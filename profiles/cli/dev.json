@@ -1,0 +1,8 @@
+{
+    "description": "Standard Development Environment",
+    "env": {
+        "EDITOR": "vim",
+        "PATH": "/usr/local/bin:/usr/bin"
+    },
+    "workingDirectory": "/home/user/src"
+}

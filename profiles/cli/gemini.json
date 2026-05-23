@@ -1,0 +1,12 @@
+{
+    "description": "Standard Development Environment",
+    "env": {
+        "EDITOR": "vim",
+        "PATH": "/usr/local/bin:/usr/bin:$HOME/.npm-global/bin"
+    },
+    "workingDirectory": "/home/user/src",
+    "mounts": [
+        {"source": "$HOME/.nvm", "dest": "$HOME/.nvm", "perm": "ro"},
+        {"source": "$HOME/.npm-global", "dest": "$HOME/.npm-global", "perm": "copy"}
+    ]
+}

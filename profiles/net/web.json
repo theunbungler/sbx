@@ -1,0 +1,9 @@
+{
+    "description": "Limited Web Access",
+    "allow": [
+        "*.google.com",
+        "github.com",
+        "192.168.1.0/24"
+    ],
+    "ports": [80, 443]
+}
