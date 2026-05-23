@@ -34,6 +34,22 @@ EOF
 resolve_profile() {
     local type="$1"
     local name="$2"
+
+    # If it's a direct path to a file, use it
+    if [[ -f "$name" ]]; then
+        realpath "$name"
+        return 0
+    fi
+    if [[ -f "$name.json" ]]; then
+        realpath "$name.json"
+        return 0
+    fi
+
+    # Strip the type prefix if it was included (e.g., "cli/dev" -> "dev")
+    if [[ "$name" == "$type/"* ]]; then
+        name="${name#$type/}"
+    fi
+
     local paths=(
         "./.sbx/profiles/$type/$name.json"
         "$CONFIG_DIR/profiles/$type/$name.json"
@@ -52,22 +68,35 @@ resolve_profile() {
 }
 
 list_profiles() {
-    echo "Available Profiles:"
+    local types=("cli" "fs" "net")
     local sources=(
-        "Project (./.sbx/profiles/)"
-        "User ($CONFIG_DIR/profiles/)"
-        "Global ($SCRIPT_DIR/profiles/)"
-    )
-    local paths=(
-        "./.sbx/profiles"
-        "$CONFIG_DIR/profiles"
-        "$SCRIPT_DIR/profiles"
+        "Project:./.sbx/profiles"
+        "User:$CONFIG_DIR/profiles"
+        "Global:$SCRIPT_DIR/profiles"
     )
 
-    for i in "${!paths[@]}"; do
-        if [[ -d "${paths[$i]}" ]]; then
-            echo "[${sources[$i]}]"
-            find "${paths[$i]}" -name "*.json" | sed "s|${paths[$i]}/||" | sed 's/\.json$//' | sed 's/^/  /'
+    echo "Available Profiles:"
+    for type in "${types[@]}"; do
+        echo ""
+        echo "${type^^} Profiles:"
+        local found=0
+        for src in "${sources[@]}"; do
+            local label="${src%%:*}"
+            local path="${src#*:}"
+            if [[ -d "$path/$type" ]]; then
+                # Use a temporary variable to capture find output to avoid empty lines
+                local files
+                files=$(find "$path/$type" -name "*.json" | sed "s|$path/$type/||" | sed 's/\.json$//' | sort)
+                if [[ -n "$files" ]]; then
+                    while IFS= read -r profile; do
+                        echo "  $profile ($label)"
+                        found=1
+                    done <<< "$files"
+                fi
+            fi
+        done
+        if [[ $found -eq 0 ]]; then
+            echo "  (none)"
         fi
     done
 }
