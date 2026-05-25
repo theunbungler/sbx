@@ -1,0 +1,7 @@
+{
+    "description": "Project-specific sources",
+    "workingDirectory": "/workspace",
+    "mounts": [
+        { "source": "$PWD", "dest": "/workspace", "perm": "rw" }
+    ]
+}
