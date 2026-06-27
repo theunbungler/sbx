@@ -1,6 +1,5 @@
 {
     "description": "Project-specific sources",
-    "workingDirectory": "/workspace",
     "mounts": [
     ],
     "env": {

@@ -1,5 +1,6 @@
 {
     "description": "Limited Web Access",
+    "dns": "1.1.1.1",
     "allow": [
         "*.google.com",
         "github.com",
