@@ -352,6 +352,13 @@ if [[ -n "$NET_PROFILE" ]]; then
     
     ALLOWED_NAMES="$DNS_DIR/allowed-names.txt"
     jq -r '.allow[]? | select(type == "string" and test("^[a-zA-Z*]"))' "$NET_PROFILE" > "$ALLOWED_NAMES"
+
+    # dnscrypt-proxy's allowed_names is only an *exemption* list — it does NOT
+    # block names that aren't listed. To get whitelist-only behaviour we pair it
+    # with a catch-all blocklist. The pattern "*.*" matches every multi-label
+    # domain; allowed_names then exempts the profile's allowed hosts.
+    BLOCKED_NAMES="$DNS_DIR/blocked-names.txt"
+    echo "*.*" > "$BLOCKED_NAMES"
     
     DNS_SETTING=$(jq -r '.dns // empty' "$NET_PROFILE")
     
@@ -373,6 +380,9 @@ forwarding_rules = '$DNS_DIR/forwarding-rules.txt'
 [query_log]
   file = '$DNS_DIR/query.log'
 
+[blocked_names]
+  blocked_names_file = '$BLOCKED_NAMES'
+
 [allowed_names]
   allowed_names_file = '$ALLOWED_NAMES'
 EOF
@@ -392,6 +402,9 @@ server_names = ['custom']
 
 [query_log]
   file = '$DNS_DIR/query.log'
+
+[blocked_names]
+  blocked_names_file = '$BLOCKED_NAMES'
 
 [allowed_names]
   allowed_names_file = '$ALLOWED_NAMES'
@@ -427,6 +440,10 @@ EOF
             echo "        ip daddr $cidr accept"
         done
         
+        # Drop all IPv6 outbound — prevents bypass of domain filtering via
+        # Chrome's DNS-over-HTTPS or other IPv6-native resolvers.
+        # Loopback (::1) is already accepted above via 'oif "lo" accept'.
+        echo "        meta nfproto ipv6 drop"
         # Add Ports
         if jq -e '.ports[]? | select(. == "*")' "$NET_PROFILE" >/dev/null 2>&1; then
             echo "        meta l4proto tcp accept"
@@ -629,11 +646,14 @@ if [[ -n "$NET_PROFILE" ]]; then
 # Manual network initialization inside the namespace
 ip link set lo up >/dev/null 2>&1
 
-# Apply nftables rules (we are root in the sandbox userns)
+# Apply nftables rules — hard fail if the ruleset cannot be loaded.
+# Never fall through to an unrestricted network.
 if [[ -f "$NFT_RULES" ]]; then
-    # Try to apply nft rules, but don't fail the whole session if it fails
-    # Some environments have restrictive sysctls even for root in a userns
-    nft -f "$NFT_RULES" >/dev/null 2>&1 || echo "Warning: Could not apply nftables rules. Networking will be unrestricted." >&2
+    if ! NFT_ERR=\$(nft -f "$NFT_RULES" 2>&1); then
+        echo "Error: nftables rules failed to load — refusing to start with unrestricted networking." >&2
+        echo "  nft output: \$NFT_ERR" >&2
+        exit 1
+    fi
 fi
 
 "$DNSCRYPT_BIN" -config "$DNS_DIR/dnscrypt-proxy.toml" > "$DNS_DIR/dnscrypt.log" 2>&1 &
@@ -654,6 +674,14 @@ for i in {1..20}; do
     fi
     sleep 0.5
 done
+# Hard fail if dnscrypt-proxy never became ready — do not start the session
+# with a broken resolver that could allow unfiltered name resolution.
+if ! grep -q "Now listening" "$DNS_DIR/dnscrypt.log" 2>/dev/null; then
+    echo "Error: dnscrypt-proxy did not become ready within 10 seconds." >&2
+    cat "$DNS_DIR/dnscrypt.log" >&2
+    kill \$DNS_PID 2>/dev/null || true
+    exit 1
+fi
 $(printf "%q " "${COMMAND[@]}")
 kill \$DNS_PID 2>/dev/null || true
 EOF
