@@ -8,6 +8,9 @@ STATE_DIR="$HOME/.local/state/sbx"
 CONFIG_DIR="$HOME/.config/sbx"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+GUI_MODE=false
+XPRA_DISPLAY=""
+
 # Ensure state directory exists
 mkdir -p "$STATE_DIR"
 
@@ -22,6 +25,7 @@ Options:
   --fs <profile>         Apply a filesystem profile (multiple allowed)
   --net <profile>        Apply a network profile
   --cli <profile>        Apply a CLI/environment profile
+  --gui                  Enable isolated GUI via xpra (attach with: xpra attach :<N>)
   -h, --help             Show this help message
 
 Profiles are searched in:
@@ -106,6 +110,7 @@ FS_PROFILES=()
 NET_PROFILE=""
 CLI_PROFILE=""
 COMMAND=()
+GUI_FLAG=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -159,6 +164,10 @@ while [[ $# -gt 0 ]]; do
             shift
             COMMAND=("$@")
             break
+            ;;
+        --gui)
+            GUI_FLAG=true
+            shift
             ;;
         -h|--help)
             usage
@@ -448,6 +457,94 @@ cat > "$SESSION_DIR/session.json" <<EOF
 }
 EOF
 
+# GUI Setup (xpra virtual display)
+if [[ "$GUI_FLAG" == "true" ]]; then
+    if ! command -v xpra >/dev/null 2>&1; then
+        echo "Error: xpra is not installed. Cannot use --gui mode." >&2
+        exit 1
+    fi
+
+    # Find a free X11 display slot
+    DISPLAY_NUM=100
+    while [[ -S "/tmp/.X11-unix/X$DISPLAY_NUM" ]]; do
+        DISPLAY_NUM=$((DISPLAY_NUM + 1))
+    done
+    XPRA_DISPLAY=":$DISPLAY_NUM"
+    XPRA_LOG="$SESSION_DIR/xpra.log"
+
+    echo "Starting xpra on display $XPRA_DISPLAY..."
+    xpra start "$XPRA_DISPLAY" \
+        --daemon=yes \
+        --log-file="$XPRA_LOG" \
+        --mdns=no \
+        --notifications=no \
+        --bell=no \
+        --speaker=disabled \
+        --microphone=disabled \
+        > /dev/null 2>&1
+
+    # Wait for the virtual X11 socket to appear
+    X11_SOCK="/tmp/.X11-unix/X$DISPLAY_NUM"
+    echo -n "Waiting for display"
+    XPRA_READY=false
+    for i in {1..40}; do
+        if [[ -S "$X11_SOCK" ]]; then
+            XPRA_READY=true
+            break
+        fi
+        sleep 0.25
+        echo -n "."
+    done
+    echo
+
+    if [[ "$XPRA_READY" != "true" ]]; then
+        echo "Error: xpra display $XPRA_DISPLAY failed to start. Check $XPRA_LOG" >&2
+        xpra stop "$XPRA_DISPLAY" >/dev/null 2>&1 || true
+        exit 1
+    fi
+
+    # Build a session Xauthority cookie for the display.
+    # xpra writes its cookie to the host Xauthority keyed to the host hostname,
+    # but the sandbox runs under a different hostname (e.g. pasta-<host> when
+    # networking is on, or no UTS name otherwise). We rewrite the cookie's
+    # address family to FamilyWild (ffff) so it matches from any hostname.
+    HOST_XAUTH="${XAUTHORITY:-$HOME/.Xauthority}"
+    SBX_XAUTH="$SESSION_DIR/Xauthority"
+    rm -f "$SBX_XAUTH"
+
+    # The cookie may lag slightly behind the socket; retry briefly.
+    for i in {1..20}; do
+        if xauth -f "$HOST_XAUTH" nlist "$XPRA_DISPLAY" 2>/dev/null | grep -q .; then
+            break
+        fi
+        sleep 0.25
+    done
+
+    if xauth -f "$HOST_XAUTH" nlist "$XPRA_DISPLAY" 2>/dev/null \
+        | sed -e 's/^..../ffff/' \
+        | xauth -f "$SBX_XAUTH" nmerge - 2>/dev/null; then
+        : # cookie installed
+    else
+        echo "Warning: could not build X11 auth cookie; GUI apps may fail with auth errors." >&2
+    fi
+
+    # Expose the X11 socket and auth cookie inside the sandbox
+    BWRAP_ARGS+=(--dir /tmp/.X11-unix)
+    BWRAP_ARGS+=(--bind "$X11_SOCK" "/tmp/.X11-unix/X$DISPLAY_NUM")
+    BWRAP_ARGS+=(--setenv DISPLAY "$XPRA_DISPLAY")
+    if [[ -f "$SBX_XAUTH" ]]; then
+        BWRAP_ARGS+=(--ro-bind "$SBX_XAUTH" /tmp/.sbx-Xauthority)
+        BWRAP_ARGS+=(--setenv XAUTHORITY /tmp/.sbx-Xauthority)
+    fi
+    # Prevent MIT-SHM errors (IPC is unshared, so SHM won't work)
+    BWRAP_ARGS+=(--setenv LIBGL_ALWAYS_INDIRECT 1)
+
+    GUI_MODE=true
+    echo "GUI display $XPRA_DISPLAY is ready."
+    echo "  Attach viewer : xpra attach $XPRA_DISPLAY"
+    echo "  Stop display  : xpra stop $XPRA_DISPLAY"
+fi
+
 # Teardown Logic
 teardown() {
     echo "Tearing down session $SESSION_ID..."
@@ -510,7 +607,12 @@ teardown() {
 
     rm -rf "$SESSION_DIR/tmp_mounts"
     rm -f "$SESSION_DIR/abduco.sock" "$SESSION_DIR/wrapper.sh"
-    
+
+    if [[ -n "$XPRA_DISPLAY" ]]; then
+        echo "Stopping xpra display $XPRA_DISPLAY..."
+        xpra stop "$XPRA_DISPLAY" >/dev/null 2>&1 || true
+    fi
+
     echo "Session $SESSION_ID finished. Changes saved to $SESSION_DIR/fs"
 }
 
