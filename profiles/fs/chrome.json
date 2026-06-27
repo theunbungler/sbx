@@ -1,0 +1,14 @@
+{
+    "description": "Project-specific sources",
+    "workingDirectory": "/workspace",
+    "mounts": [
+        { "source": "/run/user/1000/wayland-0", "dest": "/run/user/1000/wayland-0", "perm": "rw" }
+    ],
+    "env": {
+        "USER": "user",
+        "DISPLAY": ":0",
+        "XDG_RUNTIME_DIR": "/run/user/1000",
+        "WAYLAND_DISPLAY": "wayland-0"
+    }
+
+}

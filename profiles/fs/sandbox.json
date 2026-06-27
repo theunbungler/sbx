@@ -3,5 +3,9 @@
     "workingDirectory": "/workspace",
     "mounts": [
         { "source": "$PWD", "dest": "/workspace", "perm": "rw" }
-    ]
+    ],
+    "env": {
+        "HOME": "/workspace",
+        "USER": "user"
+    }
 }

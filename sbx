@@ -197,6 +197,7 @@ BWRAP_ARGS=(
     --tmpfs /tmp
     --tmpfs /run
     --ro-bind /usr /usr
+    --ro-bind /opt /opt
     --ro-bind /etc /etc
     --symlink usr/bin /bin
     --symlink usr/lib /lib

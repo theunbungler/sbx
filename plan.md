@@ -98,10 +98,15 @@ All active session data is stored in `~/.local/state/sbx/`.
 ```json
 {
     "description": "Project-specific sources",
+    "workingDirectory": "/home/user/src",
     "mounts": [
         { "source": "./src", "dest": "/home/user/src", "perm": "copy" },
         { "source": "/usr/include", "dest": "/usr/include", "perm": "ro" }
-    ]
+    ],
+    "env": {
+        "HOME": "/home/user",
+        "USER": "user"
+    }
 }
 
 ```
