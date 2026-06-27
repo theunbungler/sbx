@@ -2,7 +2,6 @@
     "description": "Project-specific sources",
     "workingDirectory": "/workspace",
     "mounts": [
-        { "source": "/run/user/1000/wayland-0", "dest": "/run/user/1000/wayland-0", "perm": "rw" }
     ],
     "env": {
         "USER": "user",
