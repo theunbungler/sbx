@@ -349,118 +349,82 @@ if [[ -n "$NET_PROFILE" ]]; then
 
     DNS_DIR="$SESSION_DIR/dns"
     mkdir -p "$DNS_DIR"
-    
-    ALLOWED_NAMES="$DNS_DIR/allowed-names.txt"
-    jq -r '.allow[]? | select(type == "string" and test("^[a-zA-Z*]"))' "$NET_PROFILE" > "$ALLOWED_NAMES"
 
-    # dnscrypt-proxy's allowed_names is only an *exemption* list — it does NOT
-    # block names that aren't listed. To get whitelist-only behaviour we pair it
-    # with a catch-all blocklist. The pattern "*.*" matches every multi-label
-    # domain; allowed_names then exempts the profile's allowed hosts.
-    BLOCKED_NAMES="$DNS_DIR/blocked-names.txt"
-    echo "*.*" > "$BLOCKED_NAMES"
-    
-    DNS_SETTING=$(jq -r '.dns // empty' "$NET_PROFILE")
-    
-    # Generate dnscrypt-proxy.toml and potential forwarding rules
-    if [[ "$DNS_SETTING" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        # It's an IP address - use it as a forwarder
-        echo ". $DNS_SETTING" > "$DNS_DIR/forwarding-rules.txt"
-        cat > "$DNS_DIR/dnscrypt-proxy.toml" <<EOF
-listen_addresses = ['127.0.0.1:53']
-ignore_system_dns = true
-block_ipv6 = true
-server_names = ['fallback']
-forwarding_rules = '$DNS_DIR/forwarding-rules.txt'
-
-[static]
-  [static.fallback]
-    stamp = 'sdns://AgcAAAAAAAAABzEuMS4xLjEAEmRucy5jbG91ZGZsYXJlLmNvbQovZG5zLXF1ZXJ5'
-
-[query_log]
-  file = '$DNS_DIR/query.log'
-
-[blocked_names]
-  blocked_names_file = '$BLOCKED_NAMES'
-
-[allowed_names]
-  allowed_names_file = '$ALLOWED_NAMES'
-EOF
-    else
-        # It's a stamp or name (default to Cloudflare if empty)
-        [[ -z "$DNS_SETTING" ]] && DNS_SETTING="sdns://AgcAAAAAAAAABzEuMS4xLjEAEmRucy5jbG91ZGZsYXJlLmNvbQovZG5zLXF1ZXJ5"
-        
-        cat > "$DNS_DIR/dnscrypt-proxy.toml" <<EOF
-listen_addresses = ['127.0.0.1:53']
-ignore_system_dns = true
-block_ipv6 = true
-server_names = ['custom']
-
-[static]
-  [static.custom]
-    stamp = '$DNS_SETTING'
-
-[query_log]
-  file = '$DNS_DIR/query.log'
-
-[blocked_names]
-  blocked_names_file = '$BLOCKED_NAMES'
-
-[allowed_names]
-  allowed_names_file = '$ALLOWED_NAMES'
-EOF
+    # DNS upstream must be a plain IP — dnsmasq does not speak DoH stamps.
+    # If the profile supplies a stamp or leaves dns empty, fall back to Cloudflare.
+    DNS_UPSTREAM=$(jq -r '.dns // empty' "$NET_PROFILE")
+    if ! [[ "$DNS_UPSTREAM" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        DNS_UPSTREAM="1.1.1.1"
     fi
 
-    # resolv.conf
-    cat > "$DNS_DIR/resolv.conf" <<EOF
-nameserver 127.0.0.1
-EOF
+    # Build per-domain dnsmasq CLI flags from the hostname entries in allow[].
+    # Strips leading '*.' — dnsmasq --server=/domain/up matches the apex + all subs.
+    # --nftset auto-populates the nftables set from every A-record answer,
+    # replacing the old bespoke Python sniffer with zero custom code.
+    ALLOW_ALL=false
+    DNSMASQ_DOMAIN_ARGS=()
+    while IFS= read -r entry; do
+        [[ -z "$entry" ]] && continue
+        if [[ "$entry" == "*" ]]; then
+            ALLOW_ALL=true
+            break
+        fi
+        domain="${entry#\*.}"
+        DNSMASQ_DOMAIN_ARGS+=("--server=/$domain/$DNS_UPSTREAM")
+        DNSMASQ_DOMAIN_ARGS+=("--nftset=/$domain/inet#sbx_filter#allowed4")
+    done < <(jq -r '.allow[]? | select(type == "string" and test("^[a-zA-Z*]"))' "$NET_PROFILE")
+
+    # First non-CIDR hostname for the readiness probe.
+    TEST_DOMAIN=$(jq -r '.allow[]? | select(type=="string" and test("^[a-zA-Z]"))' "$NET_PROFILE" | head -n1)
+
+    # resolv.conf points into the sandbox at our dnsmasq instance.
+    printf 'nameserver 127.0.0.1\n' > "$DNS_DIR/resolv.conf"
     BWRAP_ARGS+=(--ro-bind "$DNS_DIR/resolv.conf" /etc/resolv.conf)
 
-    # nftables setup
+    # nftables egress rules — default-drop, permit only:
+    #   lo / established / DNS to 127.0.0.1 / upstream DNS on port 53
+    #   explicit CIDRs from profile / @allowed4 (auto-populated by dnsmasq --nftset)
+    # Raw IP connections and all IPv6 egress are dropped.
     NFT_RULES="$DNS_DIR/rules.nft"
     {
         echo "table inet sbx_filter {"
+        echo "    set allowed4 {"
+        echo "        type ipv4_addr"
+        echo "        flags timeout"
+        echo "    }"
         echo "    chain output {"
         echo "        type filter hook output priority 0; policy drop;"
         echo "        oif \"lo\" accept"
         echo "        ct state established,related accept"
         echo "        ip daddr 127.0.0.1 udp dport 53 accept"
         echo "        ip daddr 127.0.0.1 tcp dport 53 accept"
-        
-        # Automatically allow the DNS server if it's an IP
-        if [[ "$DNS_SETTING" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "        ip daddr $DNS_SETTING udp dport 53 accept"
-            echo "        ip daddr $DNS_SETTING tcp dport 53 accept"
-        fi
+        echo "        ip daddr $DNS_UPSTREAM udp dport 53 accept"
+        echo "        ip daddr $DNS_UPSTREAM tcp dport 53 accept"
 
-        # Add CIDRs
+        # Explicit CIDRs from the profile (any port).
         jq -r '.allow[]? | select(test("^[0-9]"))' "$NET_PROFILE" | while read -r cidr; do
             [[ -z "$cidr" ]] && continue
             echo "        ip daddr $cidr accept"
         done
-        
-        # Drop all IPv6 outbound — prevents bypass of domain filtering via
-        # Chrome's DNS-over-HTTPS or other IPv6-native resolvers.
-        # Loopback (::1) is already accepted above via 'oif "lo" accept'.
-        echo "        meta nfproto ipv6 drop"
-        # Add Ports
-        if jq -e '.ports[]? | select(. == "*")' "$NET_PROFILE" >/dev/null 2>&1; then
-            echo "        meta l4proto tcp accept"
-            echo "        meta l4proto udp accept"
+
+        # Destinations resolved for allowed domains, gated by the port list.
+        if [[ "$ALLOW_ALL" == "true" ]] || jq -e '.ports[]? | select(. == "*")' "$NET_PROFILE" >/dev/null 2>&1; then
+            echo "        ip daddr @allowed4 accept"
         else
             ports=$(jq -r '.ports[]?' "$NET_PROFILE" | paste -sd, -)
             if [[ -n "$ports" ]]; then
-                echo "        tcp dport { $ports } accept"
-                echo "        udp dport { $ports } accept"
-            elif [[ -n "$(jq -r '.allow[]? | select(test("^[a-zA-Z]"))' "$NET_PROFILE")" ]]; then
-                # If hostnames are allowed but no ports specified, allow 80/443
-                echo "        tcp dport { 80, 443 } accept"
+                echo "        ip daddr @allowed4 tcp dport { $ports } accept"
+                echo "        ip daddr @allowed4 udp dport { $ports } accept"
+            else
+                # Hostnames allowed but no ports specified -> default to web.
+                echo "        ip daddr @allowed4 tcp dport { 80, 443 } accept"
             fi
         fi
+
+        echo "        meta nfproto ipv6 drop"
+        echo "    }"
+        echo "}"
     } > "$NFT_RULES"
-    echo "    }" >> "$NFT_RULES"
-    echo "}" >> "$NFT_RULES"
 fi
 
 # Session State Persistence
@@ -639,51 +603,69 @@ trap teardown EXIT
 ABDUCO_SOCK="$SESSION_DIR/abduco.sock"
 LAUNCH_SCRIPT="$SESSION_DIR/launch.sh"
 CAT_WRAPPER="$SESSION_DIR/wrapper.sh"
-DNSCRYPT_BIN=$(which dnscrypt-proxy)
+DNSMASQ_BIN=$(which dnsmasq)
+
 if [[ -n "$NET_PROFILE" ]]; then
+    # Serialise per-domain flags for expansion inside the heredoc.
+    if [[ "$ALLOW_ALL" == "true" ]]; then
+        # Wildcard: forward everything, populate allowed4 for every answer.
+        DNSMASQ_DOMAIN_FLAGS="--server=$DNS_UPSTREAM --nftset=//inet#sbx_filter#allowed4"
+    else
+        DNSMASQ_DOMAIN_FLAGS=$(printf '%s ' "${DNSMASQ_DOMAIN_ARGS[@]}")
+    fi
+
     cat > "$CAT_WRAPPER" <<EOF
 #!/bin/bash
-# Manual network initialization inside the namespace
 ip link set lo up >/dev/null 2>&1
 
-# Apply nftables rules — hard fail if the ruleset cannot be loaded.
-# Never fall through to an unrestricted network.
-if [[ -f "$NFT_RULES" ]]; then
-    if ! NFT_ERR=\$(nft -f "$NFT_RULES" 2>&1); then
-        echo "Error: nftables rules failed to load — refusing to start with unrestricted networking." >&2
-        echo "  nft output: \$NFT_ERR" >&2
-        exit 1
-    fi
+# Hard-fail if nftables rules cannot be loaded — never proceed with open egress.
+if ! NFT_ERR=\$(nft -f "$NFT_RULES" 2>&1); then
+    echo "Error: nftables rules failed to load — aborting." >&2
+    echo "  nft: \$NFT_ERR" >&2
+    exit 1
 fi
 
-"$DNSCRYPT_BIN" -config "$DNS_DIR/dnscrypt-proxy.toml" > "$DNS_DIR/dnscrypt.log" 2>&1 &
-DNS_PID=\$!
-# Wait for dnscrypt-proxy to start and check if it's still running
+# dnsmasq on 127.0.0.1:53.
+# All options are CLI flags: AppArmor's usr.sbin.dnsmasq profile restricts
+# config-file paths to /etc/dnsmasq.d/*, making arbitrary paths unreadable.
+# --conf-file=/dev/null  suppress any host /etc/dnsmasq.conf
+# --filter-AAAA          return only A records; IPv6 egress is nft-dropped anyway
+# --nftset               auto-populates @allowed4 from A-record answers —
+#                        no bespoke sniffer needed
+"$DNSMASQ_BIN" \\
+    --conf-file=/dev/null \\
+    -d \\
+    --port=53 \\
+    --listen-address=127.0.0.1 \\
+    --bind-interfaces \\
+    --no-resolv \\
+    --no-hosts \\
+    --filter-AAAA \\
+    $DNSMASQ_DOMAIN_FLAGS \\
+    > "$DNS_DIR/dnsmasq.log" 2>&1 &
+DNSMASQ_PID=\$!
+
+DNS_READY=false
 for i in {1..20}; do
-    if kill -0 \$DNS_PID 2>/dev/null; then
-        if grep -q "Now listening" "$DNS_DIR/dnscrypt.log" 2>/dev/null; then
-            # Verify DNS is actually working before proceeding
-            if getent hosts github.com >/dev/null 2>&1; then
-                break
-            fi
-        fi
-    else
-        echo "Error: dnscrypt-proxy failed to start. Log output:" >&2
-        cat "$DNS_DIR/dnscrypt.log" >&2
+    if ! kill -0 \$DNSMASQ_PID 2>/dev/null; then
+        echo "Error: dnsmasq failed to start:" >&2
+        cat "$DNS_DIR/dnsmasq.log" >&2
         exit 1
+    fi
+    if [[ -z "$TEST_DOMAIN" ]] || getent ahostsv4 "$TEST_DOMAIN" >/dev/null 2>&1; then
+        DNS_READY=true
+        break
     fi
     sleep 0.5
 done
-# Hard fail if dnscrypt-proxy never became ready — do not start the session
-# with a broken resolver that could allow unfiltered name resolution.
-if ! grep -q "Now listening" "$DNS_DIR/dnscrypt.log" 2>/dev/null; then
-    echo "Error: dnscrypt-proxy did not become ready within 10 seconds." >&2
-    cat "$DNS_DIR/dnscrypt.log" >&2
-    kill \$DNS_PID 2>/dev/null || true
+if [[ "\$DNS_READY" != "true" ]]; then
+    echo "Error: dnsmasq did not become ready (could not resolve '$TEST_DOMAIN')." >&2
+    cat "$DNS_DIR/dnsmasq.log" >&2
+    kill \$DNSMASQ_PID 2>/dev/null
     exit 1
 fi
 $(printf "%q " "${COMMAND[@]}")
-kill \$DNS_PID 2>/dev/null || true
+kill \$DNSMASQ_PID 2>/dev/null || true
 EOF
 else
     cat > "$CAT_WRAPPER" <<EOF

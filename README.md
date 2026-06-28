@@ -48,7 +48,8 @@ Profiles are JSON files organized into three categories — **CLI**, **Filesyste
 
 1. `./.sbx/profiles/` (Local to the current directory)
 2. `$HOME/.config/sbx/profiles/` (User-specific configuration)
-3. `/home/lonelyninja/git/sandbox-gemini/profiles/` (Project-specific defaults)
+3. Global profiles in the profiles directory with sbx
+
 
 ### CLI Profiles (`profiles/cli/<name>.json`)
 
@@ -139,7 +140,7 @@ Each entry in the `mounts` array has these fields:
 
 ### Network (NET) Profiles (`profiles/net/<name>.json`)
 
-NET profiles control network access inside the sandbox. When a network profile is applied, the sandbox uses `pasta` for user-mode networking, `dnscrypt-proxy` for DNS resolution (with domain allowlisting), and `nftables` for egress filtering.
+NET profiles control network access inside the sandbox. When a network profile is applied, the sandbox uses `pasta` for user-mode networking, `dnscrypt-proxy` for DNS resolution (with domain allowlisting), a small DNS sniffer (`sbx-dns-sniffer.py`) that records resolved IPs, and `nftables` for egress filtering keyed on those IPs.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
@@ -150,10 +151,15 @@ NET profiles control network access inside the sandbox. When a network profile i
 
 **How filtering works:**
 
-1. **Domain allowlisting** — Hostname entries in `allow` (those matching `^[a-zA-Z*]`) are written to a file consumed by `dnscrypt-proxy`. Only DNS queries for matching domains are resolved; all others are refused.
-2. **CIDR allowlisting** — IP/CIDR entries in `allow` (those matching `^[0-9]`) become `nftables` rules that accept outbound traffic to those address ranges.
-3. **Port filtering** — `nftables` rules restrict allowed TCP/UDP destination ports. If only hostnames are listed without explicit ports, ports 80 and 443 are allowed by default.
-4. **Default policy** — The egress chain default is `drop`. Only traffic matching an allow rule passes.
+Egress is enforced at the **IP layer by `nftables`**, not just at DNS resolution. The output chain defaults to `drop`; a connection is only permitted if its destination IP is explicitly allowed. This closes the bypass where a process connects straight to a raw IP (or a public DNS provider) and skips the filtered resolver entirely.
+
+1. **Domain allowlisting** — Hostname entries in `allow` (those matching `^[a-zA-Z*]`) are written to a file consumed by `dnscrypt-proxy`, which uses a catch-all `*.*` blocklist exempted by the allow list. Only DNS queries for matching domains resolve; all others are refused.
+2. **Dynamic IP allowlisting** — The DNS sniffer sits on `127.0.0.1:53`, forwards queries to `dnscrypt-proxy`, and adds every IP it sees in an allowed-domain answer to the `nftables` set `allowed4`. `nftables` then permits connections to exactly those IPs (subject to the port filter). An IP the resolver never returned is dropped.
+3. **CIDR allowlisting** — IP/CIDR entries in `allow` (those matching `^[0-9]`) become `nftables` rules that accept outbound traffic to those address ranges (any port).
+4. **Port filtering** — `nftables` rules restrict the allowed TCP/UDP destination ports for resolved hosts. If only hostnames are listed without explicit ports, ports 80 and 443 are allowed by default.
+5. **Default policy** — The egress chain default is `drop`. The only fixed exceptions are loopback, established/related flows, and the single upstream resolver (Cloudflare DoH on `1.1.1.1`/`1.0.0.1:443`, or the plain-DNS IP set via `dns`). All outbound IPv6 is dropped.
+
+> **Note:** because the upstream resolver is reachable, a process could still perform DNS lookups against it, but it cannot *connect* anywhere the resolver didn't hand back for an allowed domain — egress is gated on `nftables`, not on resolution. A custom `dns` stamp pointing at a non-Cloudflare resolver must add that resolver's IP as a CIDR in `allow`.
 
 **Example — web browsing profile:**
 
