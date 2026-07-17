@@ -221,7 +221,10 @@ if [[ -n "$NET_PROFILE" ]]; then
     BWRAP_ARGS+=(--cap-add ALL)
 else
     # Without networking, bwrap creates its own namespaces.
-    BWRAP_ARGS+=(--unshare-user --unshare-net --uid 0 --gid 0)
+    # No --uid/--gid: bwrap defaults to mapping the real UID/GID into the
+    # new user namespace, so the sandbox sees the same user/HOME identity
+    # as the host (matches what the --net branch already does via pasta).
+    BWRAP_ARGS+=(--unshare-user --unshare-net)
 fi
 
 COPY_MOUNTS=() # Array of "source:dest"
@@ -238,6 +241,12 @@ apply_mounts() {
         source=$(realpath -m "$source")
         dest=$(echo "$m" | jq -r '.dest' | envsubst)
         perm=$(echo "$m" | jq -r '.perm')
+
+        # rw mounts may point at a persistent host directory that doesn't
+        # exist yet (e.g. first-ever use of a profile's storage dir).
+        if [[ "$perm" == "rw" && ! -e "$source" ]]; then
+            mkdir -p "$source"
+        fi
 
         # Ensure parent directories exist in the sandbox
         parent=$(dirname "$dest")
@@ -259,8 +268,10 @@ apply_mounts() {
             rw)
                 BWRAP_ARGS+=(--bind "$source" "$dest")
                 ;;
+            dev)
+                BWRAP_ARGS+=(--dev-bind "$source" "$dest")
+                ;;
             copy)
-                BWRAP_ARGS+=(--tmpfs "$dest")
                 COPY_MOUNTS+=("$source:$dest")
                 ;;
         esac
@@ -281,18 +292,19 @@ mkdir -p "$SESSION_DIR/tmp_mounts"
 for cm in "${COPY_MOUNTS[@]}"; do
     src="${cm%%:*}"
     dst="${cm#*:}"
-    
+
     mount_id=$(echo "$dst" | tr '/' '_')
     tmp_src="$SESSION_DIR/tmp_mounts/$mount_id"
     mkdir -p "$tmp_src"
-    
+
     if [[ -d "$src" ]]; then
         cp -a "$src/." "$tmp_src/"
+        BWRAP_ARGS+=(--tmpfs "$dst")
+        BWRAP_ARGS+=(--bind "$tmp_src" "$dst")
     elif [[ -f "$src" ]]; then
         cp -a "$src" "$tmp_src/"
+        BWRAP_ARGS+=(--bind "$tmp_src/$(basename "$src")" "$dst")
     fi
-    
-    BWRAP_ARGS+=(--bind "$tmp_src" "$dst")
 done
 
 # Parse Environment and Working Directory from all profiles
