@@ -113,13 +113,14 @@ Each entry in the `mounts` array has these fields:
 |-------|------|----------|-------------|
 | `source` | string | Yes | Host path. Supports `$HOME`, `$PWD`, and other environment variables via `envsubst`. |
 | `dest` | string | Yes | Destination path inside the sandbox. Also supports variable substitution. |
-| `perm` | string | Yes | Mount permission: one of `ro` (read-only bind), `rw` (read-write bind), or `copy` (writable snapshot) |
+| `perm` | string | Yes | Mount permission: one of `ro` (read-only bind), `rw` (read-write bind), `dev` (device bind, for files under `/dev`), or `copy` (writable snapshot) |
 
 **Permission modes explained:**
 
 - **`ro`** — Read-only bind mount. The sandbox sees the host directory but cannot modify it.
 - **`rw`** — Read-write bind mount. Changes made inside the sandbox are reflected on the host.
 - **`copy`** — Writable snapshot. The directory is copied into a tmpfs at session start. Changes inside the sandbox are **not** written back to the host. Instead, on session teardown, only **modified or new files** are compared against the original host source and saved to `~/.local/state/sbx/<session-id>/fs/<mount_id>/`. The original host directory is never modified.
+- **`dev`** — Device bind mount (`--dev-bind`). Like `rw`, but allows device-node access (a plain `ro`/`rw` bind mounts `nodev`, so opening a device file would fail). Used for things like `/dev/kvm` and `/dev/net/tun`.
 
 **Example:**
 
@@ -235,6 +236,38 @@ When using the `--gui` flag, you can attach to the Xpra session using:
 xpra attach :<N>
 ```
 *(Where `<N>` is the display number provided by `sbx`)*
+
+## Virt: Podman Containers and QEMU VMs
+
+Every session gets rootless-podman-friendly plumbing for free: a
+generated `storage.conf`/`containers.conf` (overlay driver, cgroupfs
+manager — the only manager that can work inside bwrap), `/etc/subuid`
+and `/etc/subgid` masked (so podman falls back to single-UID mapping
+instead of failing outright — bwrap's `no_new_privs` blocks the setuid
+`newuidmap` helper multi-UID mapping needs), and a writable `/var/tmp`.
+
+Two `fs` profiles add the actual device access and persistent storage:
+
+- `--fs podman` — `/dev/net/tun` (for pasta-based container networking)
+  plus a persistent container storage directory at
+  `~/.local/state/sbx/virt/containers`.
+- `--fs qemu` — `/dev/kvm` (KVM acceleration) plus a persistent VM image
+  directory at `~/.local/state/sbx/virt/images`.
+
+```bash
+# Build and run containers, with images persisting across sessions
+./sbx --fs sandbox --fs podman --net web --cli claude
+
+# KVM-accelerated VMs, with disk images persisting across sessions
+./sbx --fs sandbox --fs qemu --cli claude
+```
+
+**Known limitations (single-UID only):** images relying on `USER`,
+cross-user `chown`, or setuid installs may degrade or fail. `sudo`/setuid
+elevation inside a container cannot work (`no_new_privs` is inherited
+from bwrap). Container/VM network egress still flows through the
+session's `--net` profile and its nftables allow-listing — there is no
+way for a container to bypass it.
 
 ## License
 

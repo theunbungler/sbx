@@ -1,0 +1,7 @@
+{
+    "description": "QEMU with KVM acceleration + persistent VM image directory",
+    "mounts": [
+        { "source": "/dev/kvm", "dest": "/dev/kvm", "perm": "dev" },
+        { "source": "$HOME/.local/state/sbx/virt/images", "dest": "$HOME/.local/state/sbx/virt/images", "perm": "rw" }
+    ]
+}
