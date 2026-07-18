@@ -219,6 +219,24 @@ if [[ -n "$NET_PROFILE" ]]; then
     # bwrap joins them and provides filesystem isolation.
     # We need to keep capabilities to allow dnscrypt-proxy and nftables to work.
     BWRAP_ARGS+=(--cap-add ALL)
+
+    # podman/crun decide rootless-vs-rootful by checking geteuid()==0, not
+    # actual privilege. --cap-add ALL above makes the sandboxed process look
+    # like real root (uid 0, full capability bits) to podman, so it skips its
+    # normal single-UID-mapping fallback and assumes a genuine system gid=5
+    # exists for its default devpts mount — which fails with EINVAL, since
+    # this is still a single-identity-mapped namespace underneath. These
+    # containers/common env vars are the documented override for exactly
+    # this case (a process nested in a constrained namespace where EUID==0
+    # doesn't mean real privilege): they force podman back onto the correct
+    # rootless code path regardless of what geteuid() reports. Confirmed
+    # this doesn't touch networking — container egress is still fully
+    # gated by this session's own nftables allow-list either way.
+    BWRAP_ARGS+=(
+        --setenv _CONTAINERS_USERNS_CONFIGURED done
+        --setenv _CONTAINERS_ROOTLESS_UID "$(id -u)"
+        --setenv _CONTAINERS_ROOTLESS_GID "$(id -g)"
+    )
 else
     # Without networking, bwrap creates its own namespaces.
     # No --uid/--gid: bwrap defaults to mapping the real UID/GID into the
