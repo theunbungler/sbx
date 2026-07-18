@@ -100,10 +100,13 @@ These apply to every session (each is harmless-to-beneficial generally):
 
 5. `--ro-bind /sys /sys` (podman needs cgroup mode detection).
 
-6. **Net-profile-only:** when a `--net` profile is active, also set
-   `_CONTAINERS_USERNS_CONFIGURED=done`, `_CONTAINERS_ROOTLESS_UID=$(id -u)`,
-   `_CONTAINERS_ROOTLESS_GID=$(id -g)`. Not applied in the no-net path —
-   see the devpts finding above for why this is scoped to the net branch.
+### Net-profile-only podman fix
+
+Unlike the always-on plumbing above, this applies only when a `--net`
+profile is active — applying it unconditionally breaks the no-net path
+(see the devpts finding above): set `_CONTAINERS_USERNS_CONFIGURED=done`,
+`_CONTAINERS_ROOTLESS_UID=$(id -u)`, `_CONTAINERS_ROOTLESS_GID=$(id -g)`
+in `sbx`'s existing `if [[ -n "$NET_PROFILE" ]]` branch.
 
 ### Profile schema changes (sbx)
 
