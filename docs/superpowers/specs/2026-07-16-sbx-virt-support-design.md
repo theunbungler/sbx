@@ -202,12 +202,21 @@ were executed against the actual implementation, not simulated.
    `timeout 4 qemu-system-x86_64 -accel kvm -display none ...`, killed by
    `timeout` (exit 124 = success, still running). Image persisted on host
    afterward.
-5. ✅ Teardown confirmed clean (zero lingering `catatonit`/`pasta`
-   processes) for a session that completes normally and undisturbed.
-   Note: external tools wrapping `sbx` in their own `timeout` can SIGTERM
-   the calling shell without propagating through the abduco/pasta/bwrap
-   chain, orphaning processes — that's a caller-side hazard, not a defect
-   in `sbx`'s own teardown path (which was independently confirmed clean).
+5. ⚠️ Teardown: partial finding, precisely isolated via a 2×2 test matrix
+   (`podman run` vs `podman images`, each with and without `--net`,
+   waited-on rather than `timeout`-killed to rule out the caller-side
+   hazard of `timeout` SIGTERM-ing the calling shell without propagating
+   through the abduco/pasta/bwrap chain). Result: **every `--net` session
+   tears down clean (4/4); every no-net podman session leaves an orphaned
+   `bwrap`+`catatonit -P` pair behind (2/2)**, regardless of which podman
+   subcommand ran. Not root-caused (plausible but unconfirmed: bwrap's
+   `--unshare-net` hands podman's nested pasta an interface-less
+   namespace to build the container's netns from — logs show `IPv6: no
+   external interface as template, use local mode` only on this path).
+   The podman command's own output is unaffected either way — this is a
+   process-cleanup leak on the secondary (offline-only, no image pulls
+   possible) path, not a correctness bug, and not fixed in this task; see
+   Known limitations.
 6. ✅ Regression-checked: plain `sbx -- bash -c 'true'` session, a
    `--net`-only (no podman) session, and a `--gui` session (xpra started,
    `DISPLAY` set, torn down cleanly) all still work; chrome.json's
@@ -227,6 +236,14 @@ were executed against the actual implementation, not simulated.
   inherited by everything under bwrap).
 - IPv6 egress is dropped by the existing nftables rules; containers
   inherit that.
+- **Teardown leak on the no-net podman path (follow-up, not fixed here):**
+  a podman session started without `--net` leaves an orphaned
+  `bwrap`+`catatonit -P` process pair running after the session ends
+  (confirmed via a 2×2 test matrix — see Verification plan item 5). Only
+  affects sessions with no `--net` profile, which can only run
+  already-cached images anyway (no pulls possible without `--net`); every
+  `--net` session was confirmed to tear down clean. Root cause not yet
+  identified.
 
 ## Phase 2 (deferred, composes without rework)
 
