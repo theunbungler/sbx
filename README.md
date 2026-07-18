@@ -267,7 +267,18 @@ cross-user `chown`, or setuid installs may degrade or fail. `sudo`/setuid
 elevation inside a container cannot work (`no_new_privs` is inherited
 from bwrap). Container/VM network egress still flows through the
 session's `--net` profile and its nftables allow-listing — there is no
-way for a container to bypass it.
+way for a container to bypass it (verified: a container under a
+restrictive allow-list can reach an allowed host but is blocked from a
+disallowed one, same as any other sandboxed process).
+
+**Known issue:** `--fs podman` sessions started *without* a `--net`
+profile currently leak an orphaned process pair (`bwrap` + podman's
+`catatonit -P` network-namespace pause process) on teardown — confirmed
+via repeated testing, not yet root-caused. Sessions that also use `--net`
+tear down cleanly every time. Since a session without `--net` can only
+run already-cached images anyway (no image pulls are possible without
+network access), this only affects the offline-only workflow; if you hit
+it, `pkill catatonit` cleans up the stragglers.
 
 ## License
 

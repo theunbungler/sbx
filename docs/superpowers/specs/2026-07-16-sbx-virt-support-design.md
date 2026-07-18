@@ -3,6 +3,24 @@
 **Date:** 2026-07-16
 **Status:** Implemented and verified (2026-07-17)
 
+**Note on pre-existing `sbx` edits carried by this branch:** the working
+tree had unrelated, pre-existing uncommitted edits to `sbx` when this work
+began (from the user's own prior session), and every commit here that
+touches `sbx` necessarily includes them (the user reviewed and accepted
+this explicitly — see Task 1 in the implementation plan). Two of those
+edits are functionally significant enough to call out and were verified
+during the final review pass: (1) a fix to `copy` mount handling for
+single-file sources (previously bound a temp directory over a file
+destination; now binds the file directly) — verified with both a
+directory and a single-file `copy` mount, host originals untouched,
+modifications correctly captured to the session's egress dir in both
+cases; (2) removal of `--uid 0 --gid 0` from the no-net branch, so no-net
+sessions now see their real host identity instead of fake root — this is
+actually load-bearing for the podman fix above (fake-root would
+re-trigger the devpts detection bug) and matches the script's own
+pre-existing comment describing the intended behavior; confirmed no
+existing profile depends on in-sandbox uid 0.
+
 ## Goal
 
 Let an LLM agent running inside an sbx sandbox create/modify/run container
@@ -50,9 +68,20 @@ later if needed.
   `containers/common` overrides for exactly this "nested namespace where
   EUID==0 isn't real privilege" situation). Confirmed the fix doesn't
   touch networking (egress is still fully gated by the session's nftables
-  allow-list) and confirmed it must stay net-profile-scoped (applying it
+  allow-list, confirmed with a restrictive allow-list negative test: a
+  container reaches an allowed host and is blocked from a disallowed one)
+  and confirmed it must stay net-profile-scoped (applying it
   unconditionally breaks the no-net path's already-correct native
   detection with an unrelated overlay-mount error).
+
+  **Fragility note (flagged in final review):** this fix depends on
+  underscore-prefixed *internal* `containers/common` env vars, not a
+  stable public API. A future podman/crun upgrade that renames or stops
+  honoring them would silently break `--net`+podman again — but the
+  failure mode is loud (the same `crun: mount devpts ... Invalid
+  argument` error this fix resolves), not silent data corruption or a
+  security gap, so it degrades safely. Re-verify this fix specifically
+  after any podman/crun version bump.
 
 ## Design
 
