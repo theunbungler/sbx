@@ -1,0 +1,18 @@
+{
+    "description": "Standard Development Environment",
+    "env": {
+        "NO_BROWSER": 1,
+        "NODE_OPTIONS": "--dns-result-order=ipv4first"
+    },
+    "path": [
+        "$HOME/.local/bin"
+    ],
+    "mounts": [
+        {"source": "$HOME/.nvm", "dest": "$HOME/.nvm", "perm": "rw"},
+        {"source": "$HOME/.npm-global", "dest": "$HOME/.npm-global", "perm": "ro"},
+        {"source": "$HOME/.npm", "dest": "$HOME/.npm", "perm": "rw"},
+        {"source": "$HOME/.local", "dest": "$HOME/.local", "perm": "rw"},
+        {"source": "$HOME/.claude", "dest": "$HOME/.claude", "perm": "copy"},
+        {"source": "$HOME/.claude.json", "dest": "$HOME/.claude.json", "perm": "copy"}
+    ]
+}

@@ -1,0 +1,14 @@
+{
+    "description": "Limited Web Access",
+    "dns": "1.1.1.1",
+    "allow": [
+        "github.com",
+        "*.claude.ai",
+        "platform.claude.com",
+        "*.anthropic.com",
+        "*.npmjs.org",
+        "localhost",
+        "127.0.0.1"
+    ],
+    "ports": ["*"]
+}
