@@ -1,7 +1,7 @@
 # sbx virt support: podman containers + qemu VMs inside the sandbox
 
 **Date:** 2026-07-16
-**Status:** Approved design, pending implementation plan
+**Status:** Implemented and verified (2026-07-17)
 
 ## Goal
 
@@ -34,6 +34,25 @@ later if needed.
   65536-UID subordinate range, and bwrap nests inside it (phase 2 basis).
 - Podman leaves a `catatonit -P` pause process holding inherited fds; it
   kept the test pipeline from exiting. Watch for this in session teardown.
+- **(Found during implementation, 2026-07-17)** Combining `--net` with
+  `--fs podman` broke container *creation* (not pulls) with `crun: mount
+  devpts to dev/pts: Invalid argument`. Root cause: `sbx`'s pre-existing
+  net-profile branch doesn't `--unshare-user` — it joins pasta's
+  namespaces and adds `--cap-add ALL`, so the sandboxed process looks like
+  real root (`uid=0`, full capability bits) to podman. podman/crun decide
+  rootless-vs-rootful by checking `geteuid()==0`, not actual privilege, so
+  seeing uid=0 they skip the rootless single-UID-mapping fallback and
+  attempt a devpts mount assuming a real system `gid=5` exists — which
+  isn't valid in this still-single-identity-mapped namespace. Fixed by
+  setting `_CONTAINERS_USERNS_CONFIGURED=done`,
+  `_CONTAINERS_ROOTLESS_UID=$(id -u)`, `_CONTAINERS_ROOTLESS_GID=$(id -g)`
+  in the net-profile branch only (these are documented
+  `containers/common` overrides for exactly this "nested namespace where
+  EUID==0 isn't real privilege" situation). Confirmed the fix doesn't
+  touch networking (egress is still fully gated by the session's nftables
+  allow-list) and confirmed it must stay net-profile-scoped (applying it
+  unconditionally breaks the no-net path's already-correct native
+  detection with an unrelated overlay-mount error).
 
 ## Design
 
@@ -80,6 +99,11 @@ These apply to every session (each is harmless-to-beneficial generally):
    (chrome.json already sets its own).
 
 5. `--ro-bind /sys /sys` (podman needs cgroup mode detection).
+
+6. **Net-profile-only:** when a `--net` profile is active, also set
+   `_CONTAINERS_USERNS_CONFIGURED=done`, `_CONTAINERS_ROOTLESS_UID=$(id -u)`,
+   `_CONTAINERS_ROOTLESS_GID=$(id -g)`. Not applied in the no-net path —
+   see the devpts finding above for why this is scoped to the net branch.
 
 ### Profile schema changes (sbx)
 
@@ -130,8 +154,17 @@ the corresponding profile. Cross-session contamination is accepted;
 
 ### Failure mode without the profile
 
-The always-on config points storage at a path that isn't mounted rw, so
-podman fails with an obvious permission error. No partial states.
+**(Corrected after verification — the original assumption below was wrong.)**
+The always-on config points storage at a path that isn't mounted rw, but
+this does **not** produce a permission error. bwrap's synthetic `/` is a
+writable tmpfs by default (nothing explicitly binds `/` itself), so
+podman/containers-storage silently falls back to using that ephemeral
+root instead. Pulls and runs succeed normally; nothing about the session
+looks broken. The only difference is durability: none of it survives
+session teardown, since it never touched the real
+`~/.local/state/sbx/virt/containers` path at all. There is no explicit
+error to catch this — an agent that forgets `--fs podman` gets working
+but silently non-persistent container storage, not a failure.
 
 ## Security notes
 
@@ -146,30 +179,45 @@ podman fails with an obvious permission error. No partial states.
 - Never bind the host's `/var/run/docker.sock` into a sandbox: host
   dockerd is root; that socket is a trivial full escape.
 
-## Verification plan
+## Verification plan (results, 2026-07-17)
 
-Run through the real sbx entry point, not bare bwrap:
+Run through the real sbx entry point, not bare bwrap. All items below
+were executed against the actual implementation, not simulated.
 
-1. `sbx --fs podman -- podman run --rm docker.io/library/alpine:latest
-   sh -c 'echo ok'` (no net profile: expect pull to fail, run of cached
-   image to succeed — documents offline behavior).
-2. `sbx --fs podman --net web -- podman run --rm alpine wget -qO-
-   http://example.com` — **key risk item:** the sandbox resolver is
-   dnsmasq on `127.0.0.1`; podman/pasta must forward container DNS to a
-   loopback resolver (pasta `--dns-forward`). Verify against the nftables
-   rules; if broken, containers may need `--dns` pointing at the upstream
-   or an nft rule tweak.
-3. `podman build` of a Dockerfile with `RUN apt-get install` (expect:
-   works with warnings) and one with `USER nobody` (expect: degraded —
-   document).
-4. `sbx --fs qemu -- qemu-img create` + short KVM boot
-   (`timeout 4 qemu-system-x86_64 -accel kvm -display none ...` exiting
-   via timeout = success).
-5. Confirm session teardown is not hung by a surviving `catatonit`
-   process; kill it in the wrapper's exit path if needed.
-6. Regression: a plain `sbx -- bash -c 'true'` session and a
-   `--net`/`--gui` session still work; chrome.json's `XDG_RUNTIME_DIR`
-   overrides the new default.
+1. ✅ Pull + run works both with and without a `--net` profile (the
+   no-net case uses cached images only, per the corrected "Failure mode
+   without the profile" section above).
+2. ✅ **Key risk item resolved, non-issue:** DNS forwarding to the
+   sandbox's dnsmasq resolver works correctly — image pulls always
+   succeeded through `--net`. What actually blocked this step initially
+   was the unrelated devpts bug (see Empirically verified facts), now
+   fixed; with the fix, `podman run --rm alpine wget ... http://example.com`
+   succeeds end-to-end under `--net`.
+3. ✅ `USER`-based Dockerfile: confirmed the expected single-UID
+   limitation cleanly (once separated from the devpts bug) — base image
+   builds, `USER appuser` step succeeds, but a subsequent `RUN` as that
+   user fails with `setresgid to \`1000\`: Invalid argument`. Matches the
+   Known limitations section below exactly.
+4. ✅ `sbx --fs qemu` — `qemu-img create` + KVM-accelerated boot via
+   `timeout 4 qemu-system-x86_64 -accel kvm -display none ...`, killed by
+   `timeout` (exit 124 = success, still running). Image persisted on host
+   afterward.
+5. ✅ Teardown confirmed clean (zero lingering `catatonit`/`pasta`
+   processes) for a session that completes normally and undisturbed.
+   Note: external tools wrapping `sbx` in their own `timeout` can SIGTERM
+   the calling shell without propagating through the abduco/pasta/bwrap
+   chain, orphaning processes — that's a caller-side hazard, not a defect
+   in `sbx`'s own teardown path (which was independently confirmed clean).
+6. ✅ Regression-checked: plain `sbx -- bash -c 'true'` session, a
+   `--net`-only (no podman) session, and a `--gui` session (xpra started,
+   `DISPLAY` set, torn down cleanly) all still work; chrome.json's
+   `XDG_RUNTIME_DIR` still overrides the new default.
+7. ✅ Cross-session persistence confirmed: a second, independent
+   `sbx --fs podman` session's `podman images` lists a previously-pulled
+   image without re-pulling.
+8. ✅ **New finding, root-caused and fixed:** `--net` + `--fs podman`
+   container creation failure (devpts/EINVAL) — see Empirically verified
+   facts above for the full root cause and fix.
 
 ## Known limitations (accepted for phase 1)
 
