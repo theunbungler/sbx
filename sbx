@@ -188,6 +188,31 @@ if [[ ${#COMMAND[@]} -eq 0 ]]; then
     COMMAND=("/bin/bash")
 fi
 
+# --- Profile feature-field scan (phase 2 virt) ---
+# Optional fields honored in any applied fs/cli profile:
+#   "userns": "full"    -> run the whole session inside an outer user
+#                          namespace carrying the user's full subordinate-
+#                          UID range (multi-UID podman). Requires --net.
+#   "docker_api": true  -> start a podman docker-API socket for the session.
+USERNS_FULL=false
+DOCKER_API=false
+USERNS_PROFILE=""
+for profile in "${FS_PROFILES[@]}" "$CLI_PROFILE"; do
+    [[ -z "$profile" ]] && continue
+    if [[ "$(jq -r '.userns // empty' "$profile")" == "full" ]]; then
+        USERNS_FULL=true
+        USERNS_PROFILE="$profile"
+    fi
+    if [[ "$(jq -r '.docker_api // false' "$profile")" == "true" ]]; then
+        DOCKER_API=true
+    fi
+done
+
+if [[ "$USERNS_FULL" == "true" && -z "$NET_PROFILE" ]]; then
+    echo "Error: profile '$USERNS_PROFILE' sets \"userns\": \"full\", which requires networking. Add --net <profile>." >&2
+    exit 1
+fi
+
 # Session Initialization
 SESSION_ID=$(date +%Y%m%d-%H%M%S)-$(printf "%04x" $RANDOM)
 SESSION_DIR="$STATE_DIR/$SESSION_ID"
