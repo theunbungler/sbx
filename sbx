@@ -336,6 +336,22 @@ BWRAP_ARGS+=(
     --setenv CONTAINERS_CONF "$VIRT_DIR/containers.conf"
 )
 
+# Docker compat: a `docker` CLI shim (execs podman) and DOCKER_HOST are
+# always on — both are free (no processes; $SESSION_DIR is already bound
+# into every sandbox). The socket DOCKER_HOST points at only exists when
+# a profile sets "docker_api": true (see wrapper generation). The path is
+# pinned to the sbx-computed /run/user/<uid> — deliberately NOT
+# $XDG_RUNTIME_DIR, which a profile may override and silently diverge
+# from DOCKER_HOST.
+PODMAN_SOCK="/run/user/$(id -u)/podman/podman.sock"
+mkdir -p "$SESSION_DIR/bin"
+cat > "$SESSION_DIR/bin/docker" <<'SHIMEOF'
+#!/bin/sh
+exec podman "$@"
+SHIMEOF
+chmod +x "$SESSION_DIR/bin/docker"
+BWRAP_ARGS+=(--setenv DOCKER_HOST "unix://$PODMAN_SOCK")
+
 COPY_MOUNTS=() # Array of "source:dest"
 
 apply_mounts() {
@@ -456,7 +472,9 @@ if [[ -n "$CLI_PROFILE" ]]; then
 else
     [[ -z "$SANDBOX_PATH" ]] && SANDBOX_PATH="$DEFAULT_PATH"
 fi
-BWRAP_ARGS+=(--setenv PATH "$SANDBOX_PATH")
+# $SESSION_DIR/bin holds the docker shim; first on PATH so `docker` always
+# resolves to it (the host docker socket is never reachable in a sandbox).
+BWRAP_ARGS+=(--setenv PATH "$SESSION_DIR/bin:$SANDBOX_PATH")
 
 # Network Setup
 if [[ -n "$NET_PROFILE" ]]; then
@@ -726,6 +744,30 @@ LAUNCH_SCRIPT="$SESSION_DIR/launch.sh"
 CAT_WRAPPER="$SESSION_DIR/wrapper.sh"
 DNSMASQ_BIN=$(which dnsmasq)
 
+# Opt-in podman docker-API service ("docker_api": true in any profile).
+# Startup failure is a WARNING, not fatal — the docker CLI shim works
+# without the service (contrast: nft/dnsmasq failures stay hard errors;
+# egress safety is never best-effort). Killed when the command exits.
+DOCKER_API_START=""
+DOCKER_API_STOP=""
+if [[ "$DOCKER_API" == "true" ]]; then
+    DOCKER_API_START=$(cat <<APIEOF
+mkdir -p "$(dirname "$PODMAN_SOCK")"
+podman system service --time=0 "unix://$PODMAN_SOCK" > "$SESSION_DIR/podman-api.log" 2>&1 &
+PODMAN_API_PID=\$!
+for i in {1..10}; do
+    [[ -S "$PODMAN_SOCK" ]] && break
+    sleep 0.5
+done
+if [[ ! -S "$PODMAN_SOCK" ]]; then
+    echo "Warning: podman API socket did not appear at $PODMAN_SOCK; docker SDK clients will fail (the docker CLI shim still works)." >&2
+    cat "$SESSION_DIR/podman-api.log" >&2 || true
+fi
+APIEOF
+)
+    DOCKER_API_STOP='[[ -n "$PODMAN_API_PID" ]] && kill $PODMAN_API_PID 2>/dev/null || true'
+fi
+
 if [[ -n "$NET_PROFILE" ]]; then
     # Serialise per-domain flags for expansion inside the heredoc.
     if [[ "$ALLOW_ALL" == "true" ]]; then
@@ -785,13 +827,17 @@ if [[ "\$DNS_READY" != "true" ]]; then
     kill \$DNSMASQ_PID 2>/dev/null
     exit 1
 fi
+$DOCKER_API_START
 $(printf "%q " "${COMMAND[@]}")
+$DOCKER_API_STOP
 kill \$DNSMASQ_PID 2>/dev/null || true
 EOF
 else
     cat > "$CAT_WRAPPER" <<EOF
 #!/bin/bash
+$DOCKER_API_START
 $(printf "%q " "${COMMAND[@]}")
+$DOCKER_API_STOP
 EOF
 fi
 chmod +x "$CAT_WRAPPER"

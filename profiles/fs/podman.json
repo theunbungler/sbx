@@ -1,5 +1,6 @@
 {
-    "description": "Rootless podman: persistent container storage + tun for pasta networking",
+    "description": "Rootless podman (single-UID): persistent storage, tun, docker API socket",
+    "docker_api": true,
     "mounts": [
         { "source": "/dev/net/tun", "dest": "/dev/net/tun", "perm": "dev" },
         { "source": "$HOME/.local/state/sbx/virt/containers", "dest": "$HOME/.local/state/sbx/virt/containers", "perm": "rw" }
