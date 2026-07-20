@@ -104,6 +104,8 @@ FS profiles define the sandbox's filesystem layout — which directories are mou
 | `workingDirectory` | string | No | Initial working directory inside the sandbox (last one wins when multiple FS profiles are stacked) |
 | `mounts` | array of objects | No | Filesystem mount specifications (see below) |
 | `env` | object | No | Key-value pairs of environment variables to set |
+| `userns` | string | No | `"full"` runs the entire session inside an outer user namespace carrying your full subordinate-UID range (multi-UID podman). Requires `--net`; the session identity becomes namespace-root. See [Multi-UID containers](#multi-uid-containers-podman-full). |
+| `docker_api` | boolean | No | `true` starts a podman docker-API socket for the session (see [Docker compatibility](#docker-compatibility)). Honored in CLI profiles too. |
 
 #### Mount Object
 
@@ -246,30 +248,77 @@ and `/etc/subgid` masked (so podman falls back to single-UID mapping
 instead of failing outright — bwrap's `no_new_privs` blocks the setuid
 `newuidmap` helper multi-UID mapping needs), and a writable `/var/tmp`.
 
-Two `fs` profiles add the actual device access and persistent storage:
+Three `fs` profiles add device access and persistent storage:
 
-- `--fs podman` — `/dev/net/tun` (for pasta-based container networking)
-  plus a persistent container storage directory at
-  `~/.local/state/sbx/virt/containers`.
+- `--fs podman` — single-UID rootless podman: `/dev/net/tun` plus a
+  persistent container store at `~/.local/state/sbx/virt/containers`.
+  Composes with everything (real-user identity), works offline with
+  cached images. Images that switch UIDs (`USER` directives, service
+  images like postgres/nginx that drop privileges) will fail — use
+  `podman-full` for those.
+- `--fs podman-full` — multi-UID podman with full image fidelity: the
+  whole session runs inside an outer user namespace carrying your
+  subordinate-UID range (`/etc/subuid`), with its own persistent store
+  at `~/.local/state/sbx/virt/containers-full`. Requires `--net`.
 - `--fs qemu` — `/dev/kvm` (KVM acceleration) plus a persistent VM image
   directory at `~/.local/state/sbx/virt/images`.
 
 ```bash
-# Build and run containers, with images persisting across sessions
+# Root-only containers, composes with anything (real-user identity)
 ./sbx --fs sandbox --fs podman --net web --cli claude
+
+# Full image fidelity (postgres/USER images), ns-root session
+./sbx --fs sandbox --fs podman-full --net web
 
 # KVM-accelerated VMs, with disk images persisting across sessions
 ./sbx --fs sandbox --fs qemu --cli claude
 ```
 
-**Known limitations (single-UID only):** images relying on `USER`,
-cross-user `chown`, or setuid installs may degrade or fail. `sudo`/setuid
-elevation inside a container cannot work (`no_new_privs` is inherited
-from bwrap). Container/VM network egress still flows through the
-session's `--net` profile and its nftables allow-listing — there is no
-way for a container to bypass it (verified: a container under a
-restrictive allow-list can reach an allowed host but is blocked from a
-disallowed one, same as any other sandboxed process).
+### Multi-UID containers (podman-full)
+
+`"userns": "full"` sessions run as **namespace-root**: `id` reports
+uid 0, host files you own appear owned by root, other users' files
+appear as `nobody`, and files created by container-interior UIDs land on
+the host owned by your subordinate range. This grants no authority
+beyond what `/etc/subuid` already delegates to you — but euid 0 changes
+program *behavior*: chromium refuses to run as root without
+`--no-sandbox`, Claude Code refuses `--dangerously-skip-permissions` as
+root, and installers take we-are-root paths. Don't compose `podman-full`
+with the chrome profile or root-averse agent CLIs; use plain `podman`
+there. If `unshare` fails with a mapping error, your user has no
+`/etc/subuid`/`/etc/subgid` range — add one (e.g.
+`sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER`).
+
+The two container stores are intentionally separate (single-UID and
+multi-UID ownership layouts are incompatible); an image used in both
+modes is pulled twice. `containers-full` contents are owned by
+subordinate UIDs on the host — clean up with `podman system reset`
+inside a `podman-full` session, not bare `rm -rf`.
+
+Note: userns-full networked launches print harmless pasta warnings
+(`Couldn't write to /proc/self/uid_map` / `Couldn't configure user
+mappings`) — pasta tries to write a UID map the outer `unshare` already
+configured. This is expected noise, not a failure.
+
+### Docker compatibility
+
+Every session gets a `docker` CLI (a shim that execs `podman`) and a
+`DOCKER_HOST` pointing at the session's podman API socket path. The
+socket itself is served by `podman system service` only in sessions
+whose profile sets `"docker_api": true` (both podman profiles do), so
+docker SDKs, `docker compose`, and testcontainers work there; in other
+sessions socket clients fail with a clear connection error while the
+CLI shim still works. Host-side docker/podman sockets are never exposed
+inside a sandbox — containers must run inside the session so its
+nftables egress allow-listing applies.
+
+**Known limitations:** `sudo`/setuid elevation inside a container cannot
+work under either profile (`no_new_privs` is inherited from bwrap).
+Container/VM network egress still flows through the session's `--net`
+profile and its nftables allow-listing — there is no way for a container
+to bypass it (verified: a container under a restrictive allow-list can
+reach an allowed host but is blocked from a disallowed one, same as any
+other sandboxed process).
 
 **Known issue:** `--fs podman` sessions started *without* a `--net`
 profile currently leak an orphaned process pair (`bwrap` + podman's
