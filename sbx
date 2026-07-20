@@ -524,22 +524,13 @@ if [[ -n "$NET_PROFILE" ]]; then
     #   lo / established / DNS to 127.0.0.1 / upstream DNS on port 53
     #   explicit CIDRs from profile / @allowed4 (auto-populated by dnsmasq --nftset)
     # Raw IP connections and all IPv6 egress are dropped.
-    NFT_RULES="$DNS_DIR/rules.nft"
-    {
-        echo "table inet sbx_filter {"
-        echo "    set allowed4 {"
-        echo "        type ipv4_addr"
-        echo "        flags timeout"
-        echo "    }"
-        echo "    chain output {"
-        echo "        type filter hook output priority 0; policy drop;"
-        echo "        oif \"lo\" accept"
-        echo "        ct state established,related accept"
-        echo "        ip daddr 127.0.0.1 udp dport 53 accept"
-        echo "        ip daddr 127.0.0.1 tcp dport 53 accept"
-        echo "        ip daddr $DNS_UPSTREAM udp dport 53 accept"
-        echo "        ip daddr $DNS_UPSTREAM tcp dport 53 accept"
-
+    # Shared egress accept rules, emitted into both the output chain
+    # (process-originated traffic) and the forward chain. The forward
+    # chain exists because rootful podman under userns:full uses the
+    # netavark bridge backend: bridge-forwarded container traffic
+    # traverses the kernel forward hook, never output, so an output-only
+    # table would leave podman-full container egress completely ungated.
+    emit_egress_allow_rules() {
         # Explicit CIDRs from the profile (any port).
         jq -r '.allow[]? | select(test("^[0-9]"))' "$NET_PROFILE" | while read -r cidr; do
             [[ -z "$cidr" ]] && continue
@@ -559,9 +550,41 @@ if [[ -n "$NET_PROFILE" ]]; then
                 echo "        ip daddr @allowed4 tcp dport { 80, 443 } accept"
             fi
         fi
+    }
+
+    NFT_RULES="$DNS_DIR/rules.nft"
+    {
+        echo "table inet sbx_filter {"
+        echo "    set allowed4 {"
+        echo "        type ipv4_addr"
+        echo "        flags timeout"
+        echo "    }"
+        echo "    chain output {"
+        echo "        type filter hook output priority 0; policy drop;"
+        echo "        oif \"lo\" accept"
+        echo "        ct state established,related accept"
+        echo "        ip daddr 127.0.0.1 udp dport 53 accept"
+        echo "        ip daddr 127.0.0.1 tcp dport 53 accept"
+        echo "        ip daddr $DNS_UPSTREAM udp dport 53 accept"
+        echo "        ip daddr $DNS_UPSTREAM tcp dport 53 accept"
+
+        emit_egress_allow_rules
 
         echo "        meta nfproto ipv6 drop"
         echo "    }"
+
+        # Forward chain: gates bridge-forwarded container egress (netavark,
+        # used by rootful podman under userns:full). Deliberately omits the
+        # lo/DNS-to-127.0.0.1/DNS-to-upstream accepts above: container->
+        # aardvark DNS is delivered via the input hook, and aardvark's own
+        # upstream queries originate from a session process and hit output.
+        echo "    chain forward {"
+        echo "        type filter hook forward priority 0; policy drop;"
+        echo "        ct state established,related accept"
+        emit_egress_allow_rules
+        echo "        meta nfproto ipv6 drop"
+        echo "    }"
+
         echo "}"
     } > "$NFT_RULES"
 fi
