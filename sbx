@@ -257,11 +257,17 @@ if [[ -n "$NET_PROFILE" ]]; then
     # rootless code path regardless of what geteuid() reports. Confirmed
     # this doesn't touch networking — container egress is still fully
     # gated by this session's own nftables allow-list either way.
-    BWRAP_ARGS+=(
-        --setenv _CONTAINERS_USERNS_CONFIGURED done
-        --setenv _CONTAINERS_ROOTLESS_UID "$(id -u)"
-        --setenv _CONTAINERS_ROOTLESS_GID "$(id -g)"
-    )
+    # In userns-full mode these overrides are exactly wrong: there podman
+    # MUST run rootful-in-namespace (euid 0 backed by a real multi-UID
+    # mapping), and forcing the rootless code path would resurrect the
+    # single-UID limitation the outer userns exists to remove.
+    if [[ "$USERNS_FULL" != "true" ]]; then
+        BWRAP_ARGS+=(
+            --setenv _CONTAINERS_USERNS_CONFIGURED done
+            --setenv _CONTAINERS_ROOTLESS_UID "$(id -u)"
+            --setenv _CONTAINERS_ROOTLESS_GID "$(id -g)"
+        )
+    fi
 else
     # Without networking, bwrap creates its own namespaces.
     # No --uid/--gid: bwrap defaults to mapping the real UID/GID into the
@@ -278,10 +284,23 @@ fi
 VIRT_DIR="$SESSION_DIR/virt"
 mkdir -p "$VIRT_DIR"
 
-# rootless_storage_path expands $HOME using podman's own runtime env (sbx
-# doesn't clear or override HOME, so it resolves to the same value inside
-# the sandbox as outside). Written literally — do not let bash expand it.
-cat > "$VIRT_DIR/storage.conf" <<'CONFEOF'
+if [[ "$USERNS_FULL" == "true" ]]; then
+    # userns-full sessions run podman rootful-in-namespace: rootful podman
+    # reads graphroot, not rootless_storage_path. Expanded at write time
+    # (HOME inside the sandbox equals host HOME). No ignore_chown_errors:
+    # ownership is real in this mode (full subordinate-UID range). This
+    # store is separate from the single-UID one by design — the ownership
+    # layouts are incompatible.
+    cat > "$VIRT_DIR/storage.conf" <<CONFEOF
+[storage]
+driver = "overlay"
+graphroot = "$HOME/.local/state/sbx/virt/containers-full"
+CONFEOF
+else
+    # rootless_storage_path expands $HOME using podman's own runtime env (sbx
+    # doesn't clear or override HOME, so it resolves to the same value inside
+    # the sandbox as outside). Written literally — do not let bash expand it.
+    cat > "$VIRT_DIR/storage.conf" <<'CONFEOF'
 [storage]
 driver = "overlay"
 rootless_storage_path = "$HOME/.local/state/sbx/virt/containers"
@@ -289,6 +308,7 @@ rootless_storage_path = "$HOME/.local/state/sbx/virt/containers"
 [storage.options.overlay]
 ignore_chown_errors = "true"
 CONFEOF
+fi
 
 # cgroupfs/disabled are the only values that can work inside bwrap: the
 # systemd cgroup manager needs a user systemd instance over dbus, which
@@ -792,8 +812,19 @@ printf "%q -c %q %q\n" "$ABDUCO_BIN" "$ABDUCO_SOCK" "$CAT_WRAPPER" >> "$LAUNCH_S
 chmod +x "$LAUNCH_SCRIPT"
 
 if [[ -n "$NET_PROFILE" ]]; then
-    echo "Starting session $SESSION_ID with networking..."
-    pasta -f --config-net --interface "$HOST_IFACE" --no-ndp --no-dhcpv6 --no-ra -a "$HOST_IP" -g "$HOST_GW" -n "$HOST_MASK" -- "$LAUNCH_SCRIPT"
+    if [[ "$USERNS_FULL" == "true" ]]; then
+        echo "Starting session $SESSION_ID with networking (full userns)..."
+        # unshare claims the user's /etc/subuid range up front, via the
+        # setuid newuidmap helper — still permitted here because bwrap's
+        # no_new_privs only applies further down the chain. pasta must
+        # then NOT create its own user namespace (that would discard the
+        # multi-UID mapping): --netns-only.
+        unshare --map-auto --map-root-user -- \
+            pasta -f --config-net --netns-only --interface "$HOST_IFACE" --no-ndp --no-dhcpv6 --no-ra -a "$HOST_IP" -g "$HOST_GW" -n "$HOST_MASK" -- "$LAUNCH_SCRIPT"
+    else
+        echo "Starting session $SESSION_ID with networking..."
+        pasta -f --config-net --interface "$HOST_IFACE" --no-ndp --no-dhcpv6 --no-ra -a "$HOST_IP" -g "$HOST_GW" -n "$HOST_MASK" -- "$LAUNCH_SCRIPT"
+    fi
 else
     echo "Starting session $SESSION_ID..."
     "$LAUNCH_SCRIPT"
