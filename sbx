@@ -322,6 +322,27 @@ cgroup_manager = "cgroupfs"
 events_logger = "file"
 CONFEOF
 
+if [[ "$USERNS_FULL" == "true" ]]; then
+    # Podman's implicit default "podman" bridge network ships with
+    # dns_enabled=false; only explicitly-created custom networks default
+    # to DNS-enabled (verified empirically — podman network inspect
+    # shows dns_enabled:true only for a network made via `podman network
+    # create`). aardvark-dns for containers on this network inherits the
+    # sandbox's own /etc/resolv.conf (127.0.0.1 -> sbx's dnsmasq) as its
+    # upstream, so routing containers through it is what lets
+    # hostname-based `allow` entries populate the forward chain's
+    # allowed4 set (see USERNS_NET_SETUP below, which creates this
+    # network). Without this, container DNS goes straight to public
+    # resolvers, which the forward chain correctly drops (no egress
+    # leak) but which also means hostname-based allow entries never
+    # resolve for containers — only CIDR-based allow entries work.
+    cat >> "$VIRT_DIR/containers.conf" <<'CONFEOF2'
+
+[network]
+default_network = "sbx0"
+CONFEOF2
+fi
+
 : > "$VIRT_DIR/empty"
 
 BWRAP_ARGS+=(
@@ -791,6 +812,17 @@ APIEOF
     DOCKER_API_STOP='[[ -n "$PODMAN_API_PID" ]] && kill $PODMAN_API_PID 2>/dev/null || true'
 fi
 
+# userns:full only (which requires --net, enforced earlier): create the
+# DNS-enabled "sbx0" network that containers.conf's default_network now
+# points at. Idempotent (podman network create fails harmlessly if it
+# already exists in the persistent containers-full store) and only
+# reachable via the net-profile wrapper below, since userns:full without
+# --net is a hard error before session state is even created.
+USERNS_NET_SETUP=""
+if [[ "$USERNS_FULL" == "true" ]]; then
+    USERNS_NET_SETUP='podman network create sbx0 >/dev/null 2>&1 || true'
+fi
+
 if [[ -n "$NET_PROFILE" ]]; then
     # Serialise per-domain flags for expansion inside the heredoc.
     if [[ "$ALLOW_ALL" == "true" ]]; then
@@ -850,6 +882,7 @@ if [[ "\$DNS_READY" != "true" ]]; then
     kill \$DNSMASQ_PID 2>/dev/null
     exit 1
 fi
+$USERNS_NET_SETUP
 $DOCKER_API_START
 $(printf "%q " "${COMMAND[@]}")
 $DOCKER_API_STOP
