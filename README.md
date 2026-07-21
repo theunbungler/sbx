@@ -300,6 +300,18 @@ Note: userns-full networked launches print harmless pasta warnings
 mappings`) — pasta tries to write a UID map the outer `unshare` already
 configured. This is expected noise, not a failure.
 
+**Container egress is filtered the same as any other sandboxed
+process** — an allowed destination is reachable, a disallowed one is
+network-blocked, whether the destination is given as a CIDR or a
+hostname in the net profile's `allow` list. Hostname-based entries
+additionally require **`netavark` and `aardvark-dns` installed on the
+host**: podman-full routes containers through a dedicated,
+DNS-enabled network so container hostname lookups transit the
+sandbox's own resolver (and its allow-list) exactly like a
+sandbox-process lookup does. Without those packages, hostname lookups
+from inside a container simply fail to resolve (blocked, not leaked);
+CIDR-based `allow` entries are unaffected either way.
+
 ### Docker compatibility
 
 Every session gets a `docker` CLI (a shim that execs `podman`) and a

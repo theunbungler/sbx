@@ -1,7 +1,7 @@
 # sbx virt phase 2: multi-UID podman (`userns: full`) + docker compat
 
 **Date:** 2026-07-19
-**Status:** Approved design, not yet implemented
+**Status:** Implemented and verified (2026-07-20)
 
 **Builds on:** `2026-07-16-sbx-virt-support-design.md` (phase 1, implemented
 and verified). Phase 1's always-on plumbing, `dev` mount perm, and the
@@ -62,10 +62,18 @@ Behavior when any applied profile sets `"userns": "full"`:
 - **Requires `--net`.** Hard error, before launch, if no net profile is
   active. (Rationale: multi-UID podman is nearly useless offline — no
   pulls — and the no-net podman path has a known teardown leak.)
-- **Launch chain:** `unshare --map-auto --map-root-user → pasta → bwrap
-  → abduco → wrapper.sh`. pasta, dnsmasq, and nftables now run as
-  ns-root inside the outer userns — re-verified by the verification
-  plan, not assumed.
+- **Launch chain:** `unshare --map-auto --map-root-user → pasta
+  --netns-only → bwrap → abduco → wrapper.sh`. pasta, dnsmasq, and
+  nftables now run as ns-root inside the outer userns — re-verified by
+  the verification plan, not assumed. `--netns-only` is **required**:
+  confirmed empirically that without it, pasta's own namespace setup
+  collapses `/proc/self/uid_map` back to a single-line (single-UID)
+  mapping, silently discarding the outer `unshare`'s 65536-UID range.
+  With the flag, the range survives, but pasta prints harmless stderr
+  noise on every launch (`Couldn't write to /proc/self/uid_map` /
+  `Couldn't configure user mappings`) — it's attempting to write a
+  mapping the outer `unshare` already configured. Expected, not a
+  failure.
 - **Composes with `--gui`:** xpra stays host-side; the X socket bind and
   FamilyWild cookie don't involve uid. Verified, not assumed.
 - **Mode-conditional storage config:** sbx writes a *different*
@@ -90,6 +98,90 @@ Behavior when any applied profile sets `"userns": "full"`:
   internal env vars at all.)
 - **`/etc/subuid`/`/etc/subgid` stay masked** (phase 1 always-on
   plumbing): rootful podman doesn't consult them.
+
+### Container egress under `userns: full` (found and fixed during implementation)
+
+**This corrects an assumption the original design got wrong.** The Goal
+and Security notes below stated the phase-1 nftables table would continue
+to gate container egress under `userns: full` without changes. Task 5's
+end-to-end verification found this false and release-blocking: rootful
+podman under `userns: full` uses netavark's **bridge** network backend
+(not the user-mode networking phase 1's single-UID podman uses), so
+container traffic is bridge-forwarded and traverses the kernel's
+`forward` hook — never `output`. Phase 1's `sbx_filter` table only hooked
+`output`, so it never saw this traffic at all: a `podman-full` container
+could reach any host, completely bypassing the net profile's allow-list,
+regardless of what the profile said. Confirmed with a restrictive
+allow-list: an explicitly disallowed host was reachable from inside a
+container while the sandbox's own process-level egress was correctly
+gated.
+
+**Fix 1 — forward-chain filtering.** `sbx_filter` gains a second chain:
+
+```
+chain forward {
+    type filter hook forward priority 0; policy drop;
+    ct state established,related accept
+    <same CIDR/allowed4/port rules as output>
+    meta nfproto ipv6 drop
+}
+```
+
+The CIDR/`allowed4`/port-gating logic is shared with the `output` chain
+via a new `emit_egress_allow_rules` function (extracted, not duplicated).
+The forward chain deliberately omits `output`'s lo/DNS-to-127.0.0.1/
+DNS-to-upstream accepts — see Fix 2 for why those aren't needed there.
+Verified in both directions: an allowed CIDR destination is reachable
+from inside a container (received a real HTTP response); a disallowed
+one is dropped at the network layer, not merely application-rejected.
+
+**Fix 2 — hostname-based allow-listing needs a DNS-enabled network.**
+Fixing the leak surfaced a second, non-security gap: hostname-based
+`allow` entries (e.g. `"allow": ["example.com"]`) didn't resolve for
+`podman-full` containers *at all*, even under a fully permissive
+`"allow": ["*"]` profile. Root cause: podman's **implicit default**
+bridge network ships with `dns_enabled=false`; only an **explicitly
+created** custom network defaults to `dns_enabled=true`. Without it,
+container DNS queries go straight to public resolvers (podman's
+built-in fallback, e.g. `8.8.8.8`) — traffic the new forward chain
+correctly drops (no leak) but which also means hostnames never resolve,
+since that public-DNS traffic was never allow-listed either.
+
+The fix: sbx now creates a dedicated `sbx0` podman network (DNS-enabled
+by construction) and points `containers.conf`'s `default_network` at it,
+both gated on `userns: full`:
+
+- `containers.conf` gains, only in this mode:
+  ```toml
+  [network]
+  default_network = "sbx0"
+  ```
+- The wrapper idempotently runs `podman network create sbx0` before the
+  user's command (harmless "already exists" on repeat sessions; stderr
+  is appended to `$VIRT_DIR/network-create.log` rather than discarded,
+  so a genuine creation failure — disk full, permissions — leaves a
+  trace; empirically confirmed podman fails loudly downstream, `Error:
+  ... network not found`, exit 125, if the network is ever actually
+  missing, rather than silently falling back to an unfiltered network).
+
+On a DNS-enabled network, podman/netavark runs `aardvark-dns` as the
+container-facing resolver; it inherits the *sandbox's own*
+`/etc/resolv.conf` (127.0.0.1 → sbx's own dnsmasq) as its upstream. So a
+container's hostname lookup now transits dnsmasq's existing `--nftset`
+mechanism exactly like a sandbox-process lookup does, populating the same
+`allowed4` nftables set the forward chain gates on. Verified end-to-end:
+under a restrictive hostname-based profile, an allowed hostname resolves
+and connects; a disallowed one is blocked — fully automatic, no manual
+`--network` flag needed.
+
+**New host prerequisite:** `netavark` and `aardvark-dns` must be
+installed on the host for hostname-based `allow` entries to work for
+`podman-full` containers. CIDR-based `allow` entries work regardless
+(no DNS dependency). If these packages are absent, `podman network
+create sbx0` still succeeds (network objects don't require them), but
+the resulting network's DNS won't function — container hostname
+lookups will fail to resolve (dropped by the forward chain, same as
+today, not a leak) rather than silently succeeding unfiltered.
 
 ### Identity consequences (accepted, documented)
 
@@ -221,6 +313,16 @@ on the host), not bare `rm -rf`.
 - The outer userns adds no authority beyond the user's existing
   `/etc/subuid` delegation (see Mechanism). Ns-root capabilities are
   confined to the namespace.
+- **Container egress under `userns: full` required a real fix, not just
+  re-verification** — see "Container egress under `userns: full`"
+  above. The original assumption (phase 1's output-only nftables table
+  would keep gating container traffic unchanged) was wrong: rootful
+  podman's bridge-networking backend bypasses `output` entirely. This
+  was caught by the plan's own verification step before merge, not
+  shipped and found later — but it means the Goal's hard requirement
+  ("container/VM network egress must remain subject to the session's
+  nftables allow-listing") was *not* met by the initial implementation
+  and needed the forward-chain addition to actually hold.
 - Never expose a host-side container-engine socket (docker *or* podman)
   inside a sandbox: containers would run on the host, bypassing the
   session's nftables egress allow-list, and volume mounts would grant
@@ -238,15 +340,23 @@ Manual invocations through the real `./sbx` entry point, per repo
 convention. Scratch profiles under `.sbx/profiles/` (gitignored).
 
 1. `sbx --fs podman-full --net <test>` → `id` reports uid 0;
-   `cat /proc/self/uid_map` shows the 65536-range mapping.
+   `cat /proc/self/uid_map` shows the 65536-range mapping: two lines,
+   `0 <uid> 1` (the caller's own uid) and `1 <subuid-base> 65536` (the
+   subordinate range from `/etc/subuid`) — confirmed on this host.
 2. **Acceptance test:** the phase-1 failing `USER appuser` Dockerfile
    builds and runs to completion under `podman-full`.
 3. **Service-image test:** `podman run docker.io/library/postgres` (with
    required env) reaches "ready to accept connections" under
    `podman-full` — proves the root→service-user privilege drop works.
-4. nftables re-verified inside the outer userns: allowed host reachable,
-   disallowed host blocked, from both the sandbox shell and inside a
-   container.
+4. nftables re-verified inside the outer userns — **found a real gap,
+   not a rubber stamp**: initial testing found container egress
+   completely unfiltered (bridge-forwarded traffic bypassed the
+   output-only table entirely). Fixed with a forward chain (see
+   "Container egress under `userns: full`" above); re-verified after
+   the fix with both CIDR-based and hostname-based restrictive
+   profiles, from both the sandbox shell and inside a container: in
+   every case an allowed destination is reachable and a disallowed one
+   is network-layer blocked.
 5. dnsmasq/pasta re-verified: image pull succeeds under `podman-full`.
 6. `--gui` + `--net` + `podman-full`: an X app starts under xpra.
 7. Shim: plain `sbx -- docker --version` prints podman's version.
@@ -272,6 +382,14 @@ convention. Scratch profiles under `.sbx/profiles/` (gitignored).
 - Phase 1's no-net podman teardown leak is unchanged (out of scope).
 - The phase-1 `_CONTAINERS_*` internal-env dependency remains on the
   plain `podman` + `--net` path (unused by `podman-full`).
+- **New:** `netavark` + `aardvark-dns` must be installed on the host for
+  hostname-based `allow` entries to work for `podman-full` containers
+  (see "Container egress under `userns: full`" above). CIDR-based
+  `allow` entries work regardless. Without these packages, hostname
+  lookups from inside a `podman-full` container fail to resolve —
+  cleanly (dropped, not leaked), but the profile's hostname entries are
+  effectively inert for container traffic until the packages are
+  present.
 
 ## Out of scope
 
