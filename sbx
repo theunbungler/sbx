@@ -814,13 +814,16 @@ fi
 
 # userns:full only (which requires --net, enforced earlier): create the
 # DNS-enabled "sbx0" network that containers.conf's default_network now
-# points at. Idempotent (podman network create fails harmlessly if it
-# already exists in the persistent containers-full store) and only
-# reachable via the net-profile wrapper below, since userns:full without
-# --net is a hard error before session state is even created.
+# points at. Idempotent — a repeat "already exists" failure is expected
+# and harmless (confirmed: if creation ever failed for a real reason,
+# podman fails loudly downstream with "network not found" when a
+# container runs, not silently — but stderr is still logged here so the
+# actual cause isn't lost). Only reachable via the net-profile wrapper
+# below, since userns:full without --net is a hard error before session
+# state is even created.
 USERNS_NET_SETUP=""
 if [[ "$USERNS_FULL" == "true" ]]; then
-    USERNS_NET_SETUP='podman network create sbx0 >/dev/null 2>&1 || true'
+    USERNS_NET_SETUP="podman network create sbx0 >/dev/null 2>> \"$VIRT_DIR/network-create.log\" || true"
 fi
 
 if [[ -n "$NET_PROFILE" ]]; then
