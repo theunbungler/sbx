@@ -222,6 +222,19 @@ SESSION_DIR="$STATE_DIR/$SESSION_ID"
 mkdir -p "$SESSION_DIR/fs"
 mkdir -p "$SESSION_DIR/tmp"
 
+# Persistent store for cli-profile copy mounts, keyed by profile name so
+# that every `--cli <name>` session shares one identity. Derived from the
+# resolved path, so `--cli claude`, `--cli cli/claude` and
+# `--cli ./claude.json` all key the same store. Safe to live under
+# STATE_DIR: --list-sessions only considers directories with a
+# session.json, which this never has.
+CLI_PROFILE_NAME=""
+CLI_STORE_DIR=""
+if [[ -n "$CLI_PROFILE" ]]; then
+    CLI_PROFILE_NAME=$(basename "$CLI_PROFILE" .json)
+    CLI_STORE_DIR="$STATE_DIR/profiles/cli/$CLI_PROFILE_NAME"
+fi
+
 # Bwrap Arguments
 BWRAP_ARGS=(
     --unshare-ipc
@@ -376,10 +389,11 @@ SHIMEOF
 chmod +x "$SESSION_DIR/bin/docker"
 BWRAP_ARGS+=(--setenv DOCKER_HOST "unix://$PODMAN_SOCK")
 
-COPY_MOUNTS=() # Array of "source:dest"
+COPY_MOUNTS=()     # fs-profile copy mounts,  "source:dest" — ephemeral
+CLI_COPY_MOUNTS=() # cli-profile copy mounts, "source:dest" — persistent
 
 apply_mounts() {
-    local profile="$1"
+    local profile="$1" kind="${2:-fs}"
     # Use jq to extract mounts
     mounts=$(jq -c '.mounts[]?' "$profile")
     [[ -z "$mounts" ]] && return
@@ -421,31 +435,39 @@ apply_mounts() {
                 BWRAP_ARGS+=(--dev-bind "$source" "$dest")
                 ;;
             copy)
-                COPY_MOUNTS+=("$source:$dest")
+                # `copy` means different things by profile type: ephemeral
+                # snapshot in an fs profile, persistent overlay in a cli
+                # profile. See docs/superpowers/specs/2026-07-23-persistent-cli-profiles-design.md
+                if [[ "$kind" == "cli" ]]; then
+                    CLI_COPY_MOUNTS+=("$source:$dest")
+                else
+                    COPY_MOUNTS+=("$source:$dest")
+                fi
                 ;;
         esac
     done <<< "$mounts"
 }
 
 for profile in "${FS_PROFILES[@]}"; do
-    apply_mounts "$profile"
+    apply_mounts "$profile" fs
 done
 
 if [[ -n "$CLI_PROFILE" ]]; then
-    apply_mounts "$CLI_PROFILE"
+    apply_mounts "$CLI_PROFILE" cli
 fi
 
-# Pre-population for copy mounts
+# Pre-population for copy mounts. fs-profile mounts are seeded from the
+# host alone; cli-profile mounts additionally overlay the profile's
+# persistent store, so the previous session's changes come back.
 mkdir -p "$SESSION_DIR/tmp_mounts"
 
-for cm in "${COPY_MOUNTS[@]}"; do
-    src="${cm%%:*}"
-    dst="${cm#*:}"
-
+seed_copy_mount() {
+    local src="$1" dst="$2" store="$3"
+    local mount_id tmp_src
     mount_id=$(sbx_copy_mount_id "$dst")
     tmp_src="$SESSION_DIR/tmp_mounts/$mount_id"
 
-    sbx_copy_seed "$src" "$tmp_src"
+    sbx_copy_seed "$src" "$tmp_src" "$store"
 
     if [[ -d "$src" ]]; then
         BWRAP_ARGS+=(--tmpfs "$dst")
@@ -453,6 +475,15 @@ for cm in "${COPY_MOUNTS[@]}"; do
     elif [[ -f "$src" ]]; then
         BWRAP_ARGS+=(--bind "$tmp_src/$(basename "$src")" "$dst")
     fi
+}
+
+for cm in "${COPY_MOUNTS[@]}"; do
+    seed_copy_mount "${cm%%:*}" "${cm#*:}" ""
+done
+
+for cm in "${CLI_COPY_MOUNTS[@]}"; do
+    dst="${cm#*:}"
+    seed_copy_mount "${cm%%:*}" "$dst" "$CLI_STORE_DIR/$(sbx_copy_mount_id "$dst")"
 done
 
 # Parse Environment and Working Directory from all profiles
@@ -715,12 +746,24 @@ fi
 teardown() {
     echo "Tearing down session $SESSION_ID..."
     
-    # Egress for copy mounts
+    # Egress for copy mounts. fs-profile mounts land in this session's
+    # fs/ directory; cli-profile mounts land in the profile's persistent
+    # store, where the next --cli session of the same name picks them up.
+    # The diff baseline is the host source in BOTH cases — that is what
+    # keeps a file written in an earlier session in the store even when
+    # this session never touched it.
     for cm in "${COPY_MOUNTS[@]}"; do
         src="${cm%%:*}"
         dst="${cm#*:}"
         mount_id=$(sbx_copy_mount_id "$dst")
         sbx_copy_writeback "$src" "$SESSION_DIR/tmp_mounts/$mount_id" "$SESSION_DIR/fs/$mount_id"
+    done
+
+    for cm in "${CLI_COPY_MOUNTS[@]}"; do
+        src="${cm%%:*}"
+        dst="${cm#*:}"
+        mount_id=$(sbx_copy_mount_id "$dst")
+        sbx_copy_writeback "$src" "$SESSION_DIR/tmp_mounts/$mount_id" "$CLI_STORE_DIR/$mount_id"
     done
 
     rm -rf "$SESSION_DIR/tmp_mounts"
