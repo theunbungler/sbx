@@ -222,17 +222,21 @@ SESSION_DIR="$STATE_DIR/$SESSION_ID"
 mkdir -p "$SESSION_DIR/fs"
 mkdir -p "$SESSION_DIR/tmp"
 
-# Persistent store for cli-profile copy mounts, keyed by profile name so
-# that every `--cli <name>` session shares one identity. Derived from the
-# resolved path, so `--cli claude`, `--cli cli/claude` and
-# `--cli ./claude.json` all key the same store. Safe to live under
-# STATE_DIR: --list-sessions only considers directories with a
-# session.json, which this never has.
+# Persistent store for cli-profile copy mounts, keyed by profile name AND
+# the external invoking directory. `--cli claude` in ~/projA and in
+# ~/projB get separate stores, because the fs profiles normalize every
+# project to a fixed in-sandbox cwd (/workspace, /home/user/src), which
+# would otherwise pile all projects' sessions into one bucket. The profile
+# name comes from the resolved path, so `--cli claude`, `--cli cli/claude`
+# and `--cli ./claude.json` share the name component. The cwd slug is $PWD
+# (the value recorded as "cwd" in session.json) with slashes dashed.
+# Safe to live under STATE_DIR: --list-sessions only considers directories
+# with a session.json, which this never has.
 CLI_PROFILE_NAME=""
 CLI_STORE_DIR=""
 if [[ -n "$CLI_PROFILE" ]]; then
     CLI_PROFILE_NAME=$(basename "$CLI_PROFILE" .json)
-    CLI_STORE_DIR="$STATE_DIR/profiles/cli/$CLI_PROFILE_NAME"
+    CLI_STORE_DIR="$STATE_DIR/profiles/cli/$CLI_PROFILE_NAME/$(sbx_copy_path_slug "$PWD")"
 fi
 
 # Bwrap Arguments

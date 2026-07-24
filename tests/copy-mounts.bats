@@ -12,6 +12,11 @@ setup() {
     [ "$output" = "_home_user_.claude" ]
 }
 
+@test "path_slug dashes an absolute path Claude-Code style" {
+    run sbx_copy_path_slug "/home/user/projA"
+    [ "$output" = "-home-user-projA" ]
+}
+
 @test "seed copies a directory's contents from the host" {
     echo hello > "$SRC/a.txt"
     sbx_copy_seed "$SRC" "$TMP"

@@ -11,6 +11,14 @@ sbx_copy_mount_id() {
     echo "$1" | tr '/' '_'
 }
 
+# Translate an absolute path into a dashed slug, Claude-Code style, used
+# to key a persistent store by the external directory sbx was launched
+# from.
+#   /home/user/projA -> -home-user-projA
+sbx_copy_path_slug() {
+    echo "$1" | tr '/' '-'
+}
+
 # Populate a copy mount's working directory.
 #   $1 src   - host source path (file or directory)
 #   $2 tmp   - working directory to populate
