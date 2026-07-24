@@ -4,7 +4,7 @@
 
 **Goal:** Make `copy` mounts declared in a **cli** profile persist across sandbox instantiations via a per-profile store, while `copy` in an **fs** profile keeps today's ephemeral behavior.
 
-**Architecture:** The copy-mount seed and write-back logic is extracted from `sbx` into a sourceable `lib/copy-mounts.sh` so it can be unit-tested without launching a sandbox. `sbx_copy_seed` gains an optional third argument — a persistent store overlaid on top of the host copy. `sbx` then routes cli-profile copy mounts to a store under `$STATE_DIR/profiles/cli/<name>/` at both seed and teardown, leaving fs-profile mounts on the existing per-session path.
+**Architecture:** The copy-mount seed and write-back logic is extracted from `sbx` into a sourceable `lib/copy-mounts.sh` so it can be unit-tested without launching a sandbox. `sbx_copy_seed` gains an optional third argument — a persistent store overlaid on top of the host copy. `sbx` then routes cli-profile copy mounts to a store under `$STATE_DIR/profiles/cli/<name>/<cwd-slug>/` at both seed and teardown, leaving fs-profile mounts on the existing per-session path.
 
 **Tech Stack:** Bash, bwrap, bats 1.13, shellcheck, rsync (optional — a pure-bash fallback already exists), jq, envsubst.
 
@@ -18,8 +18,9 @@
 - **The host source directory is never modified.** True today, must remain true.
 - **The teardown diff baseline is the host source, never the store.** The reason is semantic: "differs from the host" is what the store is meant to hold, so it stays a minimal delta instead of growing into a full mirror. Survival of untouched files across sessions comes from write-back never pruning the store — *not* from this choice. (An earlier revision of this plan claimed otherwise and specified a test to prove it; the test was tautological. See the spec's Mechanism section.)
 - **`shellcheck -S error` must pass** on `sbx` and `lib/copy-mounts.sh`. It passes on `sbx` today (verified — 4 sub-error warnings exist and are not a regression gate).
-- Store path is exactly `$STATE_DIR/profiles/cli/<profile-name>/<mount_id>/` where `STATE_DIR="$HOME/.local/state/sbx"`.
-- `<profile-name>` is `basename "$CLI_PROFILE" .json` — derived from the *resolved* profile path, so `--cli claude`, `--cli cli/claude`, and `--cli ./claude.json` all key the same store.
+- Store path is exactly `$STATE_DIR/profiles/cli/<profile-name>/<cwd-slug>/<mount_id>/` where `STATE_DIR="$HOME/.local/state/sbx"`.
+- `<profile-name>` is `basename "$CLI_PROFILE" .json` — derived from the *resolved* profile path, so `--cli claude`, `--cli cli/claude`, and `--cli ./claude.json` share the profile-name component.
+- `<cwd-slug>` is the external invoking directory `$PWD` with slashes translated to dashes, Claude-Code style (`/home/user/projA` → `-home-user-projA`). This is what separates one project's persistent store from another's: `sbx --cli claude` in `~/projA` and in `~/projB` get separate stores. `$PWD` is the same value `sbx` records as `"cwd"` in `session.json`.
 
 **Verified environment facts** (do not re-litigate):
 - `$STATE_DIR/profiles/` cannot collide with session directories: `--list-sessions` (`sbx:123-124`) requires `$sdir/session.json`, which a store directory never has.
@@ -617,19 +618,25 @@ fi
 In `sbx`, immediately after the Session Initialization block (after `mkdir -p "$SESSION_DIR/tmp"`, line 220), add:
 
 ```bash
-# Persistent store for cli-profile copy mounts, keyed by profile name so
-# that every `--cli <name>` session shares one identity. Derived from the
-# resolved path, so `--cli claude`, `--cli cli/claude` and
-# `--cli ./claude.json` all key the same store. Safe to live under
-# STATE_DIR: --list-sessions only considers directories with a
-# session.json, which this never has.
+# Persistent store for cli-profile copy mounts, keyed by profile name AND
+# the external invoking directory. `--cli claude` in ~/projA and in
+# ~/projB get separate stores, because the fs profiles normalize every
+# project to a fixed in-sandbox cwd (/workspace, /home/user/src), which
+# would otherwise pile all projects' sessions into one bucket. The profile
+# name comes from the resolved path, so `--cli claude`, `--cli cli/claude`
+# and `--cli ./claude.json` share the name component. The cwd slug is $PWD
+# (the value recorded as "cwd" in session.json) with slashes dashed.
+# Safe to live under STATE_DIR: --list-sessions only considers directories
+# with a session.json, which this never has.
 CLI_PROFILE_NAME=""
 CLI_STORE_DIR=""
 if [[ -n "$CLI_PROFILE" ]]; then
     CLI_PROFILE_NAME=$(basename "$CLI_PROFILE" .json)
-    CLI_STORE_DIR="$STATE_DIR/profiles/cli/$CLI_PROFILE_NAME"
+    CLI_STORE_DIR="$STATE_DIR/profiles/cli/$CLI_PROFILE_NAME/$(sbx_copy_path_slug "$PWD")"
 fi
 ```
+
+`sbx_copy_path_slug` is added to `lib/copy-mounts.sh` (below).
 
 - [ ] **Step 5: Route seeding**
 
@@ -741,7 +748,7 @@ Replace the `copy` bullet with:
 ```markdown
 - **`copy`** — Writable snapshot. The source is copied into a session-local working directory at start and bound into the sandbox; the original host path is never modified. What happens to the changes depends on the profile type:
   - In an **fs** profile, changes are **ephemeral**. At teardown, new or modified files are saved to `~/.local/state/sbx/<session-id>/fs/<mount_id>/` and nothing is carried into the next session.
-  - In a **cli** profile, changes are **persistent**. They are saved to `~/.local/state/sbx/profiles/cli/<profile-name>/<mount_id>/` and replayed on top of the host copy the next time that profile is used, so a CLI tool's sessions, history, and local config survive across sandboxes.
+  - In a **cli** profile, changes are **persistent**. They are saved to `~/.local/state/sbx/profiles/cli/<profile-name>/<cwd-slug>/<mount_id>/` and replayed on top of the host copy the next time that profile is used *from the same directory*, so a CLI tool's sessions, history, and local config survive across sandboxes. `<cwd-slug>` is the directory you launched `sbx` from, so each project keeps its own persistent state.
 ```
 
 - [ ] **Step 3: Rewrite the Copy Mount Egress section**
@@ -755,7 +762,7 @@ With `copy` mounts, the sandbox isolates changes from the host. At teardown, `sb
 
 **fs profiles — ephemeral.** Changes go to `~/.local/state/sbx/<session-id>/fs/<mount_id>/` and stay there. Each session starts from the host's state.
 
-**cli profiles — persistent.** Changes go to `~/.local/state/sbx/profiles/cli/<profile-name>/<mount_id>/`, and the next session using that profile overlays this store on top of a fresh copy of the host source. This is what lets `sbx --cli claude` resume with the sessions and history it accumulated last time.
+**cli profiles — persistent.** Changes go to `~/.local/state/sbx/profiles/cli/<profile-name>/<cwd-slug>/<mount_id>/`, and the next session using that profile *from the same directory* overlays this store on top of a fresh copy of the host source. This is what lets `sbx --cli claude` resume with the sessions and history it accumulated last time. `<cwd-slug>` is the launch directory (`$PWD`) with slashes dashed, so different projects get independent stores.
 
 In both cases:
 - The **original host directory is never modified**.
@@ -768,7 +775,7 @@ In both cases:
 - **Deletions do not persist.** A file deleted inside the sandbox is restored from the host on the next launch — the host directory is the floor. If you want it gone, delete it from the store.
 - **Written files shadow the host.** Once a session writes a given file, the store's version wins on every later launch, so subsequent host-side edits to *that file* are not seen. Host changes to files the sandbox has never touched still come through normally. To start over, delete the profile's store directory.
 
-The profile name is the store key: every `sbx --cli claude`, in any directory, shares one store. Concurrent sessions are allowed and are not locked — write-back is per file, and the last session to tear down wins for any file it changed. This matches how the CLI tools already behave across concurrent sessions on the host.
+The store key is the profile name plus the launch directory: `sbx --cli claude` resumes only when re-run from the same directory, and two directories keep independent stores. Concurrent sessions from the same directory are allowed and are not locked — write-back is per file, and the last session to tear down wins for any file it changed. This matches how the CLI tools already behave across concurrent sessions on the host.
 
 **Example directory structure:**
 
@@ -781,8 +788,11 @@ The profile name is the store key: every `sbx --cli claude`, in any directory, s
   profiles/
     cli/
       claude/
-        _home_user_.claude/    # persistent store for `--cli claude`
-        _home_user_.claude.json
+        -home-user-projA/          # store for `--cli claude` launched from ~/projA
+          _home_user_.claude/
+          _home_user_.claude.json
+        -home-user-projB/          # independent store for the same profile in ~/projB
+          _home_user_.claude/
 ```
 ```
 
@@ -793,7 +803,7 @@ Run:
 grep -n "profiles/cli" README.md
 bats tests/persistent-cli.bats
 ```
-Expected: the README store path matches the path asserted in the tests (`.../state/sbx/profiles/cli/<name>/<mount_id>/`); 8 tests PASS.
+Expected: the README store path matches the path asserted in the tests (`.../state/sbx/profiles/cli/<name>/<cwd-slug>/<mount_id>/`); tests PASS.
 
 - [ ] **Step 5: Commit**
 
@@ -811,10 +821,10 @@ git commit -m "Document copy-mount semantics as profile-type dependent"
 | Spec requirement | Task |
 |---|---|
 | `copy` semantic chosen by profile type | 3 (steps 3, 5, 6) |
-| cli profile name is the store key | 3 (step 4) |
+| store keyed by profile name + external launch dir | 3 (step 4) |
 | Declared perms still honoured — only `copy` affected | 3 (step 3; `ro`/`rw`/`dev` cases untouched) |
 | Overlay, not replacement | 2 (tests), 1 (impl) |
-| Store at `$STATE_DIR/profiles/cli/<name>/<mount_id>/` | 3 (step 4) |
+| Store at `$STATE_DIR/profiles/cli/<name>/<cwd-slug>/<mount_id>/` | 3 (step 4) |
 | Diff baseline stays the host source | 2 ("survives a session that never touches it"), 3 (step 6 + comment) |
 | No locking; last-teardown-wins; never prunes the store | 1 (`sbx_copy_writeback` never deletes), 4 (documented) |
 | `cp -a --reflink=auto` | 1 (step 3) |

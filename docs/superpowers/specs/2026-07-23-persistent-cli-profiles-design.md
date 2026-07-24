@@ -35,10 +35,32 @@ never resume its own prior session.
   profiles scope a sandbox's view of a *project*; cli profiles carry a
   *tool's identity*. Identity is the thing that should persist.
 
-- **The cli profile name is the store key.** No `--instance` flag, no
-  per-project keying. `--cli claude` anywhere gets the same store. This
-  follows from the decision above: if the cli profile *is* the identity,
-  it is also the natural persistence unit.
+- **The store is keyed by cli profile name *and* the external invoking
+  directory.** `sbx --cli claude` in `~/projA` and in `~/projB` get
+  separate persistent stores; re-running in the same directory resumes.
+  No `--instance` flag.
+
+  An earlier revision of this spec keyed on the profile name alone, on the
+  theory that a cli profile *is* one identity and should persist as one
+  unit. That was wrong in practice, for a reason that only surfaced during
+  implementation: the fs profiles normalize every project to a fixed
+  working directory inside the sandbox (`sandbox.json` mounts `$PWD` at
+  `/workspace`; `default.json` maps `./src` to `/home/user/src`). The CLI
+  therefore sees the *same* cwd in every project, so the tool's own
+  per-project partitioning — Claude Code writes sessions under
+  `~/.claude/projects/<cwd-slug>/` — collapses into a single bucket. Under
+  a name-only store, that means every project's sessions accumulate in one
+  shared `projects/-workspace/` directory and interleave. Keying the store
+  by the external invoking path restores the per-project separation the
+  CLI can no longer make for itself, matching how these tools behave
+  unsandboxed.
+
+  This does mean auth and global config (`.claude.json`, `settings.json`)
+  are *not* shared across projects — each directory re-authenticates. That
+  is a deliberate accepted cost of doing the separation at the store layer
+  rather than by preserving the real cwd inside the sandbox (which would
+  have been a broader change to fs-profile working-directory handling,
+  out of this feature's scope).
 
 - **Declared perms are still honoured.** Only mounts declared
   `"perm": "copy"` get the persistent treatment. `ro` and `rw` in a cli
@@ -67,14 +89,18 @@ never resume its own prior session.
 The store lives at:
 
 ```
-~/.local/state/sbx/profiles/cli/<profile-name>/<mount_id>/
+~/.local/state/sbx/profiles/cli/<profile-name>/<cwd-slug>/<mount_id>/
 ```
 
 `<mount_id>` is the existing `dest`-with-slashes-translated identifier
-(`/home/user/.claude` → `_home_user_.claude`), so the store is
-structurally identical to today's per-session `fs/<mount_id>/` egress
-directory. It *is* that directory, promoted from per-session to
-per-profile scope.
+(`/home/user/.claude` → `_home_user_.claude`), so the leaf is structurally
+identical to today's per-session `fs/<mount_id>/` egress directory.
+
+`<cwd-slug>` is the external invoking directory (`$PWD`, the same value
+`sbx` already records as `"cwd"` in `session.json`) with slashes
+translated, Claude-Code style: `/home/user/projA` → `-home-user-projA`.
+This is the component that separates one project's persistent store from
+another's.
 
 **Seed (session start), for each `copy` mount in the applied cli
 profile:**
@@ -113,10 +139,11 @@ no overlay and egress to `$SESSION_DIR/fs/<mount_id>/`, exactly as now.
 
 ## Concurrency
 
-Two simultaneous `sbx --cli claude` sandboxes share one store. This is
-safe enough to need no locking, because these CLIs already assume
-concurrent sessions and lay their state out accordingly. Inspection of a
-real `~/.claude`:
+Two simultaneous `sbx --cli claude` sandboxes launched *from the same
+directory* share one store (a different directory is a different store
+and never contends). This is safe enough to need no locking, because
+these CLIs already assume concurrent sessions and lay their state out
+accordingly. Inspection of a real `~/.claude`:
 
 - `projects/<path>/<uuid>.jsonl` — one file per session
 - `shell-snapshots/`, `session-env/`, `tasks/`, `debug/`,
