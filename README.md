@@ -230,7 +230,7 @@ In both cases:
 **Persistent store behavior.** Two consequences follow from the overlay model and are intentional:
 
 - **Deletions do not persist.** A file deleted inside the sandbox is restored from the host on the next launch — the host directory is the floor. If you want it gone, delete it from the store.
-- **Written files shadow the host.** Once a session writes a given file, the store's version wins on every later launch, so subsequent host-side edits to *that file* are not seen. Host changes to files the sandbox has never touched still come through normally. To start over, delete the profile's store directory.
+- **Written files shadow the host.** Once a session writes a given file, the store's version wins on every later launch, so subsequent host-side edits to *that file* are not seen. Host changes to files the sandbox has never touched still come through normally. To start over, delete this directory's store (`~/.local/state/sbx/profiles/cli/<profile-name>/<cwd-slug>/`); other directories' stores for the same profile are unaffected.
 
 The store key is the profile name plus the launch directory: `sbx --cli claude` resumes only when re-run from the same directory, and two directories keep independent stores. Concurrent sessions from the same directory are allowed and are not locked — write-back is per file, and the last session to tear down wins for any file it changed. This matches how the CLI tools already behave across concurrent sessions on the host.
 
