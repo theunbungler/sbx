@@ -16,7 +16,7 @@
 - **No new runtime dependencies.** `rsync` stays optional with its existing fallback.
 - **Declared perms are honoured.** Only `"perm": "copy"` mounts are affected. `ro`, `rw`, and `dev` behavior is untouched in both profile types.
 - **The host source directory is never modified.** True today, must remain true.
-- **The teardown diff baseline is the host source, never the store.** This is load-bearing: it is what makes a file written in session 1 survive session 3 even when session 3 never touches it. Do not "simplify" this to diffing against the store.
+- **The teardown diff baseline is the host source, never the store.** The reason is semantic: "differs from the host" is what the store is meant to hold, so it stays a minimal delta instead of growing into a full mirror. Survival of untouched files across sessions comes from write-back never pruning the store — *not* from this choice. (An earlier revision of this plan claimed otherwise and specified a test to prove it; the test was tautological. See the spec's Mechanism section.)
 - **`shellcheck -S error` must pass** on `sbx` and `lib/copy-mounts.sh`. It passes on `sbx` today (verified — 4 sub-error warnings exist and are not a regression gate).
 - Store path is exactly `$STATE_DIR/profiles/cli/<profile-name>/<mount_id>/` where `STATE_DIR="$HOME/.local/state/sbx"`.
 - `<profile-name>` is `basename "$CLI_PROFILE" .json` — derived from the *resolved* profile path, so `--cli claude`, `--cli cli/claude`, and `--cli ./claude.json` all key the same store.
@@ -383,14 +383,16 @@ Append to `tests/copy-mounts.bats` (and add `STORE="$WORK/store"` to the `setup(
     [ "$(cat "$TMP/sub/a.txt")" = "stored" ]
 }
 
-# The load-bearing one: proves the diff baseline must be the host source.
-# b.txt came from the store, was never touched this session, and must
-# still be in the store afterwards.
+# The round trip: a store file must reach the working copy, and must
+# still be in the store after a session that never modified it. The
+# mid-test assertion is what makes this depend on the overlay — without
+# it the test passes even with the overlay removed entirely.
 @test "a stored file survives a session that never touches it" {
     echo host > "$SRC/a.txt"
     mkdir -p "$STORE"
     echo stored > "$STORE/b.txt"
     sbx_copy_seed "$SRC" "$TMP" "$STORE"
+    [ "$(cat "$TMP/b.txt")" = "stored" ]
     sbx_copy_writeback "$SRC" "$TMP" "$STORE"
     [ "$(cat "$STORE/b.txt")" = "stored" ]
 }
@@ -403,7 +405,7 @@ Expected: 15 tests, **4 failures**. `sbx_copy_seed` ignores its third argument, 
 - "seed overlays store entries on top of the host copy" — `$TMP/a.txt` still holds `host`
 - "seed brings through store files absent from the host" — `c.txt` never appears
 - "seed overlays nested store paths" — `sub/a.txt` still holds `host`
-- "a stored file survives a session that never touches it" — `b.txt` never reaches `$TMP`, so write-back does not return it to the store
+- "a stored file survives a session that never touches it" — `b.txt` never reaches `$TMP`, so the mid-test assertion fails
 
 The other two new tests ("brings through host files absent from the store", "tolerates a store that does not exist yet") pass already — they assert the host-copy behavior Task 1 built, and are here to pin it against regression once the overlay lands. Do not treat their passing as a problem.
 

@@ -93,10 +93,20 @@ profile:**
 2. Write the differing files into the **persistent store** rather than
    into `$SESSION_DIR/fs/<mount_id>/`.
 
-The diff baseline stays the host source, not the store. This is what
-makes the store accumulate correctly: a file the sandbox wrote in an
-earlier session still differs from the host, so it is re-written to the
-store and survives, even in a session that never touched it.
+The diff baseline stays the host source, not the store. The reason is
+semantic, not a correctness cliff: "differs from the host" is what the
+store is supposed to mean — the set of divergences from the user's real
+config — so the store stays a minimal delta rather than growing into a
+full mirror of the host directory.
+
+An earlier draft of this spec claimed the baseline was load-bearing for
+survival — that a file written in session 1 would be dropped in session 3
+unless the comparison used the host. That was wrong, and the test written
+to prove it was tautological (it passed with the overlay removed
+entirely). Survival across untouched sessions comes from write-back never
+pruning the store, not from the choice of baseline. Recorded here because
+the false claim is more dangerous than the true one: it would have sent a
+future reader hunting for a bug that does not exist.
 
 fs-profile `copy` mounts take neither path. They seed from the host with
 no overlay and egress to `$SESSION_DIR/fs/<mount_id>/`, exactly as now.
