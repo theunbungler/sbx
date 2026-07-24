@@ -44,11 +44,12 @@
 
 ### Task 1: Extract copy-mount logic into a testable library
 
-Pure refactor plus two robustness fixes. Behavior for existing users is unchanged: fs and cli `copy` mounts both still egress to `$SESSION_DIR/fs/<mount_id>/`.
+Pure refactor plus three robustness fixes. Behavior for existing users is unchanged: fs and cli `copy` mounts both still egress to `$SESSION_DIR/fs/<mount_id>/`.
 
-The two fixes folded in here, both in code this task is already rewriting:
+The three fixes folded in here, all in code this task is already rewriting:
 - `cp -a` gains `--reflink=auto`, making the seed a metadata-only CoW operation when source and destination share a btrfs/xfs filesystem (they do by default: `~/.claude` and `~/.local/state/sbx` are both under `$HOME`). Silently falls back to a full copy otherwise.
 - The single-file write-back path calls `stat` on a file the sandbox may have deleted (`sbx:761`). Under `set -e` inside an `EXIT` trap that can abort teardown. Guarded with an existence check.
+- The rsync-fallback branch's bare `cd "$tmp_src"` (`sbx:732`) becomes `cd "$tmp" || exit 0`. Same motivation as the guard above, and it satisfies shellcheck SC2164. Strictly safer: an unguarded failed `cd` would leave the subshell in the wrong working directory and `find .` would then walk it, egressing unrelated files. Unreachable in practice — `sbx_copy_seed` always `mkdir -p`s the directory first — so there is no success-path behavior change.
 
 **Files:**
 - Create: `lib/copy-mounts.sh`
