@@ -12,13 +12,14 @@ sbx_copy_mount_id() {
 }
 
 # Populate a copy mount's working directory.
-#   $1 src - host source path (file or directory)
-#   $2 tmp - working directory to populate
+#   $1 src   - host source path (file or directory)
+#   $2 tmp   - working directory to populate
+#   $3 store - optional persistent store, overlaid on top of the host copy
 #
 # --reflink=auto makes this metadata-only on btrfs/xfs when src and tmp
 # share a filesystem, and silently falls back to a full copy otherwise.
 sbx_copy_seed() {
-    local src="$1" tmp="$2"
+    local src="$1" tmp="$2" store="${3:-}"
 
     mkdir -p "$tmp"
 
@@ -26,6 +27,12 @@ sbx_copy_seed() {
         cp -a --reflink=auto "$src/." "$tmp/"
     elif [[ -f "$src" ]]; then
         cp -a --reflink=auto "$src" "$tmp/"
+    fi
+
+    # Store entries win over the host copy, per file. Applied after the
+    # host copy, so the store is the upper layer.
+    if [[ -n "$store" && -d "$store" ]]; then
+        cp -a --reflink=auto "$store/." "$tmp/"
     fi
 }
 
