@@ -8,6 +8,9 @@ STATE_DIR="$HOME/.local/state/sbx"
 CONFIG_DIR="$HOME/.config/sbx"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# shellcheck source=lib/copy-mounts.sh
+source "$SCRIPT_DIR/lib/copy-mounts.sh"
+
 GUI_MODE=false
 XPRA_DISPLAY=""
 
@@ -439,16 +442,15 @@ for cm in "${COPY_MOUNTS[@]}"; do
     src="${cm%%:*}"
     dst="${cm#*:}"
 
-    mount_id=$(echo "$dst" | tr '/' '_')
+    mount_id=$(sbx_copy_mount_id "$dst")
     tmp_src="$SESSION_DIR/tmp_mounts/$mount_id"
-    mkdir -p "$tmp_src"
+
+    sbx_copy_seed "$src" "$tmp_src"
 
     if [[ -d "$src" ]]; then
-        cp -a "$src/." "$tmp_src/"
         BWRAP_ARGS+=(--tmpfs "$dst")
         BWRAP_ARGS+=(--bind "$tmp_src" "$dst")
     elif [[ -f "$src" ]]; then
-        cp -a "$src" "$tmp_src/"
         BWRAP_ARGS+=(--bind "$tmp_src/$(basename "$src")" "$dst")
     fi
 done
@@ -717,56 +719,8 @@ teardown() {
     for cm in "${COPY_MOUNTS[@]}"; do
         src="${cm%%:*}"
         dst="${cm#*:}"
-        mount_id=$(echo "$dst" | tr '/' '_')
-        tmp_src="$SESSION_DIR/tmp_mounts/$mount_id"
-        
-        egress_dir="$SESSION_DIR/fs/$mount_id"
-        mkdir -p "$egress_dir"
-        
-        if [[ -d "$src" ]]; then
-            if command -v rsync >/dev/null 2>&1; then
-                # Optimized sync using rsync
-                rsync -a --compare-dest="$src/" "$tmp_src/" "$egress_dir/"
-            else
-                (
-                    cd "$tmp_src"
-                    find . -type f -print0 | while IFS= read -r -d '' rel_path; do
-                        rel_path="${rel_path#./}"
-                        file="$tmp_src/$rel_path"
-                        orig_file="$src/$rel_path"
-
-                        needs_copy=0
-                        if [[ ! -f "$orig_file" ]]; then
-                            needs_copy=1
-                        else
-                            if [[ $(stat -c %s "$file") -ne $(stat -c %s "$orig_file") ]] || \
-                               [[ $(stat -c %Y "$file") -gt $(stat -c %Y "$orig_file") ]]; then
-                                needs_copy=1
-                            fi
-                        fi
-
-                        if [[ $needs_copy -eq 1 ]]; then
-                            mkdir -p "$(dirname "$egress_dir/$rel_path")"
-                            cp -a "$file" "$egress_dir/$rel_path"
-                        fi
-                    done
-                )
-            fi
-        elif [[ -f "$src" ]]; then
-            # If it's a single file, it's copied into tmp_src/$(basename src)
-            filename=$(basename "$src")
-            file="$tmp_src/$filename"
-            
-            needs_copy=0
-            if [[ $(stat -c %s "$file") -ne $(stat -c %s "$src") ]] || \
-               [[ $(stat -c %Y "$file") -gt $(stat -c %Y "$src") ]]; then
-                needs_copy=1
-            fi
-            
-            if [[ $needs_copy -eq 1 ]]; then
-                cp -a "$file" "$egress_dir/$filename"
-            fi
-        fi
+        mount_id=$(sbx_copy_mount_id "$dst")
+        sbx_copy_writeback "$src" "$SESSION_DIR/tmp_mounts/$mount_id" "$SESSION_DIR/fs/$mount_id"
     done
 
     rm -rf "$SESSION_DIR/tmp_mounts"
