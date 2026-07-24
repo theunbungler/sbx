@@ -111,18 +111,18 @@ setup() {
     [ "$(cat "$TMP/sub/a.txt")" = "stored" ]
 }
 
-# Verify the store overlay reaches the working copy and persists unchanged
-# when not modified during the session. The store-only file b.txt is overlaid
-# into the working copy during seed, and remains in the store after write-back
-# (proving the diff baseline is the host source, not the overlay).
+# The round trip: a store-only file must reach the working copy, and must
+# still be in the store after a session that never modified it. The
+# mid-test assertion is what makes this depend on the overlay — without it
+# the test passes even with the overlay removed entirely.
 @test "a stored file survives a session that never touches it" {
     echo host > "$SRC/a.txt"
     mkdir -p "$STORE"
     echo stored > "$STORE/b.txt"
     sbx_copy_seed "$SRC" "$TMP" "$STORE"
-    # Assert the overlay worked: store file reached the working copy
+    # The overlay reached the working copy.
     [ "$(cat "$TMP/b.txt")" = "stored" ]
     sbx_copy_writeback "$SRC" "$TMP" "$STORE"
-    # Assert post-writeback: store file was not modified (still in store)
+    # Write-back left an untouched store entry alone.
     [ "$(cat "$STORE/b.txt")" = "stored" ]
 }
