@@ -59,7 +59,7 @@ The two fixes folded in here, both in code this task is already rewriting:
 - Consumes: nothing.
 - Produces:
   - `sbx_copy_mount_id <dest>` → echoes the flat mount id (`/home/u/.claude` → `_home_u_.claude`)
-  - `sbx_copy_seed <src> <tmp> [store]` → populates `<tmp>`; returns 0 with `<tmp>` created-but-empty if `<src>` does not exist. `[store]` is unused until Task 2.
+  - `sbx_copy_seed <src> <tmp>` → populates `<tmp>`; returns 0 with `<tmp>` created-but-empty if `<src>` does not exist. Task 2 adds an optional third parameter.
   - `sbx_copy_writeback <src> <tmp> <out>` → copies files in `<tmp>` that differ from `<src>` into `<out>`. Never modifies `<src>`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -165,14 +165,13 @@ sbx_copy_mount_id() {
 }
 
 # Populate a copy mount's working directory.
-#   $1 src   - host source path (file or directory)
-#   $2 tmp   - working directory to populate
-#   $3 store - optional persistent store, overlaid on top of the host copy
+#   $1 src - host source path (file or directory)
+#   $2 tmp - working directory to populate
 #
 # --reflink=auto makes this metadata-only on btrfs/xfs when src and tmp
 # share a filesystem, and silently falls back to a full copy otherwise.
 sbx_copy_seed() {
-    local src="$1" tmp="$2" store="${3:-}"
+    local src="$1" tmp="$2"
 
     mkdir -p "$tmp"
 
@@ -180,13 +179,6 @@ sbx_copy_seed() {
         cp -a --reflink=auto "$src/." "$tmp/"
     elif [[ -f "$src" ]]; then
         cp -a --reflink=auto "$src" "$tmp/"
-    else
-        return 0
-    fi
-
-    # Store entries win over the host copy, per file.
-    if [[ -n "$store" && -d "$store" ]]; then
-        cp -a --reflink=auto "$store/." "$tmp/"
     fi
 }
 
@@ -335,15 +327,15 @@ sandbox may have deleted."
 
 ### Task 2: Overlay a persistent store during seeding
 
-Teaches `sbx_copy_seed` to use its third argument. Nothing calls it with a store yet, so this task changes no observable `sbx` behavior — it is gated purely on its own tests.
+Adds an optional third parameter to `sbx_copy_seed`: a persistent store overlaid on top of the host copy. Nothing calls it with a store yet, so this task changes no observable `sbx` behavior — it is gated purely on its own tests.
 
 **Files:**
-- Modify: `lib/copy-mounts.sh` (already accepts and applies `$3` from Task 1 — verify, do not duplicate)
+- Modify: `lib/copy-mounts.sh` (`sbx_copy_seed` — add the `store` parameter and the overlay)
 - Modify: `tests/copy-mounts.bats`
 
 **Interfaces:**
-- Consumes: `sbx_copy_seed <src> <tmp> [store]`, `sbx_copy_writeback <src> <tmp> <out>` from Task 1.
-- Produces: no new symbols. Establishes the overlay contract Task 3 depends on: store entries win per file; host entries absent from the store still come through; a nonexistent store is not an error.
+- Consumes: `sbx_copy_seed <src> <tmp>`, `sbx_copy_writeback <src> <tmp> <out>` from Task 1.
+- Produces: `sbx_copy_seed <src> <tmp> [store]` — the third parameter is optional and backward compatible, so Task 1's two-argument call sites in `sbx` keep working untouched. Establishes the overlay contract Task 3 depends on: store entries win per file; host entries absent from the store still come through; a nonexistent or empty store is not an error.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -403,18 +395,64 @@ Append to `tests/copy-mounts.bats` (and add `STORE="$WORK/store"` to the `setup(
 }
 ```
 
-- [ ] **Step 2: Run tests**
+- [ ] **Step 2: Run tests to verify they fail**
 
 Run: `bats tests/copy-mounts.bats`
-Expected: 15 tests, all PASS — Task 1's implementation already satisfies these.
+Expected: 15 tests, **4 failures**. `sbx_copy_seed` ignores its third argument, so these fail:
+- "seed overlays store entries on top of the host copy" — `$TMP/a.txt` still holds `host`
+- "seed brings through store files absent from the host" — `c.txt` never appears
+- "seed overlays nested store paths" — `sub/a.txt` still holds `host`
+- "a stored file survives a session that never touches it" — `b.txt` never reaches `$TMP`, so write-back does not return it to the store
 
-If any fail, fix `sbx_copy_seed` in `lib/copy-mounts.sh`; the overlay must be `cp -a --reflink=auto "$store/." "$tmp/"` applied *after* the host copy, guarded by `[[ -n "$store" && -d "$store" ]]`.
+The other two new tests ("brings through host files absent from the store", "tolerates a store that does not exist yet") pass already — they assert the host-copy behavior Task 1 built, and are here to pin it against regression once the overlay lands. Do not treat their passing as a problem.
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 3: Add the overlay**
+
+In `lib/copy-mounts.sh`, replace `sbx_copy_seed` with:
+
+```bash
+# Populate a copy mount's working directory.
+#   $1 src   - host source path (file or directory)
+#   $2 tmp   - working directory to populate
+#   $3 store - optional persistent store, overlaid on top of the host copy
+#
+# --reflink=auto makes this metadata-only on btrfs/xfs when src and tmp
+# share a filesystem, and silently falls back to a full copy otherwise.
+sbx_copy_seed() {
+    local src="$1" tmp="$2" store="${3:-}"
+
+    mkdir -p "$tmp"
+
+    if [[ -d "$src" ]]; then
+        cp -a --reflink=auto "$src/." "$tmp/"
+    elif [[ -f "$src" ]]; then
+        cp -a --reflink=auto "$src" "$tmp/"
+    fi
+
+    # Store entries win over the host copy, per file. Applied after the
+    # host copy, so the store is the upper layer.
+    if [[ -n "$store" && -d "$store" ]]; then
+        cp -a --reflink=auto "$store/." "$tmp/"
+    fi
+}
+```
+
+The third parameter is optional, so Task 1's two-argument call sites in `sbx` are unaffected.
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run:
+```bash
+shellcheck -S error lib/copy-mounts.sh
+bats tests/copy-mounts.bats
+```
+Expected: shellcheck silent; 15 tests PASS.
+
+- [ ] **Step 5: Commit**
 
 ```bash
 git add tests/copy-mounts.bats lib/copy-mounts.sh
-git commit -m "Cover the persistent-store overlay contract in copy-mount seeding"
+git commit -m "Overlay an optional persistent store when seeding a copy mount"
 ```
 
 ---
@@ -790,4 +828,4 @@ No gaps.
 
 **Type consistency:** `sbx_copy_mount_id`, `sbx_copy_seed`, `sbx_copy_writeback` are spelled identically in the library, in both test files, and at all four `sbx` call sites. `CLI_COPY_MOUNTS`, `CLI_STORE_DIR`, and `CLI_PROFILE_NAME` are consistent between Task 3 steps 3, 4, 5 and 6. `seed_copy_mount`'s three parameters match both loops that call it.
 
-**One deliberate ordering note:** Task 2 is expected to pass immediately against Task 1's implementation, because Task 1 writes the store overlay into `sbx_copy_seed` as part of the extracted function. Task 2 is therefore a test-only gate that locks the contract before Task 3 depends on it, rather than a red-to-green cycle. Its step 2 says so explicitly and tells the implementer what to fix if it does go red.
+**Ordering note:** Task 1 deliberately does *not* write the store parameter into `sbx_copy_seed`, even though the finished function needs it. Doing so would leave Task 1 with an untested, unused branch — a YAGNI defect a reviewer should flag — and would leave Task 2 with nothing to turn from red to green. The overlay is therefore added in Task 2 as a genuine red-to-green cycle. The cost is that `lib/copy-mounts.sh` is edited in two consecutive tasks; that is the normal shape of TDD, not churn.
