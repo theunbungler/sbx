@@ -102,6 +102,13 @@ translated, Claude-Code style: `/home/user/projA` → `-home-user-projA`.
 This is the component that separates one project's persistent store from
 another's.
 
+Like Claude Code's own slug, this is lossy: `/home/user/a-b` and
+`/home/user/a/b` both slug to `-home-user-a-b`, so two sibling projects
+differing only in dash-vs-slash would share a store. Accepted — it
+requires a contrived directory layout, affects only the one user's own
+projects (no cross-trust-boundary effect), and matches the upstream tools'
+identical behavior.
+
 **Seed (session start), for each `copy` mount in the applied cli
 profile:**
 
