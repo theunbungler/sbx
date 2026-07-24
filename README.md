@@ -115,13 +115,15 @@ Each entry in the `mounts` array has these fields:
 |-------|------|----------|-------------|
 | `source` | string | Yes | Host path. Supports `$HOME`, `$PWD`, and other environment variables via `envsubst`. |
 | `dest` | string | Yes | Destination path inside the sandbox. Also supports variable substitution. |
-| `perm` | string | Yes | Mount permission: one of `ro` (read-only bind), `rw` (read-write bind), `dev` (device bind, for files under `/dev`), or `copy` (writable snapshot) |
+| `perm` | string | Yes | Mount permission: one of `ro` (read-only bind), `rw` (read-write bind), `dev` (device bind, for files under `/dev`), or `copy` (writable snapshot — see below; behavior differs between fs and cli profiles) |
 
 **Permission modes explained:**
 
 - **`ro`** — Read-only bind mount. The sandbox sees the host directory but cannot modify it.
 - **`rw`** — Read-write bind mount. Changes made inside the sandbox are reflected on the host.
-- **`copy`** — Writable snapshot. The directory is copied into a tmpfs at session start. Changes inside the sandbox are **not** written back to the host. Instead, on session teardown, only **modified or new files** are compared against the original host source and saved to `~/.local/state/sbx/<session-id>/fs/<mount_id>/`. The original host directory is never modified.
+- **`copy`** — Writable snapshot. The source is copied into a session-local working directory at start and bound into the sandbox; the original host path is never modified. What happens to the changes depends on the profile type:
+  - In an **fs** profile, changes are **ephemeral**. At teardown, new or modified files are saved to `~/.local/state/sbx/<session-id>/fs/<mount_id>/` and nothing is carried into the next session.
+  - In a **cli** profile, changes are **persistent**. They are saved to `~/.local/state/sbx/profiles/cli/<profile-name>/<cwd-slug>/<mount_id>/` and replayed on top of the host copy the next time that profile is used *from the same directory*, so a CLI tool's sessions, history, and local config survive across sandboxes. `<cwd-slug>` is the directory you launched `sbx` from, so each project keeps its own persistent state.
 - **`dev`** — Device bind mount (`--dev-bind`). Like `rw`, but allows device-node access (a plain `ro`/`rw` bind mounts `nodev`, so opening a device file would fail). Used for things like `/dev/kvm` and `/dev/net/tun`.
 
 **Example:**
@@ -213,21 +215,41 @@ When multiple profiles set the same environment variable or `workingDirectory`, 
 
 ## Copy Mount Egress
 
-When using `copy` mounts (permission `"copy"`), the sandbox isolates changes from the host. At session teardown, `sbx` automatically handles **egress** — it compares the temporary copies inside the sandbox against the original host source and saves only the files that were **new or modified** to `~/.local/state/sbx/<session-id>/fs/<mount_id>/`.
+With `copy` mounts, the sandbox isolates changes from the host. At teardown, `sbx` compares the working copy against the **original host source** and saves only the files that are **new or modified**. Where they are saved depends on the profile the mount was declared in.
 
-This means:
-- The **original host directory is never modified** during the session.
-- Only **changed files** are preserved in the state directory.
-- The egress uses `rsync --compare-dest` when available (efficient diff-based sync), otherwise falls back to a file-by-file size and timestamp comparison.
-- The temporary tmpfs copies are cleaned up after egress.
+**fs profiles — ephemeral.** Changes go to `~/.local/state/sbx/<session-id>/fs/<mount_id>/` and stay there. Each session starts from the host's state.
+
+**cli profiles — persistent.** Changes go to `~/.local/state/sbx/profiles/cli/<profile-name>/<cwd-slug>/<mount_id>/`, and the next session using that profile *from the same directory* overlays this store on top of a fresh copy of the host source. This is what lets `sbx --cli claude` resume with the sessions and history it accumulated last time. `<cwd-slug>` is the launch directory (`$PWD`) with slashes dashed, so different projects get independent stores.
+
+In both cases:
+- The **original host directory is never modified**.
+- Only **changed files** are written; the comparison baseline is always the host source, never the store.
+- The egress uses `rsync --compare-dest` when available, otherwise a file-by-file size and timestamp comparison.
+- The session's temporary working copies are cleaned up afterwards.
+
+**Persistent store behavior.** Two consequences follow from the overlay model and are intentional:
+
+- **Deletions do not persist.** A file deleted inside the sandbox is restored from the host on the next launch — the host directory is the floor. If you want it gone, delete it from the store.
+- **Written files shadow the host.** Once a session writes a given file, the store's version wins on every later launch, so subsequent host-side edits to *that file* are not seen. Host changes to files the sandbox has never touched still come through normally. To start over, delete the profile's store directory.
+
+The store key is the profile name plus the launch directory: `sbx --cli claude` resumes only when re-run from the same directory, and two directories keep independent stores. Concurrent sessions from the same directory are allowed and are not locked — write-back is per file, and the last session to tear down wins for any file it changed. This matches how the CLI tools already behave across concurrent sessions on the host.
 
 **Example directory structure:**
 
 ```
-~/.local/state/sbx/20260627-143000-0001/
-  session.json
-  fs/
-    _home_user_myproject/   # egressed files from copy mount /home/user/myproject
+~/.local/state/sbx/
+  20260627-143000-0001/
+    session.json
+    fs/
+      _home_user_myproject/    # ephemeral egress from an fs profile copy mount
+  profiles/
+    cli/
+      claude/
+        -home-user-projA/          # store for `--cli claude` launched from ~/projA
+          _home_user_.claude/
+          _home_user_.claude.json
+        -home-user-projB/          # independent store for the same profile in ~/projB
+          _home_user_.claude/
 ```
 
 ## GUI Attachment
