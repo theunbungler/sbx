@@ -681,10 +681,12 @@ Replace the teardown block written in Task 1 Step 7 with:
 ```bash
     # Egress for copy mounts. fs-profile mounts land in this session's
     # fs/ directory; cli-profile mounts land in the profile's persistent
-    # store, where the next --cli session of the same name picks them up.
-    # The diff baseline is the host source in BOTH cases — that is what
-    # keeps a file written in an earlier session in the store even when
-    # this session never touched it.
+    # store (keyed by profile + launch dir), where the next --cli session
+    # from the same directory picks them up. The diff baseline is the host
+    # source in BOTH cases — not for survival (write-back never prunes the
+    # store, so a file written in an earlier session persists regardless of
+    # baseline) but so the store stays a minimal delta from the user's real
+    # config rather than a full mirror of it.
     for cm in "${COPY_MOUNTS[@]}"; do
         src="${cm%%:*}"
         dst="${cm#*:}"
