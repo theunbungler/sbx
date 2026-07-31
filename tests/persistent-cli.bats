@@ -3,8 +3,8 @@
 setup() {
     SBX="$(cd "$BATS_TEST_DIRNAME/.." && pwd)/sbx"
 
-    # NOT $BATS_TEST_TMPDIR — it embeds the test name, and sbx's abduco
-    # socket at $HOME/.local/state/sbx/<session-id>/abduco.sock would blow
+    # NOT $BATS_TEST_TMPDIR — it embeds the test name, and sbx's session
+    # socket at $HOME/.local/state/sbx/<session-id>/session.sock would blow
     # the ~108-char sun_path limit, failing with "create-session: File name
     # too long" before the command ever runs. Verified: a long HOME fails,
     # /tmp/sbxh.XXXXXX (66 chars total) works. Keep this path short.
@@ -33,8 +33,9 @@ teardown() {
     [[ -n "$ROOT" && "$ROOT" == /tmp/sbxh.* ]] && rm -rf "$ROOT"
 }
 
-# Run a shell command inside a sandbox. sbx ends in `abduco -c`, which
-# needs a pty; `script -qec` supplies one non-interactively.
+# Run a shell command inside a sandbox. sbx ends in `abduco -c` (or the
+# dtach fallback), which needs a pty; `script -qec` supplies one
+# non-interactively.
 run_sbx() {
     ( cd "$PROJ" && script -qec "$SBX $1 -- /bin/sh -c '$2'" /dev/null >/dev/null 2>&1 )
 }
