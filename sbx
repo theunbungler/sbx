@@ -135,6 +135,7 @@ NET_PROFILE=""
 CLI_PROFILE=""
 COMMAND=()
 GUI_FLAG=false
+CAPS_KEEP=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -323,6 +324,25 @@ else
     # as the host (matches what the --net branch already does via pasta).
     BWRAP_ARGS+=(--unshare-user --unshare-net)
 fi
+
+# The payload never needs capabilities; only session setup does, and that
+# happens outside the sandbox (see the launch-script generation below).
+#
+# CAP_SETPCAP is retained deliberately and is the ONLY capability kept.
+# It is the privilege the wrapper's setpriv needs to empty the bounding
+# set, which bwrap leaves full whenever it JOINS an existing user
+# namespace instead of creating one — i.e. the --net path. Dropping it
+# here makes setpriv fail with "apply bounding set: Operation not
+# permitted" and every session exit 127. CAP_SETPCAP cannot mount,
+# configure networking, or change ownership, so holding it across the
+# single exec into setpriv is not an escape surface.
+if [[ "$CAPS_KEEP" != "true" ]]; then
+    BWRAP_ARGS+=(--cap-drop ALL --cap-add CAP_SETPCAP)
+fi
+
+# Reap the sandbox if sbx itself dies, rather than leaking a detached
+# session with no supervisor.
+BWRAP_ARGS+=(--die-with-parent)
 
 # --- Virt (podman/qemu) base plumbing ---
 # Always applied: adds no attack surface (nested single-UID userns was
@@ -922,12 +942,23 @@ $(printf "%q " "${COMMAND[@]}")
 $DOCKER_API_STOP
 kill \$DNSMASQ_PID 2>/dev/null || true
 EOF
-else
+elif [[ "$CAPS_KEEP" == "true" ]]; then
     cat > "$CAT_WRAPPER" <<EOF
 #!/bin/bash
 $DOCKER_API_START
 $(printf "%q " "${COMMAND[@]}")
 $DOCKER_API_STOP
+EOF
+else
+    # setpriv spends the retained CAP_SETPCAP to empty the bounding set,
+    # then execs the payload with every capability set at zero. If setpriv
+    # is absent or fails, the exec fails and the payload never runs: the
+    # failure mode is closed, not open. exec because a capless session has
+    # no docker-API service to stop afterwards.
+    cat > "$CAT_WRAPPER" <<EOF
+#!/bin/bash
+exec setpriv --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- \\
+    $(printf "%q " "${COMMAND[@]}")
 EOF
 fi
 chmod +x "$CAT_WRAPPER"
