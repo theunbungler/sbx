@@ -90,6 +90,14 @@ run_sbx() {
     ( cd "$PROJ" && script -qec "$SBX $1 -- /bin/sh -c '$2'" /dev/null >/dev/null 2>&1 )
 }
 
+# CANARY — keep this first. Every other test in this file asserts that
+# something is DENIED inside the sandbox, so all of them pass vacuously if
+# the sandbox fails to launch at all. This one fails loudly instead.
+@test "a sandbox command actually runs" {
+    run_sbx "--fs caps" "echo ran > /out/ran.txt"
+    [ "$(cat "$HOSTDIR/ran.txt")" = "ran" ]
+}
+
 # REGRESSION GUARDS, not a red-green cycle: bwrap zeroes every capability
 # set — effective and bounding — whenever it creates the user namespace
 # itself, which is what the no-net path does. So both capability tests
@@ -163,12 +171,17 @@ fi
 
 # The payload never needs capabilities; only session setup does, and that
 # happens outside the sandbox (see the launch-script generation below).
-# --cap-drop ALL zeroes the effective set but leaves the bounding set full;
-# setpriv in the wrapper empties that too. Both are applied because
-# --cap-drop alone would let a setuid binary regain privilege if bwrap ever
-# stopped setting no_new_privs.
+#
+# CAP_SETPCAP is retained deliberately and is the ONLY capability kept.
+# It is the privilege the wrapper's setpriv needs to empty the bounding
+# set, which bwrap leaves full whenever it JOINS an existing user
+# namespace instead of creating one — i.e. the --net path. Dropping it
+# here makes setpriv fail with "apply bounding set: Operation not
+# permitted" and every session exit 127. CAP_SETPCAP cannot mount,
+# configure networking, or change ownership, so holding it across the
+# single exec into setpriv is not an escape surface.
 if [[ "$CAPS_KEEP" != "true" ]]; then
-    BWRAP_ARGS+=(--cap-drop ALL)
+    BWRAP_ARGS+=(--cap-drop ALL --cap-add CAP_SETPCAP)
 fi
 
 # Reap the sandbox if sbx itself dies, rather than leaking a detached
@@ -208,9 +221,11 @@ $(printf "%q " "${COMMAND[@]}")
 $DOCKER_API_STOP
 EOF
 else
-    # setpriv empties the capability bounding set, which --cap-drop ALL
-    # leaves intact. exec because a capless session has no docker-API
-    # service to stop afterwards.
+    # setpriv spends the retained CAP_SETPCAP to empty the bounding set,
+    # then execs the payload with every capability set at zero. If setpriv
+    # is absent or fails, the exec fails and the payload never runs: the
+    # failure mode is closed, not open. exec because a capless session has
+    # no docker-API service to stop afterwards.
     cat > "$CAT_WRAPPER" <<EOF
 #!/bin/bash
 exec setpriv --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- \\
@@ -443,9 +458,11 @@ $(printf "%q " "${COMMAND[@]}")
 $DOCKER_API_STOP
 EOF
 else
-    # setpriv empties the capability bounding set, which --cap-drop ALL
-    # leaves intact. exec because a capless session has no docker-API
-    # service to stop afterwards. USERNS_NET_SETUP and DOCKER_API_START are
+    # setpriv spends the retained CAP_SETPCAP to empty the bounding set,
+    # then execs the payload with every capability set at zero. If setpriv
+    # is absent or fails, the exec fails and the payload never runs: the
+    # failure mode is closed, not open. exec because a capless session has
+    # no docker-API service to stop afterwards. USERNS_NET_SETUP and DOCKER_API_START are
     # both podman operations and are unreachable without capabilities, so
     # they are absent here by construction.
     cat > "$CAT_WRAPPER" <<EOF

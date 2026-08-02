@@ -92,7 +92,8 @@ launch.sh          (pasta ns, privileged)
     nft -f rules.nft                  # hard-fail, as today
     dnsmasq … &                       # outside the sandbox's PID and mount ns
     readiness probe
-    bwrap --cap-drop ALL --die-with-parent … <mux> -c sock wrapper.sh
+    bwrap --cap-drop ALL --cap-add CAP_SETPCAP --die-with-parent …
+          <mux> -c sock wrapper.sh
     trap: kill dnsmasq
 
 wrapper.sh         (sandbox, unprivileged)
@@ -100,9 +101,21 @@ wrapper.sh         (sandbox, unprivileged)
         -- <command>
 ```
 
-`--cap-drop ALL` zeroes the effective set but leaves `CapBnd` full. That is
-inert because bwrap sets `NoNewPrivs=1`, but `setpriv` empties the bounding set
-too, so both are applied.
+**Why `CAP_SETPCAP` is retained.** bwrap zeroes every capability set when it
+*creates* the user namespace, but leaves all of them full when it *joins* one —
+which is what the `--net` path does, since pasta creates the namespace. So
+`--cap-drop ALL` is required for net mode, and there it zeroes the effective
+set while leaving `CapBnd` full. `setpriv` empties the bounding set, but
+dropping bounding bits itself requires `CAP_SETPCAP`: a plain `--cap-drop ALL`
+takes away the very privilege `setpriv` needs, and the wrapper dies with
+`setpriv: apply bounding set: Operation not permitted`, exit 127, in *every*
+session.
+
+Retaining exactly `CAP_SETPCAP` resolves it. Measured on bubblewrap 0.11.2,
+both modes reach `CapEff=0 CapBnd=0` with `ro` remount and `nft flush` both
+denied. `CAP_SETPCAP` cannot mount, configure networking, or change ownership,
+so holding it across the single exec into `setpriv` is not an escape surface,
+and a missing or failing `setpriv` fails closed — the payload never runs.
 
 Consequences beyond the capability drop itself:
 
