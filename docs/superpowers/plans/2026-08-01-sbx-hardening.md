@@ -553,7 +553,15 @@ done
 printf "%q -c %q %q\n" "$SESSION_MUX" "$SESSION_SOCK" "$CAT_WRAPPER" >> "$LAUNCH_SCRIPT"
 
 if [[ -n "$NET_PRELUDE" ]]; then
-    printf 'SBX_RC=$?\nkill $DNSMASQ_PID 2>/dev/null || true\nexit $SBX_RC\n' >> "$LAUNCH_SCRIPT"
+    # Quoted heredoc: every expansion below belongs to launch.sh, not here.
+    # Do NOT use `printf 'SBX_RC=$?\n…'` for this — shellcheck flags the
+    # single-quoted `$` as SC2016, which would violate the no-new-findings
+    # constraint. The heredoc emits identical bytes with no new finding.
+    cat >> "$LAUNCH_SCRIPT" <<'REAPEOF'
+SBX_RC=$?
+kill $DNSMASQ_PID 2>/dev/null || true
+exit $SBX_RC
+REAPEOF
 fi
 
 chmod +x "$LAUNCH_SCRIPT"
