@@ -98,6 +98,33 @@ run_sbx() {
     [ "$(cat "$HOSTDIR/ran.txt")" = "ran" ]
 }
 
+# Networked sessions need pasta and a usable default route; skip rather
+# than fail where neither exists. Tasks 2 onward reuse both helpers.
+requires_net() {
+    command -v pasta >/dev/null 2>&1 || skip "pasta not installed"
+    ip route show default | grep -q . || skip "no default route"
+}
+
+net_fixture() {
+    cat > "$PROJ/.sbx/profiles/net/tstnet.json" <<'NETEOF'
+{"description":"test","dns":"1.1.1.1","allow":["example.com"],"ports":[443]}
+NETEOF
+}
+
+# SECOND CANARY. Networked mode is Task 2's scope, but THIS task is the
+# one that can break it: the capability flags are appended to a single
+# global BWRAP_ARGS array, so a cap-drop meant for no-net silently
+# applies to --net too. Until Task 2 relocates them, the --net wrapper
+# runs nft and dnsmasq inside the sandbox and needs CAP_NET_ADMIN;
+# without this test the breakage is invisible, because nothing else in
+# tests/ launches a networked session.
+@test "a networked session still runs" {
+    requires_net
+    net_fixture
+    run_sbx "--fs caps --net tstnet" "echo netran > /out/netran.txt"
+    [ "$(cat "$HOSTDIR/netran.txt")" = "netran" ]
+}
+
 # REGRESSION GUARDS, not a red-green cycle: bwrap zeroes every capability
 # set — effective and bounding — whenever it creates the user namespace
 # itself, which is what the no-net path does. So both capability tests
@@ -140,7 +167,7 @@ CapEff: 0000000000000000
 CapBnd: 0000000000000000
 ```
 
-**This task has no red test, by design.** Both capability tests are regression guards for the no-net path. The `--cap-drop ALL --cap-add CAP_SETPCAP` line added in Step 3 is not redundant — it applies to *both* modes, and in net mode bwrap leaves all sets full (`CapBnd: 000001ffffffffff`), so that line is what does the real work. Task 2's networked tests are its red: they fail before this line exists and pass after. Do not fabricate a failure here, and do not restructure these tests to fail first.
+**This task has no red test, by design.** Both capability tests are regression guards for the no-net path, which is the only path this task touches. The `--cap-drop ALL --cap-add CAP_SETPCAP` line added in Step 3 is deliberately gated on `-z "$NET_PROFILE"`: in net mode bwrap leaves all sets full (`CapBnd: 000001ffffffffff`), but the wrapper there still runs `nft` and `dnsmasq` inside the sandbox until Task 2 moves them out, so dropping caps now would break every networked session. Task 2 removes that guard and supplies the real red. Do not fabricate a failure here, and do not restructure these tests to fail first.
 
 The `ro`-mount tests in this file *do* exercise real behaviour on the no-net path and should pass throughout.
 
@@ -180,7 +207,13 @@ fi
 # permitted" and every session exit 127. CAP_SETPCAP cannot mount,
 # configure networking, or change ownership, so holding it across the
 # single exec into setpriv is not an escape surface.
-if [[ "$CAPS_KEEP" != "true" ]]; then
+# Scoped to the no-net path in THIS task. Until Task 2 relocates nft and
+# dnsmasq, the --net wrapper still runs them INSIDE bwrap, where they
+# genuinely need CAP_NET_ADMIN. Dropping caps for net sessions here kills
+# every one of them at `nft -f` with "cache initialization failed:
+# Operation not permitted". Task 2 removes the -z "$NET_PROFILE" guard in
+# the same commit that moves the setup out.
+if [[ "$CAPS_KEEP" != "true" && -z "$NET_PROFILE" ]]; then
     BWRAP_ARGS+=(--cap-drop ALL --cap-add CAP_SETPCAP)
 fi
 
@@ -271,20 +304,9 @@ The core change. `nft` and `dnsmasq` move from `wrapper.sh` (inside the sandbox)
 
 Append to `tests/hardening.bats`:
 
+**Note:** `requires_net()` and `net_fixture()` already exist in this file — Task 1 added them for its "a networked session still runs" canary. Do not redefine them; just use them.
+
 ```bash
-# Networked tests need pasta and a usable default route; skip rather than
-# fail on machines that have neither.
-requires_net() {
-    command -v pasta >/dev/null 2>&1 || skip "pasta not installed"
-    ip route show default | grep -q . || skip "no default route"
-}
-
-net_fixture() {
-    cat > "$PROJ/.sbx/profiles/net/tstnet.json" <<'EOF'
-{"description":"test","dns":"1.1.1.1","allow":["example.com"],"ports":[443]}
-EOF
-}
-
 @test "a networked sandbox holds no capabilities" {
     requires_net
     net_fixture
@@ -359,6 +381,20 @@ else
 ```
 
 Leave the `else` body from Task 1 unchanged.
+
+Then **remove Task 1's temporary net-mode guard**. Task 1 scoped the cap-drop to no-net because the wrapper still ran `nft` and `dnsmasq` inside the sandbox. Steps 4–6 below move them out, so the guard must go in this same commit or net sessions stay capable and the whole hardening is a no-op for them. Change:
+
+```bash
+if [[ "$CAPS_KEEP" != "true" && -z "$NET_PROFILE" ]]; then
+```
+
+to:
+
+```bash
+if [[ "$CAPS_KEEP" != "true" ]]; then
+```
+
+and update the comment above it — delete the paragraph about the guard being temporary, since it no longer is.
 
 - [ ] **Step 4: Build the setup prelude and emit it into `launch.sh`**
 
