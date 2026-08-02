@@ -90,11 +90,15 @@ run_sbx() {
     ( cd "$PROJ" && script -qec "$SBX $1 -- /bin/sh -c '$2'" /dev/null >/dev/null 2>&1 )
 }
 
-# REGRESSION GUARD, not a red-green cycle: no-net sandboxes are already
-# capless today, so this test passes before the change too. It is here
-# because Task 2 rewrites the capability handling for both modes, and
-# nothing else would catch the no-net path regressing. Deliberate — do
-# not "fix" it into a failing-first test.
+# REGRESSION GUARDS, not a red-green cycle: bwrap zeroes every capability
+# set — effective and bounding — whenever it creates the user namespace
+# itself, which is what the no-net path does. So both capability tests
+# below pass before the change as well as after. They are here because
+# Task 2 rewrites capability handling for both modes and nothing else
+# would catch the no-net path regressing. The red for the capability
+# work lives in Task 2's networked tests, where bwrap joins pasta's
+# namespace instead and leaves every set full. Deliberate — do not
+# "fix" these into failing-first tests.
 @test "a no-net sandbox holds no capabilities" {
     run_sbx "--fs caps" "grep '^CapEff' /proc/self/status > /out/caps.txt"
     [[ "$(cat "$HOSTDIR/caps.txt")" == *"0000000000000000" ]]
@@ -120,7 +124,17 @@ run_sbx() {
 
 Run: `bats tests/hardening.bats`
 
-Expected: "a no-net sandbox holds no capabilities" PASSES — it is a labelled regression guard, not a red-green cycle (see the comment above it). "holds an empty capability bounding set" FAILS — `CapBnd` is currently full because nothing drops it. That failing test is this task's red.
+Expected: **both** capability tests PASS before the change. bwrap zeroes every capability set — effective *and* bounding — whenever it creates the user namespace itself, which is exactly what the no-net path does. Verified on bubblewrap 0.11.2:
+
+```
+$ bwrap --unshare-user --unshare-net ... -- grep -E '^(CapEff|CapBnd)' /proc/self/status
+CapEff: 0000000000000000
+CapBnd: 0000000000000000
+```
+
+**This task has no red test, by design.** Both capability tests are regression guards for the no-net path. The `--cap-drop ALL` line added in Step 3 is not redundant — it applies to *both* modes, and in net mode bwrap leaves all sets full (`CapBnd: 000001ffffffffff`), so that line is what does the real work. Task 2's networked tests are its red: they fail before this line exists and pass after. Do not fabricate a failure here, and do not restructure these tests to fail first.
+
+The `ro`-mount tests in this file *do* exercise real behaviour on the no-net path and should pass throughout.
 
 - [ ] **Step 3: Add the cap-drop flags to the no-net branch**
 
