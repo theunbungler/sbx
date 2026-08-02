@@ -325,8 +325,11 @@ else
     BWRAP_ARGS+=(--unshare-user --unshare-net)
 fi
 
-# The payload never needs capabilities; only session setup does, and that
-# happens outside the sandbox (see the launch-script generation below).
+# The payload never needs capabilities. Session setup does — and where
+# that setup runs is what the guard below is about: a no-net session has
+# none, but a --net session still runs nft and dnsmasq INSIDE the sandbox
+# until they are relocated. So the drop is scoped to the no-net path for
+# now; see the TEMPORARY GUARD note further down.
 #
 # CAP_SETPCAP is retained deliberately and is the ONLY capability kept.
 # It is the privilege the wrapper's setpriv needs to empty the bounding
@@ -336,12 +339,13 @@ fi
 # permitted" and every session exit 127. CAP_SETPCAP cannot mount,
 # configure networking, or change ownership, so holding it across the
 # single exec into setpriv is not an escape surface.
-# Scoped to the no-net path in THIS task. Until Task 2 relocates nft and
-# dnsmasq, the --net wrapper still runs them INSIDE bwrap, where they
-# genuinely need CAP_NET_ADMIN. Dropping caps for net sessions here kills
-# every one of them at `nft -f` with "cache initialization failed:
-# Operation not permitted". Task 2 removes the -z "$NET_PROFILE" guard in
-# the same commit that moves the setup out.
+#
+# TEMPORARY GUARD — the `-z "$NET_PROFILE"` clause below. While the --net
+# wrapper still runs nft and dnsmasq inside bwrap, those genuinely need
+# CAP_NET_ADMIN; dropping caps for net sessions kills every one of them at
+# `nft -f` with "cache initialization failed: Operation not permitted".
+# Delete that clause in the same change that moves the setup out of the
+# sandbox — not before, and not after.
 if [[ "$CAPS_KEEP" != "true" && -z "$NET_PROFILE" ]]; then
     BWRAP_ARGS+=(--cap-drop ALL --cap-add CAP_SETPCAP)
 fi
