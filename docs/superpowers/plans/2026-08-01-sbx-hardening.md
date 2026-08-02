@@ -140,7 +140,7 @@ CapEff: 0000000000000000
 CapBnd: 0000000000000000
 ```
 
-**This task has no red test, by design.** Both capability tests are regression guards for the no-net path. The `--cap-drop ALL` line added in Step 3 is not redundant — it applies to *both* modes, and in net mode bwrap leaves all sets full (`CapBnd: 000001ffffffffff`), so that line is what does the real work. Task 2's networked tests are its red: they fail before this line exists and pass after. Do not fabricate a failure here, and do not restructure these tests to fail first.
+**This task has no red test, by design.** Both capability tests are regression guards for the no-net path. The `--cap-drop ALL --cap-add CAP_SETPCAP` line added in Step 3 is not redundant — it applies to *both* modes, and in net mode bwrap leaves all sets full (`CapBnd: 000001ffffffffff`), so that line is what does the real work. Task 2's networked tests are its red: they fail before this line exists and pass after. Do not fabricate a failure here, and do not restructure these tests to fail first.
 
 The `ro`-mount tests in this file *do* exercise real behaviour on the no-net path and should pass throughout.
 
