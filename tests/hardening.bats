@@ -101,3 +101,37 @@ NETEOF
     run_sbx "--fs caps" "mount -n -o remount,bind,rw /ro 2>/dev/null; echo pwned > /ro/f.txt 2>/dev/null; true"
     [ "$(cat "$RODIR/f.txt")" = "readonly" ]
 }
+
+# The red-green pair for the relocation. Under --net, bwrap joins pasta's
+# user namespace instead of creating it, so every capability set arrives
+# full; these four fail until nft and dnsmasq move to launch.sh and the
+# payload can be run capless.
+@test "a networked sandbox holds no capabilities" {
+    requires_net
+    net_fixture
+    run_sbx "--fs caps --net tstnet" "grep '^CapEff' /proc/self/status > /out/ncaps.txt"
+    [[ "$(cat "$HOSTDIR/ncaps.txt")" == *"0000000000000000" ]]
+}
+
+@test "a networked sandbox cannot flush the egress firewall" {
+    requires_net
+    net_fixture
+    run_sbx "--fs caps --net tstnet" "nft flush ruleset 2>/dev/null && echo BAD > /out/n.txt || echo GOOD > /out/n.txt"
+    [ "$(cat "$HOSTDIR/n.txt")" = "GOOD" ]
+}
+
+@test "a networked sandbox cannot remount a ro mount writable" {
+    requires_net
+    net_fixture
+    run_sbx "--fs caps --net tstnet" "mount -n -o remount,bind,rw /ro 2>/dev/null && echo BAD > /out/nr.txt || echo GOOD > /out/nr.txt"
+    [ "$(cat "$HOSTDIR/nr.txt")" = "GOOD" ]
+}
+
+# dnsmasq now lives outside the sandbox's PID namespace, so the payload
+# cannot signal it — the resolver is unreachable, not merely unwritable.
+@test "a networked sandbox cannot see the dnsmasq process" {
+    requires_net
+    net_fixture
+    run_sbx "--fs caps --net tstnet" "ps ax > /out/ps.txt 2>/dev/null || true"
+    ! grep -q dnsmasq "$HOSTDIR/ps.txt"
+}

@@ -291,31 +291,39 @@ BWRAP_ARGS=(
 if [[ -n "$NET_PROFILE" ]]; then
     # When networking is enabled, pasta creates the user and net namespaces.
     # bwrap joins them and provides filesystem isolation.
-    # We need to keep capabilities to allow dnscrypt-proxy and nftables to work.
-    BWRAP_ARGS+=(--cap-add ALL)
+    #
+    # pasta maps the host uid to 0 inside the namespace. bwrap does NOT drop
+    # inherited capabilities when it is not the namespace's creator, so
+    # without an explicit --cap-drop ALL (added below) the payload would run
+    # as uid 0 with a full ambient set — able to remount every ro bind rw and
+    # to flush the nftables ruleset. nft and dnsmasq now run in launch.sh,
+    # outside the sandbox, so nothing in here needs privilege.
+    if [[ "$CAPS_KEEP" == "true" ]]; then
+        BWRAP_ARGS+=(--cap-add ALL)
 
-    # podman/crun decide rootless-vs-rootful by checking geteuid()==0, not
-    # actual privilege. --cap-add ALL above makes the sandboxed process look
-    # like real root (uid 0, full capability bits) to podman, so it skips its
-    # normal single-UID-mapping fallback and assumes a genuine system gid=5
-    # exists for its default devpts mount — which fails with EINVAL, since
-    # this is still a single-identity-mapped namespace underneath. These
-    # containers/common env vars are the documented override for exactly
-    # this case (a process nested in a constrained namespace where EUID==0
-    # doesn't mean real privilege): they force podman back onto the correct
-    # rootless code path regardless of what geteuid() reports. Confirmed
-    # this doesn't touch networking — container egress is still fully
-    # gated by this session's own nftables allow-list either way.
-    # In userns-full mode these overrides are exactly wrong: there podman
-    # MUST run rootful-in-namespace (euid 0 backed by a real multi-UID
-    # mapping), and forcing the rootless code path would resurrect the
-    # single-UID limitation the outer userns exists to remove.
-    if [[ "$USERNS_FULL" != "true" ]]; then
-        BWRAP_ARGS+=(
-            --setenv _CONTAINERS_USERNS_CONFIGURED done
-            --setenv _CONTAINERS_ROOTLESS_UID "$(id -u)"
-            --setenv _CONTAINERS_ROOTLESS_GID "$(id -g)"
-        )
+        # podman/crun decide rootless-vs-rootful by checking geteuid()==0, not
+        # actual privilege. --cap-add ALL above makes the sandboxed process look
+        # like real root (uid 0, full capability bits) to podman, so it skips its
+        # normal single-UID-mapping fallback and assumes a genuine system gid=5
+        # exists for its default devpts mount — which fails with EINVAL, since
+        # this is still a single-identity-mapped namespace underneath. These
+        # containers/common env vars are the documented override for exactly
+        # this case (a process nested in a constrained namespace where EUID==0
+        # doesn't mean real privilege): they force podman back onto the correct
+        # rootless code path regardless of what geteuid() reports. Confirmed
+        # this doesn't touch networking — container egress is still fully
+        # gated by this session's own nftables allow-list either way.
+        # In userns-full mode these overrides are exactly wrong: there podman
+        # MUST run rootful-in-namespace (euid 0 backed by a real multi-UID
+        # mapping), and forcing the rootless code path would resurrect the
+        # single-UID limitation the outer userns exists to remove.
+        if [[ "$USERNS_FULL" != "true" ]]; then
+            BWRAP_ARGS+=(
+                --setenv _CONTAINERS_USERNS_CONFIGURED done
+                --setenv _CONTAINERS_ROOTLESS_UID "$(id -u)"
+                --setenv _CONTAINERS_ROOTLESS_GID "$(id -g)"
+            )
+        fi
     fi
 else
     # Without networking, bwrap creates its own namespaces.
@@ -325,11 +333,10 @@ else
     BWRAP_ARGS+=(--unshare-user --unshare-net)
 fi
 
-# The payload never needs capabilities. Session setup does — and where
-# that setup runs is what the guard below is about: a no-net session has
-# none, but a --net session still runs nft and dnsmasq INSIDE the sandbox
-# until they are relocated. So the drop is scoped to the no-net path for
-# now; see the TEMPORARY GUARD note further down.
+# The payload never needs capabilities. Session setup does, but all of it
+# now runs outside the sandbox: nft and dnsmasq in launch.sh, inside
+# pasta's namespaces and before bwrap starts. So the drop applies to both
+# modes.
 #
 # CAP_SETPCAP is retained deliberately and is the ONLY capability kept.
 # It is the privilege the wrapper's setpriv needs to empty the bounding
@@ -339,14 +346,7 @@ fi
 # permitted" and every session exit 127. CAP_SETPCAP cannot mount,
 # configure networking, or change ownership, so holding it across the
 # single exec into setpriv is not an escape surface.
-#
-# TEMPORARY GUARD — the `-z "$NET_PROFILE"` clause below. While the --net
-# wrapper still runs nft and dnsmasq inside bwrap, those genuinely need
-# CAP_NET_ADMIN; dropping caps for net sessions kills every one of them at
-# `nft -f` with "cache initialization failed: Operation not permitted".
-# Delete that clause in the same change that moves the setup out of the
-# sandbox — not before, and not after.
-if [[ "$CAPS_KEEP" != "true" && -z "$NET_PROFILE" ]]; then
+if [[ "$CAPS_KEEP" != "true" ]]; then
     BWRAP_ARGS+=(--cap-drop ALL --cap-add CAP_SETPCAP)
 fi
 
@@ -887,6 +887,7 @@ if [[ "$USERNS_FULL" == "true" ]]; then
     USERNS_NET_SETUP="podman network create sbx0 >/dev/null 2>> \"$VIRT_DIR/network-create.log\" || true"
 fi
 
+NET_PRELUDE=""
 if [[ -n "$NET_PROFILE" ]]; then
     # Serialise per-domain flags for expansion inside the heredoc.
     if [[ "$ALLOW_ALL" == "true" ]]; then
@@ -896,8 +897,11 @@ if [[ -n "$NET_PROFILE" ]]; then
         DNSMASQ_DOMAIN_FLAGS=$(printf '%s ' "${DNSMASQ_DOMAIN_ARGS[@]}")
     fi
 
-    cat > "$CAT_WRAPPER" <<EOF
-#!/bin/bash
+    # Runs in launch.sh: inside pasta's namespaces, before bwrap, with the
+    # capabilities nft and dnsmasq need. Everything started here lives
+    # outside the sandbox's PID and mount namespaces, so the payload can
+    # neither signal dnsmasq nor alter the ruleset.
+    NET_PRELUDE=$(cat <<EOF
 ip link set lo up >/dev/null 2>&1
 
 # Hard-fail if nftables rules cannot be loaded — never proceed with open egress.
@@ -927,6 +931,18 @@ fi
     > "$DNS_DIR/dnsmasq.log" 2>&1 &
 DNSMASQ_PID=\$!
 
+# The probe must query this session's dnsmasq, but launch.sh sees the host
+# /etc/resolv.conf. A throwaway bwrap binds the session resolv.conf so the
+# check is accurate and every setup failure still prints before the session
+# multiplexer starts.
+probe_dns() {
+    bwrap --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib \\
+        --symlink usr/lib64 /lib64 --ro-bind /etc /etc \\
+        --ro-bind "$DNS_DIR/resolv.conf" /etc/resolv.conf \\
+        --proc /proc --dev /dev \\
+        -- getent ahostsv4 "$TEST_DOMAIN" >/dev/null 2>&1
+}
+
 DNS_READY=false
 for i in {1..20}; do
     if ! kill -0 \$DNSMASQ_PID 2>/dev/null; then
@@ -934,7 +950,7 @@ for i in {1..20}; do
         cat "$DNS_DIR/dnsmasq.log" >&2
         exit 1
     fi
-    if [[ -z "$TEST_DOMAIN" ]] || getent ahostsv4 "$TEST_DOMAIN" >/dev/null 2>&1; then
+    if [[ -z "$TEST_DOMAIN" ]] || probe_dns; then
         DNS_READY=true
         break
     fi
@@ -946,15 +962,16 @@ if [[ "\$DNS_READY" != "true" ]]; then
     kill \$DNSMASQ_PID 2>/dev/null
     exit 1
 fi
-$USERNS_NET_SETUP
-$DOCKER_API_START
-$(printf "%q " "${COMMAND[@]}")
-$DOCKER_API_STOP
-kill \$DNSMASQ_PID 2>/dev/null || true
 EOF
-elif [[ "$CAPS_KEEP" == "true" ]]; then
+)
+fi
+
+# The wrapper is now the payload and nothing else — network setup has moved
+# to launch.sh, so both modes generate the same shape.
+if [[ "$CAPS_KEEP" == "true" ]]; then
     cat > "$CAT_WRAPPER" <<EOF
 #!/bin/bash
+$USERNS_NET_SETUP
 $DOCKER_API_START
 $(printf "%q " "${COMMAND[@]}")
 $DOCKER_API_STOP
@@ -964,7 +981,9 @@ else
     # then execs the payload with every capability set at zero. If setpriv
     # is absent or fails, the exec fails and the payload never runs: the
     # failure mode is closed, not open. exec because a capless session has
-    # no docker-API service to stop afterwards.
+    # no docker-API service to stop afterwards. USERNS_NET_SETUP and
+    # DOCKER_API_START are both podman operations and are unreachable
+    # without capabilities, so they are absent here by construction.
     cat > "$CAT_WRAPPER" <<EOF
 #!/bin/bash
 exec setpriv --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- \\
@@ -973,20 +992,43 @@ EOF
 fi
 chmod +x "$CAT_WRAPPER"
 
-# Generate the launch script with properly escaped BWRAP_ARGS
-cat > "$LAUNCH_SCRIPT" <<EOF
-#!/bin/bash
-# Start the sandbox
-EOF
+# Generate the launch script with properly escaped BWRAP_ARGS.
+# pasta runs this inside the session's user and net namespaces, so the
+# network prelude lands there — outside every namespace bwrap creates.
+{
+    echo "#!/bin/bash"
+    echo "# Start the sandbox"
+    if [[ -n "$NET_PRELUDE" ]]; then
+        echo "$NET_PRELUDE"
+    fi
+} > "$LAUNCH_SCRIPT"
 
-printf "exec bwrap " >> "$LAUNCH_SCRIPT"
+# With networking the script must outlive bwrap to reap dnsmasq, so it
+# cannot exec. Without networking there is nothing to clean up.
+if [[ -n "$NET_PRELUDE" ]]; then
+    printf "bwrap " >> "$LAUNCH_SCRIPT"
+else
+    printf "exec bwrap " >> "$LAUNCH_SCRIPT"
+fi
 for arg in "${BWRAP_ARGS[@]}"; do
     printf "%q " "$arg" >> "$LAUNCH_SCRIPT"
 done
 printf "%q -c %q %q\n" "$SESSION_MUX" "$SESSION_SOCK" "$CAT_WRAPPER" >> "$LAUNCH_SCRIPT"
 
+if [[ -n "$NET_PRELUDE" ]]; then
+    # Quoted heredoc: every expansion below belongs to launch.sh, not here.
+    cat >> "$LAUNCH_SCRIPT" <<'REAPEOF'
+SBX_RC=$?
+kill $DNSMASQ_PID 2>/dev/null || true
+exit $SBX_RC
+REAPEOF
+fi
+
 chmod +x "$LAUNCH_SCRIPT"
 
+# --no-map-gw on both calls: pasta otherwise translates the gateway address
+# to the host's loopback, which would let the sandbox reach host-local
+# services through $HOST_GW without ever traversing a rule that names them.
 if [[ -n "$NET_PROFILE" ]]; then
     if [[ "$USERNS_FULL" == "true" ]]; then
         echo "Starting session $SESSION_ID with networking (full userns)..."
@@ -996,10 +1038,10 @@ if [[ -n "$NET_PROFILE" ]]; then
         # then NOT create its own user namespace (that would discard the
         # multi-UID mapping): --netns-only.
         unshare --map-auto --map-root-user -- \
-            pasta -f --config-net --netns-only --interface "$HOST_IFACE" --no-ndp --no-dhcpv6 --no-ra -a "$HOST_IP" -g "$HOST_GW" -n "$HOST_MASK" -- "$LAUNCH_SCRIPT"
+            pasta -f --config-net --netns-only --no-map-gw --interface "$HOST_IFACE" --no-ndp --no-dhcpv6 --no-ra -a "$HOST_IP" -g "$HOST_GW" -n "$HOST_MASK" -- "$LAUNCH_SCRIPT"
     else
         echo "Starting session $SESSION_ID with networking..."
-        pasta -f --config-net --interface "$HOST_IFACE" --no-ndp --no-dhcpv6 --no-ra -a "$HOST_IP" -g "$HOST_GW" -n "$HOST_MASK" -- "$LAUNCH_SCRIPT"
+        pasta -f --config-net --no-map-gw --interface "$HOST_IFACE" --no-ndp --no-dhcpv6 --no-ra -a "$HOST_IP" -g "$HOST_GW" -n "$HOST_MASK" -- "$LAUNCH_SCRIPT"
     fi
 else
     echo "Starting session $SESSION_ID..."
