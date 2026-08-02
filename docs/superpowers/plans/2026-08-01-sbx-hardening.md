@@ -90,6 +90,11 @@ run_sbx() {
     ( cd "$PROJ" && script -qec "$SBX $1 -- /bin/sh -c '$2'" /dev/null >/dev/null 2>&1 )
 }
 
+# REGRESSION GUARD, not a red-green cycle: no-net sandboxes are already
+# capless today, so this test passes before the change too. It is here
+# because Task 2 rewrites the capability handling for both modes, and
+# nothing else would catch the no-net path regressing. Deliberate — do
+# not "fix" it into a failing-first test.
 @test "a no-net sandbox holds no capabilities" {
     run_sbx "--fs caps" "grep '^CapEff' /proc/self/status > /out/caps.txt"
     [[ "$(cat "$HOSTDIR/caps.txt")" == *"0000000000000000" ]]
@@ -115,7 +120,7 @@ run_sbx() {
 
 Run: `bats tests/hardening.bats`
 
-Expected: "a no-net sandbox holds no capabilities" PASSES (no-net was already capless), "holds an empty capability bounding set" FAILS — `CapBnd` is currently full because nothing drops it.
+Expected: "a no-net sandbox holds no capabilities" PASSES — it is a labelled regression guard, not a red-green cycle (see the comment above it). "holds an empty capability bounding set" FAILS — `CapBnd` is currently full because nothing drops it. That failing test is this task's red.
 
 - [ ] **Step 3: Add the cap-drop flags to the no-net branch**
 
