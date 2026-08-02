@@ -13,7 +13,7 @@
 - **No custom code.** Stock tools only: `bwrap`, `pasta`, `nft`, `dnsmasq`, `abduco`/`dtach`, `jq`, `setpriv`, `unshare`, `git`. No new binaries, no compiled artifacts, no bespoke daemons. A fix requiring custom code is documented as a residual risk instead.
 - **Spec:** `docs/superpowers/specs/2026-08-01-sbx-hardening-design.md`. Read it before Task 1.
 - **Threat model:** both the code inside the sandbox and the project directory are adversarial. The host user account is the asset.
-- **shellcheck must stay clean:** `shellcheck sbx lib/copy-mounts.sh` exits 0 after every task.
+- **shellcheck must introduce no NEW findings.** `shellcheck sbx lib/copy-mounts.sh` exits 1 on this repo and always has — do not expect exit 0. Four findings pre-date this branch: SC2295 (`${name#$type/}`), SC1010 (`done` read as a keyword in `--setenv _CONTAINERS_USERNS_CONFIGURED done`), SC2034 (`GUI_MODE` unused), SC2016 (single-quoted `DOCKER_API_STOP`). Compare your output against the branch base (`git show 3b35fbe:sbx`) and ensure your diff adds nothing new. Line numbers shift as tasks land; match on the SC code and the offending text, not the line.
 - **bats must stay green:** `bats tests/` passes after every task.
 - **Short `HOME` in e2e tests.** Session sockets live at `$HOME/.local/state/sbx/<id>/session.sock` and blow the ~108-char `sun_path` limit under `$BATS_TEST_TMPDIR`. Always use `mktemp -d /tmp/sbxh.XXXXXX`. This is why the existing suites do it.
 - **`set -e` is active in `sbx`.** A bare `[[ test ]] && action` as the last statement of a loop body or function makes the whole script exit when the test is false. Use explicit `if` blocks in every loop this plan adds.
