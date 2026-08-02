@@ -942,7 +942,7 @@ Expected: `TERM` and `HOME` populated, `PATH` set by sbx, `ls-ok`.
 
 Run: `bats tests/ && shellcheck sbx lib/copy-mounts.sh`
 
-Expected: all suites pass, shellcheck silent. `${!LC_@}` is unquoted by design; if shellcheck raises SC2206-family noise, add a targeted `# shellcheck disable=` with a one-line reason rather than restructuring.
+Expected: all suites pass, no new shellcheck findings. `${!LC_@}` is unquoted by design — verified that shellcheck accepts the idiom cleanly, so no `# shellcheck disable=` is needed. If you find yourself adding one, something else is wrong.
 
 - [ ] **Step 7: Commit**
 

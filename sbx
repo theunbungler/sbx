@@ -336,7 +336,13 @@ fi
 # permitted" and every session exit 127. CAP_SETPCAP cannot mount,
 # configure networking, or change ownership, so holding it across the
 # single exec into setpriv is not an escape surface.
-if [[ "$CAPS_KEEP" != "true" ]]; then
+# Scoped to the no-net path in THIS task. Until Task 2 relocates nft and
+# dnsmasq, the --net wrapper still runs them INSIDE bwrap, where they
+# genuinely need CAP_NET_ADMIN. Dropping caps for net sessions here kills
+# every one of them at `nft -f` with "cache initialization failed:
+# Operation not permitted". Task 2 removes the -z "$NET_PROFILE" guard in
+# the same commit that moves the setup out.
+if [[ "$CAPS_KEEP" != "true" && -z "$NET_PROFILE" ]]; then
     BWRAP_ARGS+=(--cap-drop ALL --cap-add CAP_SETPCAP)
 fi
 

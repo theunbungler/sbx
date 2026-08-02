@@ -27,7 +27,9 @@ EOF
 }
 
 teardown() {
-    [[ -n "$ROOT" && "$ROOT" == /tmp/sbxh.* ]] && rm -rf "$ROOT"
+    if [[ -n "$ROOT" && "$ROOT" == /tmp/sbxh.* ]]; then
+        rm -rf "$ROOT"
+    fi
 }
 
 # sbx ends in `abduco -c` (or the dtach fallback), which needs a pty;
@@ -42,6 +44,33 @@ run_sbx() {
 @test "a sandbox command actually runs" {
     run_sbx "--fs caps" "echo ran > /out/ran.txt"
     [ "$(cat "$HOSTDIR/ran.txt")" = "ran" ]
+}
+
+# Networked sessions need pasta and a usable default route; skip rather
+# than fail where neither exists. Tasks 2 onward reuse both helpers.
+requires_net() {
+    command -v pasta >/dev/null 2>&1 || skip "pasta not installed"
+    ip route show default | grep -q . || skip "no default route"
+}
+
+net_fixture() {
+    cat > "$PROJ/.sbx/profiles/net/tstnet.json" <<'NETEOF'
+{"description":"test","dns":"1.1.1.1","allow":["example.com"],"ports":[443]}
+NETEOF
+}
+
+# SECOND CANARY. Networked mode is Task 2's scope, but THIS task is the
+# one that can break it: the capability flags are appended to a single
+# global BWRAP_ARGS array, so a cap-drop meant for no-net silently
+# applies to --net too. Until Task 2 relocates them, the --net wrapper
+# runs nft and dnsmasq inside the sandbox and needs CAP_NET_ADMIN;
+# without this test the breakage is invisible, because nothing else in
+# tests/ launches a networked session.
+@test "a networked session still runs" {
+    requires_net
+    net_fixture
+    run_sbx "--fs caps --net tstnet" "echo netran > /out/netran.txt"
+    [ "$(cat "$HOSTDIR/netran.txt")" = "netran" ]
 }
 
 # REGRESSION GUARDS, not a red-green cycle: bwrap zeroes every capability
