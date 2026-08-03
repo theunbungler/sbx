@@ -15,6 +15,10 @@ setup() {
     HOSTDIR="$ROOT/s"
     mkdir -p "$HOME" "$PROJ/.sbx/profiles/cli" "$PROJ/.sbx/profiles/fs" "$HOSTDIR"
 
+    # Every fixture below lives in ./.sbx/profiles; these are ours, so opt
+    # out of the project-profile confirmation prompt for the whole suite.
+    export SBX_TRUST_PROJECT_PROFILES=1
+
     # The store is keyed by profile name AND the external launch
     # directory (see lib/copy-mounts.sh:sbx_copy_path_slug), so every
     # store path assertion below needs this slug of $PROJ.

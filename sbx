@@ -216,10 +216,6 @@ if [[ ${#COMMAND[@]} -eq 0 ]]; then
     COMMAND=("/bin/bash")
 fi
 
-# Resolved here, not at launch-script generation time, so a host missing
-# both multiplexers fails before any session state or xpra display exists.
-find_session_mux
-
 # True when a resolved profile path lies inside the launch directory's
 # .sbx tree — i.e. it was supplied by the project rather than by the user.
 profile_is_project() {
@@ -228,6 +224,60 @@ profile_is_project() {
     proj=$(realpath -m "$PWD/.sbx")
     [[ "$abs" == "$proj/"* ]]
 }
+
+# A project directory is untrusted input: it can ship .sbx/profiles that
+# mount anything anywhere. Using one is a decision the user makes
+# explicitly, outside the repository.
+confirm_project_profile() {
+    local profile="$1"
+    profile_is_project "$profile" || return 0
+    [[ "${SBX_TRUST_PROJECT_PROFILES:-}" == "1" ]] && return 0
+
+    local remote="" rname=""
+    if git -C "$PWD" ls-files --error-unmatch "$profile" >/dev/null 2>&1; then
+        rname=$(git -C "$PWD" remote 2>/dev/null | head -n1)
+        if [[ -n "$rname" ]]; then
+            remote=$(git -C "$PWD" remote get-url "$rname" 2>/dev/null || true)
+        fi
+    fi
+
+    {
+        echo ""
+        echo "This launch would use a profile supplied by the project directory:"
+        echo "  $profile"
+        if [[ -n "$remote" ]]; then
+            echo ""
+            echo "  This profile is checked into a repo with remote $remote — it was"
+            echo "  authored by whoever wrote that repository, not by you."
+        fi
+        echo ""
+        sed 's/^/  | /' "$profile"
+        echo ""
+    } >&2
+
+    if [[ ! -t 0 ]]; then
+        echo "Error: refusing to use a project profile non-interactively." >&2
+        echo "  Set SBX_TRUST_PROJECT_PROFILES=1 to allow it." >&2
+        exit 1
+    fi
+
+    local answer=""
+    printf "Use this project profile? [y/N] " >&2
+    read -r answer < /dev/tty
+    if [[ "$answer" != "y" && "$answer" != "Y" ]]; then
+        echo "Aborted." >&2
+        exit 1
+    fi
+}
+
+for profile in "${FS_PROFILES[@]}" "$CLI_PROFILE" "$NET_PROFILE"; do
+    [[ -z "$profile" ]] && continue
+    confirm_project_profile "$profile"
+done
+
+# Resolved here, not at launch-script generation time, so a host missing
+# both multiplexers fails before any session state or xpra display exists.
+find_session_mux
 
 # --- Profile feature-field scan (phase 2 virt) ---
 # Optional fields honored in any applied fs/cli profile:
