@@ -220,22 +220,60 @@ fi
 # both multiplexers fails before any session state or xpra display exists.
 find_session_mux
 
+# True when a resolved profile path lies inside the launch directory's
+# .sbx tree — i.e. it was supplied by the project rather than by the user.
+profile_is_project() {
+    local abs proj
+    abs=$(realpath -m "$1")
+    proj=$(realpath -m "$PWD/.sbx")
+    [[ "$abs" == "$proj/"* ]]
+}
+
 # --- Profile feature-field scan (phase 2 virt) ---
 # Optional fields honored in any applied fs/cli profile:
 #   "userns": "full"    -> run the whole session inside an outer user
 #                          namespace carrying the user's full subordinate-
 #                          UID range (multi-UID podman). Requires --net.
+#                          Implies "caps": "keep".
+#   "caps": "keep"      -> retain capabilities inside the sandbox. Needed
+#                          for nested user namespaces (podman), and it
+#                          costs the ro-mount and firewall guarantees.
 #   "docker_api": true  -> start a podman docker-API socket for the session.
+#
+# None of these are honored from a project-supplied profile: a repository
+# must never be able to talk its way back to the pre-hardening boundary,
+# with or without the interactive confirmation added elsewhere.
 USERNS_FULL=false
 DOCKER_API=false
 USERNS_PROFILE=""
+CAPS_PROFILE=""
 for profile in "${FS_PROFILES[@]}" "$CLI_PROFILE"; do
     [[ -z "$profile" ]] && continue
-    if [[ "$(jq -r '.userns // empty' "$profile")" == "full" ]]; then
+
+    p_userns=$(jq -r '.userns // empty' "$profile")
+    p_caps=$(jq -r '.caps // empty' "$profile")
+    p_docker=$(jq -r '.docker_api // false' "$profile")
+
+    if profile_is_project "$profile"; then
+        if [[ -n "$p_userns" || -n "$p_caps" || "$p_docker" == "true" ]]; then
+            echo "Error: project profile '$profile' may not set 'userns', 'caps' or 'docker_api'." >&2
+            echo "  Move it to $CONFIG_DIR/profiles/ if you intend to grant it." >&2
+            exit 1
+        fi
+        continue
+    fi
+
+    if [[ "$p_userns" == "full" ]]; then
         USERNS_FULL=true
         USERNS_PROFILE="$profile"
+        CAPS_KEEP=true
+        CAPS_PROFILE="$profile"
     fi
-    if [[ "$(jq -r '.docker_api // false' "$profile")" == "true" ]]; then
+    if [[ "$p_caps" == "keep" ]]; then
+        CAPS_KEEP=true
+        CAPS_PROFILE="$profile"
+    fi
+    if [[ "$p_docker" == "true" ]]; then
         DOCKER_API=true
     fi
 done
@@ -243,6 +281,11 @@ done
 if [[ "$USERNS_FULL" == "true" && -z "$NET_PROFILE" ]]; then
     echo "Error: profile '$USERNS_PROFILE' sets \"userns\": \"full\", which requires networking. Add --net <profile>." >&2
     exit 1
+fi
+
+if [[ "$CAPS_KEEP" == "true" ]]; then
+    echo "Warning: profile '$(basename "$CAPS_PROFILE" .json)' retains capabilities — this session's" >&2
+    echo "  ro mounts and egress firewall are NOT enforceable against code running inside it." >&2
 fi
 
 # Session Initialization
@@ -299,8 +342,6 @@ if [[ -n "$NET_PROFILE" ]]; then
     # to flush the nftables ruleset. nft and dnsmasq now run in launch.sh,
     # outside the sandbox, so nothing in here needs privilege.
     if [[ "$CAPS_KEEP" == "true" ]]; then
-        BWRAP_ARGS+=(--cap-add ALL)
-
         # podman/crun decide rootless-vs-rootful by checking geteuid()==0, not
         # actual privilege. --cap-add ALL above makes the sandboxed process look
         # like real root (uid 0, full capability bits) to podman, so it skips its
@@ -346,7 +387,15 @@ fi
 # permitted" and every session exit 127. CAP_SETPCAP cannot mount,
 # configure networking, or change ownership, so holding it across the
 # single exec into setpriv is not an escape surface.
-if [[ "$CAPS_KEEP" != "true" ]]; then
+#
+# The "caps": "keep" opt-out needs --cap-add ALL in BOTH modes, not just
+# --net. Where bwrap creates the user namespace itself (the no-net path) it
+# hands the payload an empty effective AND bounding set unless told
+# otherwise, so omitting the flag here would silently ignore the profile
+# field rather than honour it.
+if [[ "$CAPS_KEEP" == "true" ]]; then
+    BWRAP_ARGS+=(--cap-add ALL)
+else
     BWRAP_ARGS+=(--cap-drop ALL --cap-add CAP_SETPCAP)
 fi
 

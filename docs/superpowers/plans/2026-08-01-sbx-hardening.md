@@ -770,6 +770,38 @@ fi
 
 Remove the now-duplicated `CAPS_KEEP=false` initialiser added in Task 1 Step 3 only if it sits after this block; it must be initialised *before* the loop. Keep it at line 137 with the other flag defaults.
 
+- [ ] **Step 3b: Hoist `--cap-add ALL` out of the `--net` branch**
+
+CORRECTION to the plan as first written: Task 1 left `--cap-add ALL` inside the
+`-n "$NET_PROFILE"` branch, because at the time the only caps-keeping profile
+was podman-under-`--net`. Setting `caps: keep` from a no-net profile therefore
+parsed fine and did nothing — bwrap hands the payload an empty effective AND
+bounding set whenever it creates the user namespace itself, which is the no-net
+path. Verified directly:
+
+```
+$ bwrap --unshare-user --unshare-net ... -- grep -E '^Cap(Eff|Bnd)' /proc/self/status
+CapEff: 0000000000000000
+CapBnd: 0000000000000000
+$ bwrap --unshare-user --unshare-net ... --cap-add ALL -- ...
+CapEff: 000001ffffffffff
+CapBnd: 000001ffffffffff
+```
+
+Step 1's first test runs without `--net`, so it stays red after Step 3 alone.
+Make the capability block symmetric across both modes:
+
+```bash
+if [[ "$CAPS_KEEP" == "true" ]]; then
+    BWRAP_ARGS+=(--cap-add ALL)
+else
+    BWRAP_ARGS+=(--cap-drop ALL --cap-add CAP_SETPCAP)
+fi
+```
+
+The `_CONTAINERS_*` env overrides stay in the `--net` branch — they exist only
+because pasta maps the host uid to 0, which no-net mode never does.
+
 - [ ] **Step 4: Mark the podman profiles**
 
 `profiles/fs/podman.json` — add `"caps": "keep"`:

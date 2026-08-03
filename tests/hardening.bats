@@ -135,3 +135,43 @@ NETEOF
     run_sbx "--fs caps --net tstnet" "ps ax > /out/ps.txt 2>/dev/null || true"
     ! grep -q dnsmasq "$HOSTDIR/ps.txt"
 }
+
+@test "a profile with caps keep retains capabilities" {
+    cat > "$PROJ/.sbx/profiles/fs/keep.json" <<EOF
+{"description":"test","caps":"keep","mounts":[{"source":"$HOSTDIR","dest":"/out","perm":"rw"}]}
+EOF
+    # caps:keep is honoured only from host-owned profiles, so install it there.
+    mkdir -p "$HOME/.config/sbx/profiles/fs"
+    cp "$PROJ/.sbx/profiles/fs/keep.json" "$HOME/.config/sbx/profiles/fs/keep.json"
+    rm "$PROJ/.sbx/profiles/fs/keep.json"
+
+    run_sbx "--fs keep" "grep '^CapEff' /proc/self/status > /out/k.txt"
+    [[ "$(cat "$HOSTDIR/k.txt")" != *"0000000000000000" ]]
+}
+
+@test "a caps keep session warns on stderr" {
+    mkdir -p "$HOME/.config/sbx/profiles/fs"
+    cat > "$HOME/.config/sbx/profiles/fs/keep.json" <<EOF
+{"description":"test","caps":"keep","mounts":[{"source":"$HOSTDIR","dest":"/out","perm":"rw"}]}
+EOF
+    run bash -c "cd '$PROJ' && script -qec \"$SBX --fs keep -- /bin/true\" /dev/null 2>&1"
+    [[ "$output" == *"retains capabilities"* ]]
+}
+
+@test "a project profile may not request caps" {
+    cat > "$PROJ/.sbx/profiles/fs/evil.json" <<EOF
+{"description":"test","caps":"keep","mounts":[{"source":"$HOSTDIR","dest":"/out","perm":"rw"}]}
+EOF
+    run bash -c "cd '$PROJ' && $SBX --fs evil -- /bin/true 2>&1"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"may not set"* ]]
+}
+
+@test "a project profile may not request userns full" {
+    cat > "$PROJ/.sbx/profiles/fs/evil2.json" <<EOF
+{"description":"test","userns":"full","mounts":[{"source":"$HOSTDIR","dest":"/out","perm":"rw"}]}
+EOF
+    run bash -c "cd '$PROJ' && $SBX --fs evil2 -- /bin/true 2>&1"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"may not set"* ]]
+}

@@ -1,6 +1,7 @@
 {
     "description": "Multi-UID podman (ns-root session; requires --net): full image fidelity, docker API socket",
     "userns": "full",
+    "caps": "keep",
     "docker_api": true,
     "mounts": [
         { "source": "/dev/net/tun", "dest": "/dev/net/tun", "perm": "dev" },
