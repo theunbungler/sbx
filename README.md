@@ -12,6 +12,43 @@
 - **GUI Support**: Enable isolated graphical interfaces using `xpra`.
 - **Flexible Configuration**: Profiles can be stored locally, in your home directory, or in system-wide paths.
 
+## Threat model
+
+sbx assumes the code running inside a sandbox and the project directory it
+was launched from are both adversarial. It is built to protect the host user
+account from them.
+
+What that buys you, in a session without `"caps": "keep"`:
+
+- **`ro` mounts are read-only.** The payload holds no capabilities, so it
+  cannot remount a bind read-write.
+- **The egress allow-list is not removable.** `nft` and `dnsmasq` run outside
+  the sandbox's PID and mount namespaces; nothing inside can flush the
+  ruleset or signal the resolver.
+- **The host environment does not leak in.** The environment is cleared;
+  variables arrive only via the base set or a profile's `passthrough`.
+- **sbx's own state and config are masked**, so a sandbox cannot reach
+  sibling sessions, persistent cli stores, or the profiles that configure the
+  next launch.
+- **Project-supplied profiles require confirmation**, and may never request
+  `caps`, `userns`, or `docker_api`.
+
+### What it does not protect against
+
+- **Sessions with `"caps": "keep"`** — including `fs/podman` and
+  `fs/podman-full`. Capabilities are required for the nested user namespaces
+  podman needs, and with them `ro` mounts are writable and the firewall is
+  removable. Such sessions print a warning at launch.
+- **Kernel exploits.** There is no seccomp filter: `bwrap --seccomp` needs a
+  compiled BPF blob, which is the kind of custom code this project avoids.
+- **Wildcard `allow` entries.** `*.anthropic.com` admits any IP an attacker
+  can publish under that suffix.
+- **DNS as an exfiltration channel.** Query labels for allowed domains are
+  forwarded upstream.
+- **`"ports": ["*"]`** in `net/anthropic.json` and `net/gemini.json` — any
+  allowed IP is reachable on any port. Narrowing to 443 would break `git push`
+  over SSH to `github.com`.
+
 ## Usage
 
 To see all available commands and options, run:
@@ -61,6 +98,8 @@ CLI profiles configure the shell environment inside the sandbox. They control en
 | `env` | object | No | Key-value pairs of environment variables to set |
 | `path` | array of strings | No | Directories to prepend to the sandbox `PATH` |
 | `mounts` | array of objects | No | Filesystem mounts (same structure as FS mounts below) |
+| `passthrough` | array | No | Host environment variables to forward into the sandbox by name. The environment is otherwise cleared. |
+| `caps` | string | No | `"keep"` retains capabilities inside the sandbox. Required for nested user namespaces (podman); costs the read-only-mount and firewall guarantees. Ignored — and rejected — in project-supplied profiles. |
 
 **Example — minimal:**
 
@@ -106,6 +145,8 @@ FS profiles define the sandbox's filesystem layout — which directories are mou
 | `env` | object | No | Key-value pairs of environment variables to set |
 | `userns` | string | No | `"full"` runs the entire session inside an outer user namespace carrying your full subordinate-UID range (multi-UID podman). Requires `--net`; the session identity becomes namespace-root. See [Multi-UID containers](#multi-uid-containers-podman-full). |
 | `docker_api` | boolean | No | `true` starts a podman docker-API socket for the session (see [Docker compatibility](#docker-compatibility)). Honored in CLI profiles too. |
+| `passthrough` | array | No | Host environment variables to forward into the sandbox by name. The environment is otherwise cleared. |
+| `caps` | string | No | `"keep"` retains capabilities inside the sandbox. Required for nested user namespaces (podman); costs the read-only-mount and firewall guarantees. Ignored — and rejected — in project-supplied profiles. |
 
 #### Mount Object
 
@@ -145,12 +186,12 @@ Each entry in the `mounts` array has these fields:
 
 ### Network (NET) Profiles (`profiles/net/<name>.json`)
 
-NET profiles control network access inside the sandbox. When a network profile is applied, the sandbox uses `pasta` for user-mode networking, `dnscrypt-proxy` for DNS resolution (with domain allowlisting), a small DNS sniffer (`sbx-dns-sniffer.py`) that records resolved IPs, and `nftables` for egress filtering keyed on those IPs.
+NET profiles control network access inside the sandbox. When a network profile is applied, the sandbox uses `pasta` for user-mode networking, `dnsmasq` for DNS resolution (with per-domain forwarding and domain allowlisting), and `nftables` for egress filtering keyed on the IPs dnsmasq resolves. `dnsmasq` and `nft` are started outside the sandbox, so nothing running inside can signal the resolver or alter the ruleset.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `description` | string | No | Human-readable label for the profile |
-| `dns` | string | No | DNS server configuration. Can be an **IP address** (e.g., `"1.1.1.1"`) which is used as a forwarding target, or a **dnscrypt stamp** string for encrypted DNS |
+| `dns` | string | No | Upstream DNS server as a plain **IP address** (e.g., `"1.1.1.1"`). dnsmasq does not speak DoH stamps; anything that is not a bare IPv4 address falls back to `1.1.1.1` |
 | `allow` | array of strings | No | Allowed destinations. Supports **hostname globs** (e.g., `"*.google.com"`, `"github.com"`) and **CIDR notation** (e.g., `"192.168.1.0/24"`) |
 | `ports` | array | No | Allowed ports. Can be a list of port numbers (`[80, 443]`) or the wildcard `["*"]` to allow all ports |
 
@@ -158,13 +199,13 @@ NET profiles control network access inside the sandbox. When a network profile i
 
 Egress is enforced at the **IP layer by `nftables`**, not just at DNS resolution. The output chain defaults to `drop`; a connection is only permitted if its destination IP is explicitly allowed. This closes the bypass where a process connects straight to a raw IP (or a public DNS provider) and skips the filtered resolver entirely.
 
-1. **Domain allowlisting** — Hostname entries in `allow` (those matching `^[a-zA-Z*]`) are written to a file consumed by `dnscrypt-proxy`, which uses a catch-all `*.*` blocklist exempted by the allow list. Only DNS queries for matching domains resolve; all others are refused.
-2. **Dynamic IP allowlisting** — The DNS sniffer sits on `127.0.0.1:53`, forwards queries to `dnscrypt-proxy`, and adds every IP it sees in an allowed-domain answer to the `nftables` set `allowed4`. `nftables` then permits connections to exactly those IPs (subject to the port filter). An IP the resolver never returned is dropped.
+1. **Domain allowlisting** — Each hostname entry in `allow` (those matching `^[a-zA-Z*]`) becomes a `--server=/<domain>/<upstream>` flag, with any leading `*.` stripped: dnsmasq matches the apex and all subdomains. Only those domains have an upstream to forward to; every other query gets no answer.
+2. **Dynamic IP allowlisting** — The same domains get a `--nftset=/<domain>/inet#sbx_filter#allowed4` flag, so dnsmasq adds every A-record answer it returns straight to the `nftables` set `allowed4`. `nftables` then permits connections to exactly those IPs (subject to the port filter). An IP the resolver never returned is dropped. `--filter-AAAA` keeps answers to A records; IPv6 egress is dropped regardless.
 3. **CIDR allowlisting** — IP/CIDR entries in `allow` (those matching `^[0-9]`) become `nftables` rules that accept outbound traffic to those address ranges (any port).
-4. **Port filtering** — `nftables` rules restrict the allowed TCP/UDP destination ports for resolved hosts. If only hostnames are listed without explicit ports, ports 80 and 443 are allowed by default.
-5. **Default policy** — The egress chain default is `drop`. The only fixed exceptions are loopback, established/related flows, and the single upstream resolver (Cloudflare DoH on `1.1.1.1`/`1.0.0.1:443`, or the plain-DNS IP set via `dns`). All outbound IPv6 is dropped.
+4. **Port filtering** — `nftables` rules restrict the allowed TCP/UDP destination ports for resolved hosts. If only hostnames are listed without explicit ports, TCP 80 and 443 are allowed by default.
+5. **Default policy** — The egress chain default is `drop`. The only fixed exceptions are loopback, established/related flows, and the upstream resolver on port 53 (the IP set via `dns`, default `1.1.1.1`). All outbound IPv6 is dropped. A `forward` chain carries the same rules, because rootful podman under `userns: full` uses the netavark bridge backend, whose container traffic traverses the forward hook and would otherwise be ungated.
 
-> **Note:** because the upstream resolver is reachable, a process could still perform DNS lookups against it, but it cannot *connect* anywhere the resolver didn't hand back for an allowed domain — egress is gated on `nftables`, not on resolution. A custom `dns` stamp pointing at a non-Cloudflare resolver must add that resolver's IP as a CIDR in `allow`.
+> **Note:** because the upstream resolver is reachable, a process could still perform DNS lookups against it, but it cannot *connect* anywhere the resolver didn't hand back for an allowed domain — egress is gated on `nftables`, not on resolution.
 
 **Example — web browsing profile:**
 

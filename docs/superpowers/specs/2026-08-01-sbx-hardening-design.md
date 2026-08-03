@@ -163,11 +163,14 @@ launch path without it. Variables are then set in this order, later winning:
    `HOME USER LOGNAME TERM COLORTERM LANG LC_* TZ SHELL`
 2. **Profile `"passthrough": ["VAR", …]`** — new field on cli and fs profiles,
    forwarding named host variables by name only
-3. **Profile `"env"`** — existing behaviour, unchanged
-4. **sbx-controlled** — `PATH`, `XDG_RUNTIME_DIR`, `CONTAINERS_*`,
-   `DOCKER_HOST`, `DISPLAY`, `XAUTHORITY`
+3. **Profile `"env"`** — existing behaviour, unchanged; overrides both the
+   base set and `passthrough`
 
-Secrets reach a sandbox only when a profile names them.
+`PATH` and `DOCKER_HOST` are applied after profile `env` and win. Other
+sbx-set variables (`XDG_RUNTIME_DIR`, `DISPLAY`, `CONTAINERS_*`) remain
+overridable by a profile, because `profiles/fs/chrome.json` exists precisely
+to set `DISPLAY` and `XDG_RUNTIME_DIR`. Secrets reach a sandbox only when a
+profile names them.
 
 ### Mount integrity
 
