@@ -331,6 +331,41 @@ BWRAP_ARGS=(
     --bind "$SESSION_DIR" "$SESSION_DIR"
 )
 
+# Environment policy: clear everything, then reintroduce by name.
+# --clearenv is unconditional and has no opt-out — the host environment
+# routinely carries API keys, tokens and SSH_AUTH_SOCK, none of which a
+# sandbox should see unless a profile asks for them by name.
+BWRAP_ARGS+=(--clearenv)
+
+# Base set: what a shell needs to behave like a shell.
+SBX_BASE_ENV=(HOME USER LOGNAME TERM COLORTERM LANG TZ SHELL)
+for var in "${SBX_BASE_ENV[@]}"; do
+    # Explicit if, not `[[ ]] &&`: under `set -e` a trailing false test on
+    # the final iteration would exit the script.
+    if [[ -n "${!var-}" ]]; then
+        BWRAP_ARGS+=(--setenv "$var" "${!var}")
+    fi
+done
+
+# Locale variables travel as a family; ${!LC_@} lists the set ones by name.
+for var in ${!LC_@}; do
+    if [[ -n "${!var-}" ]]; then
+        BWRAP_ARGS+=(--setenv "$var" "${!var}")
+    fi
+done
+
+# Profile-declared passthrough: forwards named host variables. Applied
+# before the profile `env` block below, so an explicit `env` value wins.
+for profile in "${FS_PROFILES[@]}" "$CLI_PROFILE"; do
+    [[ -z "$profile" ]] && continue
+    while IFS= read -r var; do
+        [[ -z "$var" ]] && continue
+        if [[ -n "${!var-}" ]]; then
+            BWRAP_ARGS+=(--setenv "$var" "${!var}")
+        fi
+    done < <(jq -r '.passthrough[]?' "$profile")
+done
+
 if [[ -n "$NET_PROFILE" ]]; then
     # When networking is enabled, pasta creates the user and net namespaces.
     # bwrap joins them and provides filesystem isolation.

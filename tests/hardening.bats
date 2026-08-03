@@ -175,3 +175,36 @@ EOF
     [ "$status" -ne 0 ]
     [[ "$output" == *"may not set"* ]]
 }
+
+@test "a host secret does not reach the sandbox" {
+    export SBX_TEST_SECRET=hunter2
+    run_sbx "--fs caps" "printenv SBX_TEST_SECRET > /out/secret.txt 2>/dev/null; echo done > /out/done.txt"
+    [ -f "$HOSTDIR/done.txt" ]
+    [ ! -s "$HOSTDIR/secret.txt" ]
+}
+
+@test "the base environment set reaches the sandbox" {
+    run_sbx "--fs caps" "printenv HOME > /out/home.txt"
+    [ "$(cat "$HOSTDIR/home.txt")" = "$HOME" ]
+}
+
+@test "a profile passthrough entry forwards a host variable" {
+    export SBX_TEST_SECRET=hunter2
+    cat > "$PROJ/.sbx/profiles/fs/pass.json" <<EOF
+{"description":"test","passthrough":["SBX_TEST_SECRET"],
+ "mounts":[{"source":"$HOSTDIR","dest":"/out","perm":"rw"}]}
+EOF
+    run_sbx "--fs pass" "printenv SBX_TEST_SECRET > /out/p.txt"
+    [ "$(cat "$HOSTDIR/p.txt")" = "hunter2" ]
+}
+
+@test "an unset passthrough variable is not exported as empty" {
+    unset SBX_TEST_ABSENT
+    cat > "$PROJ/.sbx/profiles/fs/pass2.json" <<EOF
+{"description":"test","passthrough":["SBX_TEST_ABSENT"],
+ "mounts":[{"source":"$HOSTDIR","dest":"/out","perm":"rw"}]}
+EOF
+    run_sbx "--fs pass2" "printenv SBX_TEST_ABSENT > /out/a.txt 2>/dev/null; echo done > /out/done2.txt"
+    [ -f "$HOSTDIR/done2.txt" ]
+    [ ! -s "$HOSTDIR/a.txt" ]
+}
