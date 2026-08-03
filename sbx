@@ -328,7 +328,6 @@ BWRAP_ARGS=(
     --symlink usr/bin /bin
     --symlink usr/lib /lib
     --symlink usr/lib64 /lib64
-    --bind "$SESSION_DIR" "$SESSION_DIR"
 )
 
 # Environment policy: clear everything, then reintroduce by name.
@@ -887,6 +886,15 @@ if [[ "$GUI_FLAG" == "true" ]]; then
     echo "  Attach viewer : xpra attach $XPRA_DISPLAY"
     echo "  Stop display  : xpra stop $XPRA_DISPLAY"
 fi
+
+# Masks, appended after every profile mount because bwrap applies mount
+# arguments in order: a profile mounting $HOME or $HOME/.local would
+# otherwise re-expose these. The sandbox gets its own session directory
+# and nothing else — no sibling sessions, no persistent cli stores, and
+# no ability to author the profiles that configure the next launch.
+BWRAP_ARGS+=(--tmpfs "$STATE_DIR")
+BWRAP_ARGS+=(--bind "$SESSION_DIR" "$SESSION_DIR")
+BWRAP_ARGS+=(--tmpfs "$CONFIG_DIR")
 
 # Teardown Logic
 teardown() {

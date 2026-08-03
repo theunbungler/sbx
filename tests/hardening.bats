@@ -208,3 +208,61 @@ EOF
     [ -f "$HOSTDIR/done2.txt" ]
     [ ! -s "$HOSTDIR/a.txt" ]
 }
+
+@test "the sandbox sees only its own session directory" {
+    mkdir -p "$HOME/.local/state/sbx/decoy-session"
+    echo secret > "$HOME/.local/state/sbx/decoy-session/session.json"
+    run_sbx "--fs caps" "ls '$HOME/.local/state/sbx' > /out/state.txt"
+    ! grep -q decoy-session "$HOSTDIR/state.txt"
+}
+
+@test "the sandbox cannot see persistent cli stores" {
+    mkdir -p "$HOME/.local/state/sbx/profiles/cli/other"
+    run_sbx "--fs caps" "ls '$HOME/.local/state/sbx' > /out/state2.txt"
+    ! grep -q profiles "$HOSTDIR/state2.txt"
+}
+
+@test "the sandbox cannot see the user profile directory" {
+    mkdir -p "$HOME/.config/sbx/profiles/fs"
+    echo marker > "$HOME/.config/sbx/marker.txt"
+    run_sbx "--fs caps" "ls -a '$HOME/.config/sbx' > /out/cfg.txt"
+    ! grep -q marker "$HOSTDIR/cfg.txt"
+}
+
+@test "the sandbox can still write its own session directory" {
+    run_sbx "--fs caps" "ls '$HOME/.local/state/sbx' | wc -l > /out/count.txt"
+    [ "$(cat "$HOSTDIR/count.txt")" = "1" ]
+}
+
+# The masks only matter when a profile re-exposes the paths they cover, and
+# the three tests above use a profile that mounts neither $HOME nor any
+# parent of it — so they pass with or without the masks. This one is the
+# real guard: bwrap applies mount arguments in order, so a profile mounting
+# $HOME hands the sandbox every sibling session, every persistent cli store
+# and the profile directory that configures the next launch, unless the
+# masks are appended AFTER the profile mounts. Moving them back up into the
+# base array must fail here.
+@test "a profile mounting HOME still cannot see sbx state or config" {
+    mkdir -p "$HOME/.local/state/sbx/decoy-session" "$HOME/.config/sbx"
+    echo secret > "$HOME/.local/state/sbx/decoy-session/session.json"
+    echo marker > "$HOME/.config/sbx/marker.txt"
+    cat > "$PROJ/.sbx/profiles/fs/homemount.json" <<EOF
+{"description":"test","mounts":[
+  {"source":"$HOSTDIR","dest":"/out","perm":"rw"},
+  {"source":"$HOME","dest":"$HOME","perm":"rw"}
+]}
+EOF
+    run_sbx "--fs homemount" "ls '$HOME/.local/state/sbx' > /out/hs.txt; ls -a '$HOME/.config/sbx' > /out/hc.txt"
+    # NOT `! grep ...`: set -e, which bats leans on to fail a test at the
+    # offending line, explicitly ignores a failing command preceded by `!`.
+    # A `! grep` assertion anywhere but the final line is silently a no-op —
+    # it cost a genuine leak here before this was written the long way.
+    if grep -q decoy-session "$HOSTDIR/hs.txt"; then
+        echo "sibling session dir leaked into the sandbox" >&2
+        return 1
+    fi
+    if grep -q marker "$HOSTDIR/hc.txt"; then
+        echo "user profile dir leaked into the sandbox" >&2
+        return 1
+    fi
+}
