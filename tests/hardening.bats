@@ -266,3 +266,24 @@ EOF
         return 1
     fi
 }
+
+@test "session.json records the supervising pid" {
+    run_sbx "--fs caps" "true"
+    run bash -c "jq -r '.pid' \"\$(find '$HOME/.local/state/sbx' -name session.json | head -n1)\""
+    [[ "$output" =~ ^[0-9]+$ ]]
+}
+
+# The injected field is .id, NOT .cwd. cwd is only ever compared against
+# $PWD, so poisoning it makes the entry fail to match and nothing prints —
+# the test passes without any sanitization at all. id and pid are the two
+# fields that actually reach the terminal.
+@test "list-sessions survives control characters in session.json" {
+    run_sbx "--fs caps" "true"
+    sfile=$(find "$HOME/.local/state/sbx" -name session.json | head -n1)
+    jq --arg c "$(printf 'evil\033[31m')" '.id = $c' "$sfile" > "$sfile.tmp"
+    mv "$sfile.tmp" "$sfile"
+    run bash -c "cd '$PROJ' && $SBX --list-sessions"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *evil* ]]
+    [[ "$output" != *$'\033'* ]]
+}

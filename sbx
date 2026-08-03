@@ -147,11 +147,18 @@ while [[ $# -gt 0 ]]; do
             echo "Active Sessions (this directory):"
             for sdir in "$STATE_DIR"/*; do
                 if [[ -d "$sdir" && -f "$sdir/session.json" ]]; then
-                    scwd=$(jq -r '.cwd' "$sdir/session.json")
+                    # session.json sits inside the session directory, which
+                    # is bound rw into the sandbox — treat every field as
+                    # attacker-authored and strip control characters before
+                    # echoing them to a terminal.
+                    scwd=$(jq -r '.cwd' "$sdir/session.json" | tr -d '\000-\037')
                     if [[ "$scwd" == "$PWD" ]]; then
-                        sid=$(jq -r '.id' "$sdir/session.json")
-                        pid=$(jq -r '.pid // empty' "$sdir/session.json")
-                        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                        sid=$(jq -r '.id' "$sdir/session.json" | tr -d '\000-\037')
+                        pid=$(jq -r '.pid // empty' "$sdir/session.json" | tr -d '\000-\037')
+                        # Validated, not merely non-empty: an unchecked $pid
+                        # reaching kill is a signal sent wherever the sandbox
+                        # chose.
+                        if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
                             echo "  $sid (active, PID: $pid)"
                         else
                             echo "  $sid (inactive)"
@@ -843,6 +850,7 @@ cat > "$SESSION_DIR/session.json" <<EOF
 {
     "id": "$SESSION_ID",
     "cwd": "$PWD",
+    "pid": $$,
     "fs_profiles": $(printf '%s\n' "${FS_PROFILES[@]}" | jq -R . | jq -s .),
     "net_profile": $([[ -n "$NET_PROFILE" ]] && jq -R . <<< "$NET_PROFILE" || echo "null"),
     "cli_profile": $([[ -n "$CLI_PROFILE" ]] && jq -R . <<< "$CLI_PROFILE" || echo "null")
