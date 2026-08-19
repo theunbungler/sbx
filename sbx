@@ -232,30 +232,35 @@ profile_is_project() {
     [[ "$abs" == "$proj/"* ]]
 }
 
-# A project directory is untrusted input: it can ship .sbx/profiles that
-# mount anything anywhere. Using one is a decision the user makes
-# explicitly, outside the repository.
+# A version-controlled project directory is untrusted input: it can ship
+# .sbx/profiles that mount anything anywhere, authored by whoever wrote the
+# repository. Using one is a decision the user makes explicitly, outside the
+# repository.
+#
+# A project profile that git does not track is treated as the user's own
+# scratch config — it cannot have arrived via clone or pull, so there is
+# nobody else to distrust and no prompt is raised. (Tracked-but-uncommitted
+# counts as version-controlled: once it is in the index it travels.)
 confirm_project_profile() {
     local profile="$1"
     profile_is_project "$profile" || return 0
     [[ "${SBX_TRUST_PROJECT_PROFILES:-}" == "1" ]] && return 0
+    git -C "$PWD" ls-files --error-unmatch "$profile" >/dev/null 2>&1 || return 0
 
     local remote="" rname=""
-    if git -C "$PWD" ls-files --error-unmatch "$profile" >/dev/null 2>&1; then
-        rname=$(git -C "$PWD" remote 2>/dev/null | head -n1)
-        if [[ -n "$rname" ]]; then
-            remote=$(git -C "$PWD" remote get-url "$rname" 2>/dev/null || true)
-        fi
+    rname=$(git -C "$PWD" remote 2>/dev/null | head -n1)
+    if [[ -n "$rname" ]]; then
+        remote=$(git -C "$PWD" remote get-url "$rname" 2>/dev/null || true)
     fi
 
     {
         echo ""
-        echo "This launch would use a profile supplied by the project directory:"
+        echo "This launch would use a profile tracked by the project's git repository:"
         echo "  $profile"
         if [[ -n "$remote" ]]; then
             echo ""
-            echo "  This profile is checked into a repo with remote $remote — it was"
-            echo "  authored by whoever wrote that repository, not by you."
+            echo "  The repo has remote $remote — this profile was authored by"
+            echo "  whoever wrote that repository, not by you."
         fi
         echo ""
         sed 's/^/  | /' "$profile"
