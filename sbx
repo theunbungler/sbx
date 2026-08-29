@@ -47,8 +47,13 @@ Options:
   --list-sessions        Show active sessions
   --join <session>       Attach to an existing session
   --fs <profile>         Apply a filesystem profile (multiple allowed)
-  --net <profile>        Apply a network profile
+  --net <profile>        Apply a network profile (multiple allowed)
   --cli <profile>        Apply a CLI/environment profile
+  --host-port <spec>     Reach a host service on 127.0.0.1:<port> from inside.
+                         <spec> is <port>[/tcp|/udp]; bare means tcp.
+                         (repeatable; implies a network namespace)
+  --wd <path>            Start in this directory inside the sandbox
+                         (default: launch dir if present, else \$HOME, else /)
   --gui                  Enable isolated GUI via xpra (attach with: xpra attach :<N>)
   -h, --help             Show this help message
 
@@ -131,9 +136,38 @@ list_profiles() {
 
 # Main Argument Parsing
 FS_PROFILES=()
-NET_PROFILE=""
+NET_PROFILES=()
 CLI_PROFILE=""
+WORKDIR=""
+HOST_PORTS_TCP=()
+HOST_PORTS_UDP=()
 COMMAND=()
+
+# Parse one host-port spec: "<port>", "<port>/tcp" or "<port>/udp".
+#
+# A bare number means TCP. The two protocols are kept as separate lists all
+# the way to pasta's -T and -U, which are genuinely independent — forwarding
+# a TCP port does not open its UDP twin (verified; pasta only pairs the two
+# under "-t auto", which sbx never uses). So a bare "8080" grants TCP and
+# nothing else, and reaching a UDP service is always something the profile
+# or command line said out loud. To get both, name the port twice.
+add_host_port() {
+    local spec="$1" origin="$2"
+    local port="${spec%%/*}" proto="tcp"
+    [[ "$spec" == */* ]] && proto="${spec#*/}"
+    proto="${proto,,}"
+
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+        echo "Error: $origin expects <port>[/tcp|/udp] with a port 1-65535, got '$spec'." >&2
+        exit 1
+    fi
+    case "$proto" in
+        tcp) HOST_PORTS_TCP+=("$port") ;;
+        udp) HOST_PORTS_UDP+=("$port") ;;
+        *)   echo "Error: $origin names unknown protocol '$proto' in '$spec' (expected tcp or udp)." >&2
+             exit 1 ;;
+    esac
+}
 GUI_FLAG=false
 CAPS_KEEP=false
 
@@ -188,11 +222,22 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --net)
-            NET_PROFILE="$(resolve_profile net "$2")"
+            NET_PROFILES+=("$(resolve_profile net "$2")")
             shift 2
             ;;
         --cli)
             CLI_PROFILE="$(resolve_profile cli "$2")"
+            shift 2
+            ;;
+        --host-port)
+            add_host_port "$2" "--host-port"
+            shift 2
+            ;;
+        --wd)
+            # envsubst for parity with every other path sbx accepts
+            # (mounts, env, path), so '$HOME/src' works whether it reaches
+            # us quoted from a script or expanded by the caller's shell.
+            WORKDIR="$(echo "$2" | envsubst)"
             shift 2
             ;;
         --)
@@ -282,7 +327,7 @@ confirm_project_profile() {
     fi
 }
 
-for profile in "${FS_PROFILES[@]}" "$CLI_PROFILE" "$NET_PROFILE"; do
+for profile in "${FS_PROFILES[@]}" "$CLI_PROFILE" "${NET_PROFILES[@]}"; do
     [[ -z "$profile" ]] && continue
     confirm_project_profile "$profile"
 done
@@ -319,7 +364,7 @@ require_tools() {
 }
 
 require_tools bwrap jq envsubst setpriv
-if [[ -n "$NET_PROFILE" ]]; then
+if [[ ${#NET_PROFILES[@]} -gt 0 ]]; then
     require_tools pasta nft dnsmasq
 fi
 
@@ -372,9 +417,57 @@ for profile in "${FS_PROFILES[@]}" "$CLI_PROFILE"; do
     fi
 done
 
-if [[ "$USERNS_FULL" == "true" && -z "$NET_PROFILE" ]]; then
+if [[ "$USERNS_FULL" == "true" && ${#NET_PROFILES[@]} -eq 0 ]]; then
     echo "Error: profile '$USERNS_PROFILE' sets \"userns\": \"full\", which requires networking. Add --net <profile>." >&2
     exit 1
+fi
+
+# --- Host-service access ---
+# Ports named here are forwarded by pasta from the host's loopback into the
+# sandbox's loopback at the same number, so a host service on 127.0.0.1:8080
+# answers at 127.0.0.1:8080 inside. Ports NOT named are not forwarded.
+#
+# This has to be explicit. pasta's default is -T auto, which forwards every
+# port bound on the host — including ports bound after the session starts,
+# and ports bound by other users — so an --net sandbox could reach every
+# host-local service without a single rule naming it. sbx passes an explicit
+# list (or "none") instead, which is what makes host access an allow-list
+# rather than an accident. It is also what stops a host service on :53 from
+# taking the port this session's dnsmasq needs.
+#
+# Not honored from a project profile, for the same reason userns/caps/
+# docker_api are not: a cloned repository must not be able to open a path
+# from its sandbox to a service on the machine running it.
+for np in "${NET_PROFILES[@]}"; do
+    if profile_is_project "$np"; then
+        if [[ "$(jq -r '(.host_ports // []) | length' "$np")" != "0" ]]; then
+            echo "Error: project profile '$np' may not set 'host_ports'." >&2
+            echo "  Move it to $CONFIG_DIR/profiles/ if you intend to grant it." >&2
+            exit 1
+        fi
+    else
+        while IFS= read -r hp; do
+            [[ -z "$hp" ]] && continue
+            add_host_port "$hp" "profile '$np'"
+        done < <(jq -r '.host_ports[]? | tostring' "$np")
+    fi
+done
+
+# Deduplicate, preserving nothing but the numbers pasta needs.
+if [[ ${#HOST_PORTS_TCP[@]} -gt 0 ]]; then
+    mapfile -t HOST_PORTS_TCP < <(printf '%s\n' "${HOST_PORTS_TCP[@]}" | sort -n -u)
+fi
+if [[ ${#HOST_PORTS_UDP[@]} -gt 0 ]]; then
+    mapfile -t HOST_PORTS_UDP < <(printf '%s\n' "${HOST_PORTS_UDP[@]}" | sort -n -u)
+fi
+
+# A network namespace is needed for a net profile OR for host-port access.
+# The second case is the no-internet one: pasta supplies the loopback splice
+# to the host, and the ruleset below drops every other destination, so the
+# session reaches the named host services and nothing else.
+SBX_NETNS=false
+if [[ ${#NET_PROFILES[@]} -gt 0 || ${#HOST_PORTS_TCP[@]} -gt 0 || ${#HOST_PORTS_UDP[@]} -gt 0 ]]; then
+    SBX_NETNS=true
 fi
 
 if [[ "$CAPS_KEEP" == "true" ]]; then
@@ -459,8 +552,9 @@ for profile in "${FS_PROFILES[@]}" "$CLI_PROFILE"; do
     done < <(jq -r '.passthrough[]?' "$profile")
 done
 
-if [[ -n "$NET_PROFILE" ]]; then
-    # When networking is enabled, pasta creates the user and net namespaces.
+if [[ "$SBX_NETNS" == "true" ]]; then
+    # When a network namespace is used, pasta creates the user and net
+    # namespaces.
     # bwrap joins them and provides filesystem isolation.
     #
     # pasta maps the host uid to 0 inside the namespace. bwrap does NOT drop
@@ -495,7 +589,8 @@ if [[ -n "$NET_PROFILE" ]]; then
         fi
     fi
 else
-    # Without networking, bwrap creates its own namespaces.
+    # With neither a net profile nor host ports, bwrap creates its own
+    # namespaces and the session has no network stack at all.
     # No --uid/--gid: bwrap defaults to mapping the real UID/GID into the
     # new user namespace, so the sandbox sees the same user/HOME identity
     # as the host (matches what the --net branch already does via pasta).
@@ -748,15 +843,21 @@ for cm in "${CLI_COPY_MOUNTS[@]}"; do
     seed_copy_mount "${cm%%:*}" "$dst" "$CLI_STORE_DIR/$(sbx_copy_mount_id "$dst")"
 done
 
-# Parse Environment and Working Directory from all profiles
-WORKDIR=""
+# Parse Environment from all profiles
 SANDBOX_PATH=""
 for profile in "${FS_PROFILES[@]}" "$CLI_PROFILE"; do
     [[ -z "$profile" ]] && continue
-    
-    # Working Directory (last one wins)
-    WDIR=$(jq -r '.workingDirectory // empty' "$profile" | envsubst)
-    [[ -n "$WDIR" ]] && WORKDIR="$WDIR"
+
+    # "workingDirectory" used to be a profile field resolved last-one-wins.
+    # That never composed: --fs a --fs b and --fs b --fs a mount the same
+    # tree but start the session in different places, so the cwd depended on
+    # flag order rather than on what the profiles actually provide. It is now
+    # a single --wd on the command line. Warned about rather than ignored,
+    # because silently starting somewhere else is the confusing failure.
+    if [[ "$(jq -r 'has("workingDirectory")' "$profile")" == "true" ]]; then
+        echo "Warning: profile '$(basename "$profile" .json)' sets \"workingDirectory\", which is no longer honored." >&2
+        echo "  Pass --wd $(jq -r '.workingDirectory' "$profile") instead." >&2
+    fi
 
     # Environment Variables
     while IFS='=' read -r key value; do
@@ -793,7 +894,7 @@ fi
 BWRAP_ARGS+=(--setenv PATH "$SESSION_DIR/bin:$SANDBOX_PATH")
 
 # Network Setup
-if [[ -n "$NET_PROFILE" ]]; then
+if [[ "$SBX_NETNS" == "true" ]]; then
     # Detect host network settings for manual injection if pasta auto-config fails
     HOST_IFACE=$(ip route show default | awk '{print $5}' | head -n 1)
     HOST_IP=$(ip addr show "$HOST_IFACE" | grep "inet " | awk '{print $2}' | cut -d/ -f1 | head -n 1)
@@ -817,35 +918,150 @@ if [[ -n "$NET_PROFILE" ]]; then
     # untouched by pasta and is local via lo's 127.0.0.1/8.
     SBX_DNS_ADDR="127.0.0.2"
 
-    # DNS upstream must be a plain IP — dnsmasq does not speak DoH stamps.
-    # If the profile supplies a stamp or leaves dns empty, fall back to Cloudflare.
-    DNS_UPSTREAM=$(jq -r '.dns // empty' "$NET_PROFILE")
-    if ! [[ "$DNS_UPSTREAM" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        DNS_UPSTREAM="1.1.1.1"
+    # Everything from here to the resolv.conf bind is DNS machinery, which
+    # only a net profile needs: a host-ports-only session resolves nothing,
+    # because its one reachable destination is a loopback address.
+    if [[ ${#NET_PROFILES[@]} -gt 0 ]]; then
+
+    # --- Composing several net profiles ---
+    #
+    # Each destination is paired with the ports of the profile that allowed
+    # it, rather than every destination sharing one union of every profile's
+    # ports. Stacking `--net web` (80,443) with `--net db` (5432) therefore
+    # grants the web hosts 80,443 and the database host 5432 — not both hosts
+    # on all three ports, which is what a flat union would produce and is
+    # strictly more access than either profile asked for.
+    #
+    # Pairing is done by giving each distinct port list its own nftables set
+    # and pointing each domain at the set for its ports. This is forced by
+    # dnsmasq: a domain feeds exactly ONE nftset (verified — with two
+    # --nftset options for one domain, only the first receives the answer),
+    # so a domain cannot be gated two different ways at once. Hence the one
+    # place a union is unavoidable: a domain named by several profiles gets
+    # the union of their ports. That is also the right reading, since each
+    # profile independently authorized it.
+    #
+    # An explicit CIDR needs no set — it is already an address — so it is
+    # emitted as its own rule, gated by the same paired port list.
+
+    declare -A DOMAIN_PORTS=()      # domain -> port signature ("*" or "80,443")
+    declare -A DOMAIN_UPSTREAM=()   # domain -> resolver that profile chose
+    declare -A CIDR_PORTS=()        # cidr   -> port signature
+    ALLOW_ALL=false
+    ALLOW_ALL_PORTS=""
+    DNS_UPSTREAMS=()
+
+    # Union of two port signatures. "*" absorbs everything.
+    merge_ports() {
+        local a="$1" b="$2"
+        [[ -z "$a" ]] && { echo "$b"; return; }
+        [[ "$a" == "*" || "$b" == "*" ]] && { echo "*"; return; }
+        printf '%s\n%s\n' "${a//,/$'\n'}" "${b//,/$'\n'}" | sort -n -u | paste -sd, -
+    }
+
+    for np in "${NET_PROFILES[@]}"; do
+        # DNS upstream must be a plain IP — dnsmasq does not speak DoH stamps.
+        # If the profile supplies a stamp or leaves dns empty, fall back to
+        # Cloudflare. Resolved per profile: each profile's domains are asked
+        # of the resolver that profile named.
+        np_upstream=$(jq -r '.dns // empty' "$np")
+        if ! [[ "$np_upstream" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            np_upstream="1.1.1.1"
+        fi
+        DNS_UPSTREAMS+=("$np_upstream")
+
+        # This profile's port signature, normalised once.
+        if jq -e '.ports[]? | select(. == "*")' "$np" >/dev/null 2>&1; then
+            np_ports="*"
+        else
+            np_ports=$(jq -r '.ports[]?' "$np" | sort -n -u | paste -sd, -)
+            # Hostnames allowed but no ports specified -> default to web.
+            [[ -z "$np_ports" ]] && np_ports="80,443"
+        fi
+
+        while IFS= read -r entry; do
+            [[ -z "$entry" ]] && continue
+            if [[ "$entry" == "*" ]]; then
+                ALLOW_ALL=true
+                ALLOW_ALL_PORTS=$(merge_ports "$ALLOW_ALL_PORTS" "$np_ports")
+                continue
+            fi
+            # Strips leading '*.' — dnsmasq --server=/domain/up matches the
+            # apex plus all subdomains.
+            domain="${entry#\*.}"
+            DOMAIN_PORTS["$domain"]=$(merge_ports "${DOMAIN_PORTS[$domain]:-}" "$np_ports")
+            [[ -n "${DOMAIN_UPSTREAM[$domain]:-}" ]] || DOMAIN_UPSTREAM["$domain"]="$np_upstream"
+        done < <(jq -r '.allow[]? | select(type == "string" and test("^[a-zA-Z*]"))' "$np")
+
+        while IFS= read -r cidr; do
+            [[ -z "$cidr" ]] && continue
+            CIDR_PORTS["$cidr"]=$(merge_ports "${CIDR_PORTS[$cidr]:-}" "$np_ports")
+        done < <(jq -r '.allow[]? | select(type == "string" and test("^[0-9]"))' "$np")
+    done
+
+    mapfile -t DNS_UPSTREAMS < <(printf '%s\n' "${DNS_UPSTREAMS[@]}" | sort -u)
+    DNS_UPSTREAM="${DNS_UPSTREAMS[0]}"
+
+    # A wildcard profile authorizes every domain, including ones another
+    # profile also named on narrower ports. Because a domain feeds exactly
+    # one nftset, and dnsmasq prefers the more specific match, such a domain
+    # would otherwise land in the narrow set and lose the access the
+    # wildcard already granted — stacking a profile would REMOVE reach.
+    # Folding the wildcard's ports into every named domain keeps the rule
+    # that composing profiles only ever adds.
+    if [[ "$ALLOW_ALL" == "true" ]]; then
+        for domain in "${!DOMAIN_PORTS[@]}"; do
+            DOMAIN_PORTS["$domain"]=$(merge_ports "${DOMAIN_PORTS[$domain]}" "$ALLOW_ALL_PORTS")
+        done
     fi
 
-    # Build per-domain dnsmasq CLI flags from the hostname entries in allow[].
-    # Strips leading '*.' — dnsmasq --server=/domain/up matches the apex + all subs.
-    # --nftset auto-populates the nftables set from every A-record answer,
-    # replacing the old bespoke Python sniffer with zero custom code.
-    ALLOW_ALL=false
+    # Assign every distinct port signature its own set name, then build the
+    # dnsmasq flags: one --server and one --nftset per domain.
+    declare -A PORTS_SETNAME=()
+    SET_INDEX=0
     DNSMASQ_DOMAIN_ARGS=()
-    while IFS= read -r entry; do
-        [[ -z "$entry" ]] && continue
-        if [[ "$entry" == "*" ]]; then
-            ALLOW_ALL=true
-            break
+    for domain in "${!DOMAIN_PORTS[@]}"; do
+        sig="${DOMAIN_PORTS[$domain]}"
+        if [[ -z "${PORTS_SETNAME[$sig]:-}" ]]; then
+            SET_INDEX=$((SET_INDEX + 1))
+            PORTS_SETNAME["$sig"]="allowed4_$SET_INDEX"
         fi
-        domain="${entry#\*.}"
-        DNSMASQ_DOMAIN_ARGS+=("--server=/$domain/$DNS_UPSTREAM")
-        DNSMASQ_DOMAIN_ARGS+=("--nftset=/$domain/inet#sbx_filter#allowed4")
-    done < <(jq -r '.allow[]? | select(type == "string" and test("^[a-zA-Z*]"))' "$NET_PROFILE")
+        DNSMASQ_DOMAIN_ARGS+=("--server=/$domain/${DOMAIN_UPSTREAM[$domain]}")
+        DNSMASQ_DOMAIN_ARGS+=("--nftset=/$domain/inet#sbx_filter#${PORTS_SETNAME[$sig]}")
+    done
 
-    # First non-CIDR hostname for the readiness probe.
-    TEST_DOMAIN=$(jq -r '.allow[]? | select(type=="string" and test("^[a-zA-Z]"))' "$NET_PROFILE" | head -n1)
+    if [[ "$ALLOW_ALL" == "true" ]]; then
+        if [[ -z "${PORTS_SETNAME[$ALLOW_ALL_PORTS]:-}" ]]; then
+            SET_INDEX=$((SET_INDEX + 1))
+            PORTS_SETNAME["$ALLOW_ALL_PORTS"]="allowed4_$SET_INDEX"
+        fi
+        ALLOW_ALL_SET="${PORTS_SETNAME[$ALLOW_ALL_PORTS]}"
+    fi
+
+    # First hostname from any profile, for the readiness probe.
+    TEST_DOMAIN=""
+    for np in "${NET_PROFILES[@]}"; do
+        TEST_DOMAIN=$(jq -r '.allow[]? | select(type=="string" and test("^[a-zA-Z]"))' "$np" | head -n1)
+        [[ -n "$TEST_DOMAIN" ]] && break
+    done
 
     # resolv.conf points into the sandbox at our dnsmasq instance.
     printf 'nameserver %s\n' "$SBX_DNS_ADDR" > "$DNS_DIR/resolv.conf"
+
+    else
+        # Host-ports-only: no resolver runs and no destination outside
+        # loopback is reachable, so an empty resolv.conf is the honest
+        # description. Name lookups fail immediately instead of hanging on
+        # a nameserver the ruleset drops; "localhost" still resolves,
+        # because that comes from /etc/hosts rather than DNS.
+        : > "$DNS_DIR/resolv.conf"
+        ALLOW_ALL=false
+        TEST_DOMAIN=""
+        DNSMASQ_DOMAIN_ARGS=()
+        DNS_UPSTREAMS=()
+        declare -A PORTS_SETNAME=()
+        declare -A CIDR_PORTS=()
+    fi
 
     # /etc is bound read-only above, so whatever /etc/resolv.conf is on the
     # host appears in the sandbox — and on many hosts it is a symlink out of
@@ -873,45 +1089,61 @@ if [[ -n "$NET_PROFILE" ]]; then
     # netavark bridge backend: bridge-forwarded container traffic
     # traverses the kernel forward hook, never output, so an output-only
     # table would leave podman-full container egress completely ungated.
+    # One accept per destination, carrying the ports that destination was
+    # actually granted. A "*" signature means any port.
+    emit_dest_rule() {
+        local dest="$1" sig="$2"
+        if [[ "$sig" == "*" ]]; then
+            echo "        ip daddr $dest accept"
+        else
+            echo "        ip daddr $dest tcp dport { $sig } accept"
+            echo "        ip daddr $dest udp dport { $sig } accept"
+        fi
+    }
+
     emit_egress_allow_rules() {
-        # Explicit CIDRs from the profile (any port).
-        jq -r '.allow[]? | select(test("^[0-9]"))' "$NET_PROFILE" | while read -r cidr; do
-            [[ -z "$cidr" ]] && continue
-            echo "        ip daddr $cidr accept"
+        # Explicit CIDRs, each gated by the ports of the profile that
+        # allowed it.
+        local cidr sig
+        for cidr in "${!CIDR_PORTS[@]}"; do
+            emit_dest_rule "$cidr" "${CIDR_PORTS[$cidr]}"
         done
 
-        # Destinations resolved for allowed domains, gated by the port list.
-        if [[ "$ALLOW_ALL" == "true" ]] || jq -e '.ports[]? | select(. == "*")' "$NET_PROFILE" >/dev/null 2>&1; then
-            echo "        ip daddr @allowed4 accept"
-        else
-            ports=$(jq -r '.ports[]?' "$NET_PROFILE" | paste -sd, -)
-            if [[ -n "$ports" ]]; then
-                echo "        ip daddr @allowed4 tcp dport { $ports } accept"
-                echo "        ip daddr @allowed4 udp dport { $ports } accept"
-            else
-                # Hostnames allowed but no ports specified -> default to web.
-                echo "        ip daddr @allowed4 tcp dport { 80, 443 } accept"
-            fi
-        fi
+        # One rule per port signature, naming that signature's set. Domains
+        # were sorted into these sets by dnsmasq --nftset as answers arrived.
+        for sig in "${!PORTS_SETNAME[@]}"; do
+            emit_dest_rule "@${PORTS_SETNAME[$sig]}" "$sig"
+        done
     }
 
     NFT_RULES="$DNS_DIR/rules.nft"
     {
         echo "table inet sbx_filter {"
-        echo "    set allowed4 {"
-        echo "        type ipv4_addr"
-        echo "        flags timeout"
-        echo "    }"
+        for sig in "${!PORTS_SETNAME[@]}"; do
+            echo "    set ${PORTS_SETNAME[$sig]} {"
+            echo "        type ipv4_addr"
+            echo "        flags timeout"
+            echo "    }"
+        done
         echo "    chain output {"
         echo "        type filter hook output priority 0; policy drop;"
+        # Loopback carries the host-port splice: pasta binds each named
+        # host port inside this namespace, so reaching a host service is
+        # loopback traffic and needs no destination rule of its own. The
+        # allow-list for it is pasta's -T list, not this table.
         echo "        oif \"lo\" accept"
         echo "        ct state established,related accept"
-        echo "        ip daddr $SBX_DNS_ADDR udp dport 53 accept"
-        echo "        ip daddr $SBX_DNS_ADDR tcp dport 53 accept"
-        echo "        ip daddr $DNS_UPSTREAM udp dport 53 accept"
-        echo "        ip daddr $DNS_UPSTREAM tcp dport 53 accept"
 
-        emit_egress_allow_rules
+        if [[ ${#NET_PROFILES[@]} -gt 0 ]]; then
+            echo "        ip daddr $SBX_DNS_ADDR udp dport 53 accept"
+            echo "        ip daddr $SBX_DNS_ADDR tcp dport 53 accept"
+            for upstream in "${DNS_UPSTREAMS[@]}"; do
+                echo "        ip daddr $upstream udp dport 53 accept"
+                echo "        ip daddr $upstream tcp dport 53 accept"
+            done
+
+            emit_egress_allow_rules
+        fi
 
         echo "        meta nfproto ipv6 drop"
         echo "    }"
@@ -924,7 +1156,9 @@ if [[ -n "$NET_PROFILE" ]]; then
         echo "    chain forward {"
         echo "        type filter hook forward priority 0; policy drop;"
         echo "        ct state established,related accept"
-        emit_egress_allow_rules
+        if [[ ${#NET_PROFILES[@]} -gt 0 ]]; then
+            emit_egress_allow_rules
+        fi
         echo "        meta nfproto ipv6 drop"
         echo "    }"
 
@@ -939,7 +1173,7 @@ cat > "$SESSION_DIR/session.json" <<EOF
     "cwd": "$PWD",
     "pid": $$,
     "fs_profiles": $(printf '%s\n' "${FS_PROFILES[@]}" | jq -R . | jq -s .),
-    "net_profile": $([[ -n "$NET_PROFILE" ]] && jq -R . <<< "$NET_PROFILE" || echo "null"),
+    "net_profiles": $(printf '%s\n' "${NET_PROFILES[@]}" | jq -R . | jq -s 'map(select(. != ""))'),
     "cli_profile": $([[ -n "$CLI_PROFILE" ]] && jq -R . <<< "$CLI_PROFILE" || echo "null")
 }
 EOF
@@ -1125,13 +1359,32 @@ if [[ "$USERNS_FULL" == "true" ]]; then
 fi
 
 NET_PRELUDE=""
-if [[ -n "$NET_PROFILE" ]]; then
-    # Serialise per-domain flags for expansion inside the heredoc.
-    if [[ "$ALLOW_ALL" == "true" ]]; then
-        # Wildcard: forward everything, populate allowed4 for every answer.
-        DNSMASQ_DOMAIN_FLAGS="--server=$DNS_UPSTREAM --nftset=//inet#sbx_filter#allowed4"
-    else
+if [[ "$SBX_NETNS" == "true" && ${#NET_PROFILES[@]} -eq 0 ]]; then
+    # Host-ports-only: load the ruleset (which permits loopback and nothing
+    # else) and start no resolver. Same hard-fail contract as the net path —
+    # a session must never come up with the egress table missing.
+    NET_PRELUDE=$(cat <<EOF
+ip link set lo up >/dev/null 2>&1
+
+if ! NFT_ERR=\$(nft -f "$NFT_RULES" 2>&1); then
+    echo "Error: nftables rules failed to load — aborting." >&2
+    echo "  nft: \$NFT_ERR" >&2
+    exit 1
+fi
+EOF
+)
+elif [[ ${#NET_PROFILES[@]} -gt 0 ]]; then
+    # Serialise per-domain flags for expansion inside the heredoc. A
+    # wildcard profile adds a catch-all server and set on top of the
+    # per-domain flags rather than replacing them: dnsmasq prefers the more
+    # specific match, so a domain another profile named on narrow ports
+    # keeps its own set (and its own ports) even alongside `allow: ["*"]`.
+    DNSMASQ_DOMAIN_FLAGS=""
+    if [[ ${#DNSMASQ_DOMAIN_ARGS[@]} -gt 0 ]]; then
         DNSMASQ_DOMAIN_FLAGS=$(printf '%s ' "${DNSMASQ_DOMAIN_ARGS[@]}")
+    fi
+    if [[ "$ALLOW_ALL" == "true" ]]; then
+        DNSMASQ_DOMAIN_FLAGS+="--server=$DNS_UPSTREAM --nftset=//inet#sbx_filter#$ALLOW_ALL_SET"
     fi
 
     # Runs in launch.sh: inside pasta's namespaces, before bwrap, with the
@@ -1240,9 +1493,9 @@ chmod +x "$CAT_WRAPPER"
     fi
 } > "$LAUNCH_SCRIPT"
 
-# With networking the script must outlive bwrap to reap dnsmasq, so it
-# cannot exec. Without networking there is nothing to clean up.
-if [[ -n "$NET_PRELUDE" ]]; then
+# With a net profile the script must outlive bwrap to reap dnsmasq, so it
+# cannot exec. A host-ports-only session starts no resolver, so it can.
+if [[ ${#NET_PROFILES[@]} -gt 0 ]]; then
     printf "bwrap " >> "$LAUNCH_SCRIPT"
 else
     printf "exec bwrap " >> "$LAUNCH_SCRIPT"
@@ -1252,7 +1505,7 @@ for arg in "${BWRAP_ARGS[@]}"; do
 done
 printf "%q -c %q %q\n" "$SESSION_MUX" "$SESSION_SOCK" "$CAT_WRAPPER" >> "$LAUNCH_SCRIPT"
 
-if [[ -n "$NET_PRELUDE" ]]; then
+if [[ ${#NET_PROFILES[@]} -gt 0 ]]; then
     # Quoted heredoc: every expansion below belongs to launch.sh, not here.
     cat >> "$LAUNCH_SCRIPT" <<'REAPEOF'
 SBX_RC=$?
@@ -1263,10 +1516,41 @@ fi
 
 chmod +x "$LAUNCH_SCRIPT"
 
-# --no-map-gw on both calls: pasta otherwise translates the gateway address
+# -T / -U: the explicit host-port forward lists, or "none". Between them
+# they are the whole of the host-access allow-list — pasta binds exactly
+# these ports inside the namespace and splices them to the host's loopback,
+# so an unnamed host service has nothing listening for it to reach. "none"
+# on both is the default, and is what replaces pasta's -T/-U auto, which
+# would forward every port bound on the host. Keeping the two lists separate
+# is what stops a TCP grant from quietly carrying its UDP twin along, and
+# what keeps a host resolver from claiming the port dnsmasq needs unless the
+# session actually asked for udp/53.
+#
+# --no-map-gw on every call: pasta otherwise translates the gateway address
 # to the host's loopback, which would let the sandbox reach host-local
 # services through $HOST_GW without ever traversing a rule that names them.
-if [[ -n "$NET_PROFILE" ]]; then
+# Host access goes through -T/-U, which is per-port and per-protocol;
+# --map-gw is all-or-nothing.
+join_ports() {
+    if [[ $# -eq 0 ]]; then
+        echo none
+    else
+        local joined; joined=$(printf '%s,' "$@"); echo "${joined%,}"
+    fi
+}
+PASTA_FWD_TCP=$(join_ports "${HOST_PORTS_TCP[@]}")
+PASTA_FWD_UDP=$(join_ports "${HOST_PORTS_UDP[@]}")
+PASTA_PORT_ARGS=(-T "$PASTA_FWD_TCP" -U "$PASTA_FWD_UDP")
+
+# Human-readable summary for the startup line, protocols named explicitly.
+HOST_PORT_DESC=""
+[[ "$PASTA_FWD_TCP" != "none" ]] && HOST_PORT_DESC="tcp $PASTA_FWD_TCP"
+if [[ "$PASTA_FWD_UDP" != "none" ]]; then
+    [[ -n "$HOST_PORT_DESC" ]] && HOST_PORT_DESC+=", "
+    HOST_PORT_DESC+="udp $PASTA_FWD_UDP"
+fi
+
+if [[ "$SBX_NETNS" == "true" ]]; then
     if [[ "$USERNS_FULL" == "true" ]]; then
         echo "Starting session $SESSION_ID with networking (full userns)..."
         # unshare claims the user's /etc/subuid range up front, via the
@@ -1275,10 +1559,14 @@ if [[ -n "$NET_PROFILE" ]]; then
         # then NOT create its own user namespace (that would discard the
         # multi-UID mapping): --netns-only.
         unshare --map-auto --map-root-user -- \
-            pasta -f --config-net --netns-only --no-map-gw --interface "$HOST_IFACE" --no-ndp --no-dhcpv6 --no-ra -a "$HOST_IP" -g "$HOST_GW" -n "$HOST_MASK" -- "$LAUNCH_SCRIPT"
+            pasta -f --config-net --netns-only --no-map-gw "${PASTA_PORT_ARGS[@]}" --interface "$HOST_IFACE" --no-ndp --no-dhcpv6 --no-ra -a "$HOST_IP" -g "$HOST_GW" -n "$HOST_MASK" -- "$LAUNCH_SCRIPT"
     else
-        echo "Starting session $SESSION_ID with networking..."
-        pasta -f --config-net --no-map-gw --interface "$HOST_IFACE" --no-ndp --no-dhcpv6 --no-ra -a "$HOST_IP" -g "$HOST_GW" -n "$HOST_MASK" -- "$LAUNCH_SCRIPT"
+        if [[ ${#NET_PROFILES[@]} -gt 0 ]]; then
+            echo "Starting session $SESSION_ID with networking..."
+        else
+            echo "Starting session $SESSION_ID with host ports $HOST_PORT_DESC (no internet)..."
+        fi
+        pasta -f --config-net --no-map-gw "${PASTA_PORT_ARGS[@]}" --interface "$HOST_IFACE" --no-ndp --no-dhcpv6 --no-ra -a "$HOST_IP" -g "$HOST_GW" -n "$HOST_MASK" -- "$LAUNCH_SCRIPT"
     fi
 else
     echo "Starting session $SESSION_ID..."

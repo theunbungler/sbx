@@ -1,9 +1,11 @@
 {
-    "description": "Project-specific sources",
-    "workingDirectory": "/workspace",
-    "mounts": [
-        { "source": "$PWD", "dest": "/workspace", "perm": "rw" }
-    ],
-    "env": {
+  "description": "Project-specific sources",
+  "mounts": [
+    {
+      "source": "$PWD",
+      "dest": "/workspace",
+      "perm": "rw"
     }
+  ],
+  "env": {}
 }

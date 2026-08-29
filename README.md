@@ -64,6 +64,8 @@ To see all available commands and options, run:
 | `--list-profiles` | Show all available CLI, FS, and NET profiles. |
 | `--list-sessions` | List all currently active sandbox sessions. |
 | `--join <session>` | Attach to an existing sandbox session. |
+| `--wd <path>` | Start the session in this directory inside the sandbox. |
+| `--host-port <spec>` | Reach a service running on the host's `127.0.0.1:<port>` from inside the sandbox. `<spec>` is `<port>[/tcp\|/udp]`; a bare number means TCP. Repeatable. |
 | `--gui` | Start a session with isolated GUI support via `xpra`. |
 
 ### Applying Profiles
@@ -135,12 +137,11 @@ CLI profiles configure the shell environment inside the sandbox. They control en
 
 ### Filesystem (FS) Profiles (`profiles/fs/<name>.json`)
 
-FS profiles define the sandbox's filesystem layout — which directories are mounted, where the working directory is, and FS-level environment variables.
+FS profiles define the sandbox's filesystem layout — which directories are mounted and FS-level environment variables. The starting directory is not a profile field; pass `--wd <path>` on the command line.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `description` | string | No | Human-readable label for the profile |
-| `workingDirectory` | string | No | Initial working directory inside the sandbox (last one wins when multiple FS profiles are stacked) |
 | `mounts` | array of objects | No | Filesystem mount specifications (see below) |
 | `env` | object | No | Key-value pairs of environment variables to set |
 | `userns` | string | No | `"full"` runs the entire session inside an outer user namespace carrying your full subordinate-UID range (multi-UID podman). Requires `--net`; the session identity becomes namespace-root. See [Multi-UID containers](#multi-uid-containers-podman-full). |
@@ -172,7 +173,6 @@ Each entry in the `mounts` array has these fields:
 ```json
 {
     "description": "Project workspace",
-    "workingDirectory": "/workspace",
     "mounts": [
         { "source": "$PWD", "dest": "/workspace", "perm": "rw" },
         { "source": "/usr/include", "dest": "/usr/include", "perm": "ro" }
@@ -186,7 +186,7 @@ Each entry in the `mounts` array has these fields:
 
 ### Network (NET) Profiles (`profiles/net/<name>.json`)
 
-NET profiles control network access inside the sandbox. When a network profile is applied, the sandbox uses `pasta` for user-mode networking, `dnsmasq` for DNS resolution (with per-domain forwarding and domain allowlisting), and `nftables` for egress filtering keyed on the IPs dnsmasq resolves. `dnsmasq` and `nft` are started outside the sandbox, so nothing running inside can signal the resolver or alter the ruleset.
+NET profiles control network access inside the sandbox. Like FS profiles, they stack — `--net` may be given more than once, and the grants combine (see [Stacking network profiles](#stacking-network-profiles)). When a network profile is applied, the sandbox uses `pasta` for user-mode networking, `dnsmasq` for DNS resolution (with per-domain forwarding and domain allowlisting), and `nftables` for egress filtering keyed on the IPs dnsmasq resolves. `dnsmasq` and `nft` are started outside the sandbox, so nothing running inside can signal the resolver or alter the ruleset.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
@@ -194,6 +194,7 @@ NET profiles control network access inside the sandbox. When a network profile i
 | `dns` | string | No | Upstream DNS server as a plain **IP address** (e.g., `"1.1.1.1"`). dnsmasq does not speak DoH stamps; anything that is not a bare IPv4 address falls back to `1.1.1.1` |
 | `allow` | array of strings | No | Allowed destinations. Supports **hostname globs** (e.g., `"*.google.com"`, `"github.com"`) and **CIDR notation** (e.g., `"192.168.1.0/24"`) |
 | `ports` | array | No | Allowed ports. Can be a list of port numbers (`[80, 443]`) or the wildcard `["*"]` to allow all ports |
+| `host_ports` | array | No | Host services to expose inside the sandbox at `127.0.0.1:<port>`. Entries are `<port>` (TCP) or `"<port>/tcp"` / `"<port>/udp"`. Not honored in project-supplied profiles. |
 
 **How filtering works:**
 
@@ -243,9 +244,22 @@ Profiles are applied via the `--cli`, `--fs`, and `--net` flags. Multiple `--fs`
 
 # Stack multiple filesystem profiles
 ./sbx --fs sandbox --fs chrome
+
+# Stack multiple network profiles
+./sbx --net web --net internal-db
 ```
 
-When multiple profiles set the same environment variable or `workingDirectory`, the **last one wins**.
+When multiple profiles set the same environment variable, the **last one wins**.
+
+The starting directory is deliberately not part of this: a per-profile `workingDirectory` resolved last-one-wins, so `--fs a --fs b` and `--fs b --fs a` mounted the same tree but started the session in different places. Use `--wd` instead, which says once, explicitly, where the session begins:
+
+```bash
+./sbx --fs sandbox --wd /workspace
+```
+
+Without `--wd`, bwrap picks the start directory itself: the directory you launched from if that path also exists inside the sandbox, otherwise `$HOME`, otherwise `/`. Since most profiles do not mount the launch directory at its host path, this usually lands in `$HOME` — pass `--wd` whenever the session should begin somewhere specific.
+
+A profile that still carries `workingDirectory` is not honored; sbx warns and names the `--wd` to pass instead.
 
 ### Creating Custom Profiles
 
@@ -407,3 +421,69 @@ it, `pkill catatonit` cleans up the stragglers.
 ## License
 
 [LICENSE](LICENSE)
+
+## Reaching Host Services
+
+A service running on the host's loopback — a dev server, a database, a local model endpoint — is not reachable from a sandbox by default. Name its port and it appears inside the sandbox at the same address:
+
+```bash
+# with internet, per the net profile
+./sbx --net anthropic --host-port 8080
+
+# no internet at all: the host service and nothing else
+./sbx --host-port 8080 -- claude
+```
+
+Or in a net profile:
+
+```json
+{ "allow": ["github.com"], "ports": ["*"], "host_ports": [8080, 5432, "5353/udp"] }
+```
+
+The second form is the useful one for an agent you want kept off the network but still pointed at your local stack. It needs no `--net` profile: sbx creates a network namespace, forwards exactly the named ports, and loads a default-drop ruleset, so the session reaches those host services and no other destination.
+
+**Addressing.** A named host port answers at `127.0.0.1:<port>` inside the sandbox, the same number it uses on the host, so tools that hardcode `localhost` work unchanged.
+
+**TCP and UDP are granted separately.** A bare `8080` means TCP; write `8080/udp` for UDP, and name the port twice to get both:
+
+```bash
+./sbx --host-port 8080/tcp --host-port 8080/udp
+```
+
+The two are independent all the way down — forwarding a TCP port does not open its UDP twin. That matters for a port like `53`: a session reaches a host resolver only if it asks for `53/udp` by name, and doing so does not disturb the session's own DNS, which runs on a different loopback address.
+
+**Ports the sandbox binds itself are unaffected**, as long as they are not also forwarded. A sandbox can serve on `127.0.0.1:10000` while reaching the host's service on `127.0.0.1:10001`. The one case to avoid is naming a port the sandbox also wants to bind: the forwarded host service owns that port inside the sandbox, and the sandbox's own `bind()` fails with `EADDRINUSE`.
+
+**Only named ports are forwarded.** This is deliberate, and it is not what the underlying tooling does by default: pasta's `-T auto` forwards *every* port bound on the host, including ports bound after the session starts and ports bound by other users. sbx passes an explicit list instead, so host access is an allow-list like egress rather than a side effect of having networking at all.
+
+**`host_ports` is ignored in project-supplied profiles** and rejected with an error, on the same grounds as `userns`, `caps` and `docker_api`: a cloned repository must not be able to open a path from its own sandbox to a service on the machine running it. Move the profile to `$HOME/.config/sbx/profiles/` to grant it.
+
+## Stacking Network Profiles
+
+`--net` may be given more than once. Composing profiles only ever **adds** reach: no combination takes away access that one of the profiles on its own would have granted.
+
+**Ports stay paired with the hosts they were granted for**, rather than pooling into one list that every destination shares. Stacking a web profile with a database profile:
+
+```json
+// web.json                                    // db.json
+{ "allow": ["example.com"], "ports": [80,443] } { "allow": ["db.internal"], "ports": [5432] }
+```
+
+```bash
+./sbx --net web --net db
+```
+
+gives `example.com` ports 80 and 443, and `db.internal` port 5432. It does **not** give `example.com` port 5432 — which is what a flat union of all ports would produce, and is more access than either profile asked for.
+
+Pairing is implemented by giving each distinct port list its own nftables set and routing each domain to the set matching its ports. That structure is forced by dnsmasq: a domain can feed exactly one nftset, so a single domain cannot be gated two different ways at once.
+
+That constraint produces the one place a union is unavoidable:
+
+- **A host named by several profiles gets the union of their ports.** If one profile allows `github.com` on 443 and another on 22, it is reachable on both. Each profile authorized it independently, so this is also the correct reading.
+- **A wildcard profile (`allow: ["*"]`) widens every named host.** Its ports fold into every other profile's hosts, so adding a narrow profile next to a wildcard one never removes reach the wildcard already granted.
+
+Other fields:
+
+- **`dns` is per profile.** Each profile's hosts are resolved through the resolver that profile named, and every named resolver is permitted on port 53.
+- **`allow` CIDR entries** are gated by the ports of the profile that listed them, the same as hostnames. A CIDR is already an address, so it needs no set of its own.
+- **`host_ports` accumulate** across every applied profile and the `--host-port` flag, keeping TCP and UDP separate.
