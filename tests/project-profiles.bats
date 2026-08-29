@@ -17,7 +17,9 @@ teardown() {
     [[ -n "$ROOT" && "$ROOT" == /tmp/sbxh.* ]] && rm -rf "$ROOT"
 }
 
-@test "a project profile is refused non-interactively" {
+@test "a tracked project profile is refused non-interactively" {
+    git -C "$PROJ" init -q
+    git -C "$PROJ" add -f .sbx/profiles/fs/tst.json
     run bash -c "cd '$PROJ' && $SBX --fs tst -- /bin/true < /dev/null 2>&1"
     [ "$status" -ne 0 ]
     [[ "$output" == *"project profile"* ]]
@@ -46,10 +48,14 @@ EOF
     [[ "$output" == *"example.invalid"* ]]
 }
 
-@test "an untracked project profile is refused without a remote warning" {
+# An untracked profile cannot have arrived via clone or pull, so it is the
+# user's own scratch config and confirm_project_profile raises no prompt --
+# not even in a repo that has a remote. Stdin is closed so a regression that
+# does prompt exits 1 here rather than blocking on /dev/tty.
+@test "an untracked project profile launches without confirmation" {
     git -C "$PROJ" init -q
     git -C "$PROJ" remote add origin https://example.invalid/evil.git
-    run bash -c "cd '$PROJ' && $SBX --fs tst -- /bin/true < /dev/null 2>&1"
-    [ "$status" -ne 0 ]
-    [[ "$output" != *"example.invalid"* ]]
+    run bash -c "cd '$PROJ' && $SBX --fs tst -- /bin/sh -c 'echo ran > /out/untracked.txt' < /dev/null 2>&1"
+    [ "$status" -eq 0 ]
+    [ -f "$HOSTDIR/untracked.txt" ]
 }
