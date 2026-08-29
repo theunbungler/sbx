@@ -50,6 +50,15 @@ sbx_copy_seed() {
 #   $3 out - destination for changed files
 #
 # Never prunes $out: entries it does not write are left alone.
+#
+# "Differs" is decided by CONTENT, not by size-and-mtime. The cheap check
+# these paths used to make compares mtime at whole-second granularity, so a
+# file rewritten in-sandbox to the same length within the same wall-clock
+# second as the seed copy looked identical and was silently dropped — the
+# exact shape of a small JSON state file a tool rewrites the moment it
+# starts (a token, a counter, an id of unchanged width). That is data loss
+# in the persistence path behind --cli, so all three comparisons below are
+# content-based: --checksum for rsync, cmp for the fallbacks.
 sbx_copy_writeback() {
     local src="$1" tmp="$2" out="$3"
 
@@ -57,7 +66,7 @@ sbx_copy_writeback() {
 
     if [[ -d "$src" ]]; then
         if command -v rsync >/dev/null 2>&1; then
-            rsync -a --compare-dest="$src/" "$tmp/" "$out/"
+            rsync -a --checksum --compare-dest="$src/" "$tmp/" "$out/"
         else
             (
                 cd "$tmp" || exit 0
@@ -69,8 +78,7 @@ sbx_copy_writeback() {
                     local needs_copy=0
                     if [[ ! -f "$orig_file" ]]; then
                         needs_copy=1
-                    elif [[ $(stat -c %s "$file") -ne $(stat -c %s "$orig_file") ]] || \
-                         [[ $(stat -c %Y "$file") -gt $(stat -c %Y "$orig_file") ]]; then
+                    elif ! cmp -s "$file" "$orig_file"; then
                         needs_copy=1
                     fi
 
@@ -89,8 +97,7 @@ sbx_copy_writeback() {
         # The sandbox may have deleted it; nothing to write back if so.
         [[ -f "$file" ]] || return 0
 
-        if [[ $(stat -c %s "$file") -ne $(stat -c %s "$src") ]] || \
-           [[ $(stat -c %Y "$file") -gt $(stat -c %Y "$src") ]]; then
+        if ! cmp -s "$file" "$src"; then
             cp -a "$file" "$out/$filename"
         fi
     fi

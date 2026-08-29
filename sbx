@@ -291,6 +291,38 @@ done
 # both multiplexers fails before any session state or xpra display exists.
 find_session_mux
 
+# Same reasoning for the rest of the toolchain. bwrap in particular used to
+# be discovered only when the generated launch.sh tried to exec it, which
+# reported nothing but "bwrap: not found" and exit 127 — after a session
+# directory, an xpra display and a pasta namespace had already been built.
+# The --net tools are checked only when a net profile is in play.
+require_tools() {
+    local missing=() tool
+    for tool in "$@"; do
+        command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+    done
+    [[ ${#missing[@]} -eq 0 ]] && return 0
+
+    echo "Error: sbx requires ${missing[*]}, which $([[ ${#missing[@]} -eq 1 ]] && echo "is" || echo "are") not on PATH." >&2
+    for tool in "${missing[@]}"; do
+        case "$tool" in
+            bwrap)    echo "  bwrap    — Debian/Ubuntu: apt install bubblewrap   Arch: pacman -S bubblewrap" >&2 ;;
+            pasta)    echo "  pasta    — Debian/Ubuntu: apt install passt        Arch: pacman -S passt" >&2 ;;
+            nft)      echo "  nft      — Debian/Ubuntu: apt install nftables     Arch: pacman -S nftables" >&2 ;;
+            dnsmasq)  echo "  dnsmasq  — Debian/Ubuntu: apt install dnsmasq      Arch: pacman -S dnsmasq" >&2 ;;
+            jq)       echo "  jq       — Debian/Ubuntu: apt install jq           Arch: pacman -S jq" >&2 ;;
+            envsubst) echo "  envsubst — Debian/Ubuntu: apt install gettext-base Arch: pacman -S gettext" >&2 ;;
+            setpriv)  echo "  setpriv  — Debian/Ubuntu: apt install util-linux   Arch: pacman -S util-linux" >&2 ;;
+        esac
+    done
+    exit 1
+}
+
+require_tools bwrap jq envsubst setpriv
+if [[ -n "$NET_PROFILE" ]]; then
+    require_tools pasta nft dnsmasq
+fi
+
 # --- Profile feature-field scan (phase 2 virt) ---
 # Optional fields honored in any applied fs/cli profile:
 #   "userns": "full"    -> run the whole session inside an outer user
@@ -598,6 +630,7 @@ BWRAP_ARGS+=(--setenv DOCKER_HOST "unix://$PODMAN_SOCK")
 
 COPY_MOUNTS=()     # fs-profile copy mounts,  "source:dest" — ephemeral
 CLI_COPY_MOUNTS=() # cli-profile copy mounts, "source:dest" — persistent
+SKIPPED_MOUNTS=()  # profile mounts whose source is absent on this host
 
 apply_mounts() {
     local profile="$1" kind="${2:-fs}"
@@ -631,15 +664,27 @@ apply_mounts() {
             done
         fi
 
+        # The -try variants: a profile names paths that are optional on any
+        # given host ($HOME/.nvm, $HOME/.npm-global, /dev/kvm), and a plain
+        # --ro-bind on a missing source aborts the whole launch with
+        # "No such file or directory" — one absent toolchain takes down a
+        # sandbox that had no need of it. -try skips the mount instead.
+        # Only profile-declared mounts are made tolerant; the base binds
+        # (/usr, /etc, the session dir) stay strict, because a sandbox
+        # missing those is broken rather than merely reduced.
+        if [[ ! -e "$source" ]]; then
+            SKIPPED_MOUNTS+=("$perm $source")
+        fi
+
         case "$perm" in
             ro)
-                BWRAP_ARGS+=(--ro-bind "$source" "$dest")
+                BWRAP_ARGS+=(--ro-bind-try "$source" "$dest")
                 ;;
             rw)
-                BWRAP_ARGS+=(--bind "$source" "$dest")
+                BWRAP_ARGS+=(--bind-try "$source" "$dest")
                 ;;
             dev)
-                BWRAP_ARGS+=(--dev-bind "$source" "$dest")
+                BWRAP_ARGS+=(--dev-bind-try "$source" "$dest")
                 ;;
             copy)
                 # `copy` means different things by profile type: ephemeral
@@ -661,6 +706,16 @@ done
 
 if [[ -n "$CLI_PROFILE" ]]; then
     apply_mounts "$CLI_PROFILE" cli
+fi
+
+# A -try mount that finds nothing is dropped without a word from bwrap, which
+# turns "my toolchain is missing inside the sandbox" into a debugging session.
+# Name them once, here, rather than leaving the absence to be inferred.
+if [[ ${#SKIPPED_MOUNTS[@]} -gt 0 ]]; then
+    echo "Note: ${#SKIPPED_MOUNTS[@]} profile mount(s) skipped — source not present on this host:" >&2
+    for sm in "${SKIPPED_MOUNTS[@]}"; do
+        echo "  ${sm%% *} ${sm#* }" >&2
+    done
 fi
 
 # Pre-population for copy mounts. fs-profile mounts are seeded from the
@@ -750,6 +805,18 @@ if [[ -n "$NET_PROFILE" ]]; then
     DNS_DIR="$SESSION_DIR/dns"
     mkdir -p "$DNS_DIR"
 
+    # Loopback address for this session's dnsmasq. Deliberately NOT
+    # 127.0.0.1: pasta's UDP handler binds 127.0.0.1:53 inside the network
+    # namespace it creates whenever the host has anything listening on port
+    # 53 (systemd-resolved's 127.0.0.53/127.0.0.54 stubs, and under WSL2 the
+    # 10.255.255.254 DNS proxy). dnsmasq then loses the race and dies with
+    # "failed to create listening socket for 127.0.0.1: Address already in
+    # use", taking the whole session with it. Neither -u none nor -t none
+    # suppresses that bind; only --no-udp does, and that would break
+    # dnsmasq's own upstream queries. Any other 127.0.0.0/8 address is
+    # untouched by pasta and is local via lo's 127.0.0.1/8.
+    SBX_DNS_ADDR="127.0.0.2"
+
     # DNS upstream must be a plain IP — dnsmasq does not speak DoH stamps.
     # If the profile supplies a stamp or leaves dns empty, fall back to Cloudflare.
     DNS_UPSTREAM=$(jq -r '.dns // empty' "$NET_PROFILE")
@@ -778,11 +845,26 @@ if [[ -n "$NET_PROFILE" ]]; then
     TEST_DOMAIN=$(jq -r '.allow[]? | select(type=="string" and test("^[a-zA-Z]"))' "$NET_PROFILE" | head -n1)
 
     # resolv.conf points into the sandbox at our dnsmasq instance.
-    printf 'nameserver 127.0.0.1\n' > "$DNS_DIR/resolv.conf"
-    BWRAP_ARGS+=(--ro-bind "$DNS_DIR/resolv.conf" /etc/resolv.conf)
+    printf 'nameserver %s\n' "$SBX_DNS_ADDR" > "$DNS_DIR/resolv.conf"
+
+    # /etc is bound read-only above, so whatever /etc/resolv.conf is on the
+    # host appears in the sandbox — and on many hosts it is a symlink out of
+    # /etc entirely (/mnt/wsl/resolv.conf under WSL2, /run/systemd/resolve/
+    # stub-resolv.conf under systemd-resolved). The kernel resolves a bind
+    # mount's destination through symlinks, and neither target exists in the
+    # sandbox's fresh root, so binding at the /etc path fails outright with
+    # "mount point is a symbolic link to nowhere". Bind at the resolved
+    # target instead: bwrap creates the missing parents on the root tmpfs,
+    # and the inherited symlink then points at our file.
+    RESOLV_DEST=/etc/resolv.conf
+    if [[ -L /etc/resolv.conf ]]; then
+        RESOLV_DEST=$(readlink -f /etc/resolv.conf 2>/dev/null) || RESOLV_DEST=""
+        [[ -n "$RESOLV_DEST" ]] || RESOLV_DEST=/etc/resolv.conf
+    fi
+    BWRAP_ARGS+=(--ro-bind "$DNS_DIR/resolv.conf" "$RESOLV_DEST")
 
     # nftables egress rules — default-drop, permit only:
-    #   lo / established / DNS to 127.0.0.1 / upstream DNS on port 53
+    #   lo / established / DNS to $SBX_DNS_ADDR / upstream DNS on port 53
     #   explicit CIDRs from profile / @allowed4 (auto-populated by dnsmasq --nftset)
     # Raw IP connections and all IPv6 egress are dropped.
     # Shared egress accept rules, emitted into both the output chain
@@ -824,8 +906,8 @@ if [[ -n "$NET_PROFILE" ]]; then
         echo "        type filter hook output priority 0; policy drop;"
         echo "        oif \"lo\" accept"
         echo "        ct state established,related accept"
-        echo "        ip daddr 127.0.0.1 udp dport 53 accept"
-        echo "        ip daddr 127.0.0.1 tcp dport 53 accept"
+        echo "        ip daddr $SBX_DNS_ADDR udp dport 53 accept"
+        echo "        ip daddr $SBX_DNS_ADDR tcp dport 53 accept"
         echo "        ip daddr $DNS_UPSTREAM udp dport 53 accept"
         echo "        ip daddr $DNS_UPSTREAM tcp dport 53 accept"
 
@@ -836,7 +918,7 @@ if [[ -n "$NET_PROFILE" ]]; then
 
         # Forward chain: gates bridge-forwarded container egress (netavark,
         # used by rootful podman under userns:full). Deliberately omits the
-        # lo/DNS-to-127.0.0.1/DNS-to-upstream accepts above: container->
+        # lo/DNS-to-$SBX_DNS_ADDR/DNS-to-upstream accepts above: container->
         # aardvark DNS is delivered via the input hook, and aardvark's own
         # upstream queries originate from a session process and hit output.
         echo "    chain forward {"
@@ -1066,7 +1148,7 @@ if ! NFT_ERR=\$(nft -f "$NFT_RULES" 2>&1); then
     exit 1
 fi
 
-# dnsmasq on 127.0.0.1:53.
+# dnsmasq on $SBX_DNS_ADDR:53 (see SBX_DNS_ADDR above).
 # All options are CLI flags: AppArmor's usr.sbin.dnsmasq profile restricts
 # config-file paths to /etc/dnsmasq.d/*, making arbitrary paths unreadable.
 # --conf-file=/dev/null  suppress any host /etc/dnsmasq.conf
@@ -1077,7 +1159,7 @@ fi
     --conf-file=/dev/null \\
     -d \\
     --port=53 \\
-    --listen-address=127.0.0.1 \\
+    --listen-address=$SBX_DNS_ADDR \\
     --bind-interfaces \\
     --no-resolv \\
     --no-hosts \\
@@ -1093,7 +1175,7 @@ DNSMASQ_PID=\$!
 probe_dns() {
     bwrap --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib \\
         --symlink usr/lib64 /lib64 --ro-bind /etc /etc \\
-        --ro-bind "$DNS_DIR/resolv.conf" /etc/resolv.conf \\
+        --ro-bind "$DNS_DIR/resolv.conf" "$RESOLV_DEST" \\
         --proc /proc --dev /dev \\
         -- getent ahostsv4 "$TEST_DOMAIN" >/dev/null 2>&1
 }
