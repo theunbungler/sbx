@@ -104,6 +104,16 @@ pasta → launch.sh → bwrap → session.sh                     [PID 1 in sandb
 `session.sh` replaces `wrapper.sh` as bwrap's argument; `wrapper.sh` itself is
 unchanged and becomes the `main` session's command.
 
+`session.sh` is *generated* into `$SESSION_DIR` at launch, exactly as
+`launch.sh` and `wrapper.sh` already are (`sbx:1319`, `sbx:1320`): `sbx`
+remains a single shipped script, and a session directory simply holds three
+generated scripts instead of two. The three cannot be collapsed, because each
+runs at a different point in the chain — `launch.sh` outside bwrap in pasta's
+namespaces, `session.sh` inside bwrap as PID 1, and `wrapper.sh` as the payload,
+which must be separately invocable to serve as the `main` session's command.
+Keeping the PID-1 waiter on disk is deliberate: it is the new lifetime logic and
+the piece most likely to need inspection when a session misbehaves.
+
 **`session.sh` must be what bwrap waits on.** The tmux server daemonizes, so if
 bwrap's direct child exited, PID 1 would die and the pid namespace would take
 every session with it. The trailing wait loop is the entire implementation of
