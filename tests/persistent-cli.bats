@@ -31,6 +31,11 @@ EOF
     cat > "$PROJ/.sbx/profiles/fs/tstfs.json" <<EOF
 {"description":"test","mounts":[{"source":"$HOSTDIR","dest":"/tmp/tstmount","perm":"copy"}]}
 EOF
+
+    FORKED_ROOT="$HOME/.local/state/sbx/forked"
+    cat > "$PROJ/.sbx/profiles/cli/fk.json" <<EOF
+{"description":"test","mounts":[{"source":"$HOSTDIR","dest":"/tmp/fkmount","perm":"forked"}]}
+EOF
 }
 
 teardown() {
@@ -116,4 +121,44 @@ EOF
 
     [ "$(cat "$STORE_ROOT/tst/$PROJ2_SLUG/_tmp_tstmount/marker2.txt")" = "fromproj2" ]
     [ ! -f "$STORE_ROOT/tst/$PROJ2_SLUG/_tmp_tstmount/marker1.txt" ]
+}
+
+@test "a forked mount is seeded from the host on first launch" {
+    run_sbx "--cli fk" "cp /tmp/fkmount/host.txt /tmp/fkmount/seen.txt"
+    [ "$(cat "$FORKED_ROOT/fk/$PROJ_SLUG/_tmp_fkmount/seen.txt")" = "hostfile" ]
+}
+
+@test "a forked mount carries a new file into the next launch" {
+    run_sbx "--cli fk" "echo made > /tmp/fkmount/new.txt"
+    run_sbx "--cli fk" "cp /tmp/fkmount/new.txt /tmp/fkmount/echoed.txt"
+    [ "$(cat "$FORKED_ROOT/fk/$PROJ_SLUG/_tmp_fkmount/echoed.txt")" = "made" ]
+}
+
+@test "a forked mount stops seeing host edits after the first launch" {
+    run_sbx "--cli fk" "true"
+    echo edited > "$HOSTDIR/host.txt"
+    run_sbx "--cli fk" "cp /tmp/fkmount/host.txt /tmp/fkmount/seen.txt"
+    [ "$(cat "$FORKED_ROOT/fk/$PROJ_SLUG/_tmp_fkmount/seen.txt")" = "hostfile" ]
+}
+
+@test "a file deleted in a forked mount stays deleted" {
+    run_sbx "--cli fk" "rm /tmp/fkmount/host.txt"
+    run_sbx "--cli fk" "test -f /tmp/fkmount/host.txt && echo back > /tmp/fkmount/back.txt"
+    [ ! -f "$FORKED_ROOT/fk/$PROJ_SLUG/_tmp_fkmount/back.txt" ]
+}
+
+@test "a forked mount never modifies the host source" {
+    run_sbx "--cli fk" "echo sandbox > /tmp/fkmount/host.txt; echo x > /tmp/fkmount/new.txt"
+    [ "$(cat "$HOSTDIR/host.txt")" = "hostfile" ]
+    [ ! -f "$HOSTDIR/new.txt" ]
+}
+
+@test "forked stores are keyed by launch directory" {
+    OTHER="$ROOT/o"; mkdir -p "$OTHER"
+    OTHER_SLUG=$(echo "$OTHER" | tr '/' '-')
+    cp -a "$PROJ/.sbx" "$OTHER/.sbx"
+    run_sbx "--cli fk" "echo here > /tmp/fkmount/where.txt"
+    run_sbx_in "$OTHER" "--cli fk" "echo there > /tmp/fkmount/where.txt"
+    [ "$(cat "$FORKED_ROOT/fk/$PROJ_SLUG/_tmp_fkmount/where.txt")" = "here" ]
+    [ "$(cat "$FORKED_ROOT/fk/$OTHER_SLUG/_tmp_fkmount/where.txt")" = "there" ]
 }

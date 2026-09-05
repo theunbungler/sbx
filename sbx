@@ -797,9 +797,12 @@ BWRAP_ARGS+=(--setenv DOCKER_HOST "unix://$PODMAN_SOCK")
 COPY_MOUNTS=()     # fs-profile copy mounts,  "source:dest" — ephemeral
 CLI_COPY_MOUNTS=() # cli-profile copy mounts, "source:dest" — persistent
 SKIPPED_MOUNTS=()  # profile mounts whose source is absent on this host
+FORKED_MOUNTS=()   # "profile<TAB>source<TAB>dest" — sandbox-owned, seeded once
 
 apply_mounts() {
     local profile="$1" kind="${2:-fs}"
+    local profile_name
+    profile_name=$(basename "$profile" .json)
     # Use jq to extract mounts
     mounts=$(jq -c '.mounts[]?' "$profile")
     [[ -z "$mounts" ]] && return
@@ -862,6 +865,9 @@ apply_mounts() {
                     COPY_MOUNTS+=("$source:$dest")
                 fi
                 ;;
+            forked)
+                FORKED_MOUNTS+=("$profile_name"$'\t'"$source"$'\t'"$dest")
+                ;;
         esac
     done <<< "$mounts"
 }
@@ -912,6 +918,29 @@ done
 for cm in "${CLI_COPY_MOUNTS[@]}"; do
     dst="${cm#*:}"
     seed_copy_mount "${cm%%:*}" "$dst" "$CLI_STORE_DIR/$(sbx_copy_mount_id "$dst")"
+done
+
+# Sandbox-owned mounts. Seeded from the host only when the store does not
+# yet exist; from then on the store IS the tree and the host source is
+# never consulted again. That is the defining property of `forked`, not an
+# optimization — see the design spec. Bound rw directly, so there is no
+# write-back at teardown and nothing to diff.
+for fm in "${FORKED_MOUNTS[@]}"; do
+    IFS=$'\t' read -r f_prof f_src f_dest <<< "$fm"
+    f_id=$(sbx_copy_mount_id "$f_dest")
+    f_store="$STATE_DIR/forked/$f_prof/$(sbx_copy_path_slug "$PWD")/$f_id"
+
+    if [[ ! -e "$f_store" ]]; then
+        mkdir -p "$f_store"
+        sbx_copy_seed "$f_src" "$f_store"
+    fi
+
+    if [[ -f "$f_src" ]]; then
+        BWRAP_ARGS+=(--bind "$f_store/$(basename "$f_src")" "$f_dest")
+    else
+        BWRAP_ARGS+=(--tmpfs "$f_dest")
+        BWRAP_ARGS+=(--bind "$f_store" "$f_dest")
+    fi
 done
 
 # Parse Environment from all profiles
