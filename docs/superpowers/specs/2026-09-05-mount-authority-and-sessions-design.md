@@ -112,7 +112,13 @@ source, and reports what changed.
 
 - **Launch:** `cp -a --reflink=auto` the host source into a per-session
   working copy, and compute a **manifest** over it (relative path →
-  content hash and mode). Bind the working copy at the destination.
+  content hash). Bind the working copy at the destination.
+
+  The manifest records content only, not mode. A single batched
+  `find -type f -exec sha256sum {} +` is what keeps the pass cheap on a
+  large tree; collecting modes too needs either a second walk or a per-file
+  subshell, and a mode-only change with byte-identical content is not worth
+  either cost. Such a change is not detected.
 - **During:** the sandbox reads and writes the working copy. The host
   source is never written.
 - **Teardown:** walk the working copy against the manifest. Added,

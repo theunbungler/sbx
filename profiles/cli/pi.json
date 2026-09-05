@@ -5,7 +5,6 @@
         "NODE_OPTIONS": "--dns-result-order=ipv4first"
     },
     "path": [
-        "$HOME/.nvm/versions/node/v24.13.1/bin"
     ],
     "mounts": [
         {"source": "$HOME/.nvm", "dest": "$HOME/.nvm", "perm": "ro"},
