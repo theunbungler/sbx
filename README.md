@@ -64,6 +64,7 @@ To see all available commands and options, run:
 | `--list-profiles` | Show all available CLI, FS, and NET profiles. |
 | `--list-sessions` | List all currently active sandbox sessions. |
 | `--join <session>` | Open a new shell inside a running sandbox session, with its own terminal. Append `-- <cmd>` to run a command instead. |
+| `--attach <session>` | Reattach to a running session's original terminal (the one `sbx` started it on). |
 | `--wd <path>` | Start the session in this directory inside the sandbox. |
 | `--host-port <spec>` | Reach a service running on the host's `127.0.0.1:<port>` from inside the sandbox. `<spec>` is `<port>[/tcp\|/udp]`; a bare number means TCP. Repeatable. |
 | `--gui` | Start a session with isolated GUI support via `xpra`. |

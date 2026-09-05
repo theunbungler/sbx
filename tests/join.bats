@@ -143,3 +143,18 @@ EOF
     [ -f "$HOSTDIR/join-done" ]
     [ "$(cat "$BG_SDIR/fs/_copy/late.txt")" = "late" ]
 }
+
+@test "attaching to a session that does not exist fails" {
+    run bash -c "cd '$PROJ' && $SBX --attach nosuchsession 2>&1"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"not found"* ]]
+}
+
+@test "attach reaches the payload's own terminal" {
+    # The payload prints a marker to its terminal and parks; an attach must
+    # see that marker on its screen, which a fresh --join never would.
+    start_bg_sbx "--fs caps" "echo PAYLOAD_MARKER; $PARK"
+    sleep 1
+    ( cd "$PROJ" && timeout 5 script -qec "$SBX --attach $BG_SESSION" /dev/null > "$HOSTDIR/attach.out" 2>&1 ) || true
+    grep -q PAYLOAD_MARKER "$HOSTDIR/attach.out"
+}

@@ -26,6 +26,7 @@ Options:
   --list-sessions        Show active sessions
   --join <session>       Open a new shell inside a running session
                          (--join <session> -- <cmd> runs <cmd> instead)
+  --attach <session>     Reattach to a session's original terminal
   --fs <profile>         Apply a filesystem profile (multiple allowed)
   --net <profile>        Apply a network profile (multiple allowed)
   --cli <profile>        Apply a CLI/environment profile
@@ -220,6 +221,24 @@ while [[ $# -gt 0 ]]; do
             # (generated alongside wrapper.sh at launch) reapplies the same
             # setpriv drop generically, so a joined shell is capless too.
             exec tmux -S "$SDIR/tmux.sock" new-session -- "$SDIR/join_wrapper.sh" "${JOIN_CMD[@]}"
+            ;;
+        --attach)
+            ATTACH_SESSION="$2"
+            shift 2
+            SDIR="$STATE_DIR/$ATTACH_SESSION"
+            if [[ ! -d "$SDIR" || ! -S "$SDIR/tmux.sock" ]]; then
+                echo "Error: Session '$ATTACH_SESSION' not found or no socket available." >&2
+                exit 1
+            fi
+            if ! command -v tmux >/dev/null 2>&1; then
+                echo "Error: sbx requires tmux, which is not on PATH." >&2
+                exit 1
+            fi
+            # This one really is mirroring, deliberately and by name: it is
+            # the way back to a payload you detached from. --join is the
+            # non-mirroring door; without this, detaching the main session
+            # would lock you out of a still-running payload for good.
+            exec tmux -S "$SDIR/tmux.sock" attach -t main
             ;;
         --fs)
             FS_PROFILES+=("$(resolve_profile fs "$2")")
