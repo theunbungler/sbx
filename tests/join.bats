@@ -88,3 +88,19 @@ PARK='while [ ! -f /out/stop ]; do sleep 0.2; done'
     [ "$status" -ne 0 ]
     [[ "$output" == *"not found"* ]]
 }
+
+@test "the host environment does not reach a join" {
+    # tmux clients ship their environment to the server; update-environment
+    # decides how much of it lands in new sessions. DISPLAY is on tmux's
+    # default list, so it is the canary. SBX_TEST_SECRET stands in for the
+    # API keys and tokens --clearenv exists to keep out.
+    export DISPLAY=":99"
+    export SSH_AUTH_SOCK="/tmp/fake-agent.sock"
+    export SBX_TEST_SECRET=hunter2
+    start_bg_sbx "--fs caps" "$PARK"
+    join_sbx "env > /out/join.env"
+    [ -s "$HOSTDIR/join.env" ]
+    ! grep -q '^DISPLAY=:99' "$HOSTDIR/join.env"
+    ! grep -q '^SSH_AUTH_SOCK=' "$HOSTDIR/join.env"
+    ! grep -q 'hunter2' "$HOSTDIR/join.env"
+}

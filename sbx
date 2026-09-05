@@ -1510,6 +1510,11 @@ chmod +x "$JOIN_WRAPPER"
 # sandbox usually has $HOME mounted, so without it the server would read
 # the user's ~/.tmux.conf and session behaviour would depend on host
 # dotfiles. Every setting here is load-bearing:
+#   update-environment  SECURITY. A tmux client ships its environment to the
+#                  server, and this list is what gets applied to new
+#                  sessions — by default DISPLAY, SSH_AUTH_SOCK and friends.
+#                  Leaving it at the default drives a host-env hole straight
+#                  through the --clearenv policy above. Emptied deliberately.
 #   exit-empty     the session-lifetime rule — server exits with its last
 #                  session, which is what lets session.sh stop waiting.
 #   prefix C-\     a host tmux keeps C-b, so nesting needs no doubled
@@ -1517,6 +1522,7 @@ chmod +x "$JOIN_WRAPPER"
 #   window-size    per-client sizing, so one join cannot resize another.
 #   status-left    makes "you are inside a sandbox" visible at a glance.
 cat > "$TMUX_CONF" <<EOF
+set -g update-environment ''
 set -g exit-empty on
 set -g escape-time 0
 set -g window-size latest
