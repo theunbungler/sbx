@@ -10,6 +10,6 @@
         {"source": "$HOME/.nvm", "dest": "$HOME/.nvm", "perm": "ro"},
         {"source": "$HOME/.npm-global", "dest": "$HOME/.npm-global", "perm": "ro"},
         {"source": "$HOME/.npm", "dest": "$HOME/.npm", "perm": "ro"},
-        {"source": "$HOME/.pi", "dest": "$HOME/.pi", "perm": "copy"}
+        {"source": "$HOME/.pi", "dest": "$HOME/.pi", "perm": "forked"}
     ]
 }

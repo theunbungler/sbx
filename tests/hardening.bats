@@ -217,9 +217,9 @@ EOF
 }
 
 @test "the sandbox cannot see persistent cli stores" {
-    mkdir -p "$HOME/.local/state/sbx/profiles/cli/other"
+    mkdir -p "$HOME/.local/state/sbx/forked/other"
     run_sbx "--fs caps" "ls '$HOME/.local/state/sbx' > /out/state2.txt"
-    ! grep -q profiles "$HOSTDIR/state2.txt"
+    ! grep -q forked "$HOSTDIR/state2.txt"
 }
 
 @test "the sandbox cannot see the user profile directory" {

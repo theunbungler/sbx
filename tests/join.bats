@@ -163,12 +163,12 @@ EOF
 }
 
 @test "writeback waits for a join that outlives the payload" {
-    # A copy mount, not a plain rw bind: rw writes through immediately, so
-    # it would pass regardless of when (or whether) writeback ran.
+    # A record mount, not a plain rw bind: rw writes through immediately, so
+    # it would pass regardless of when (or whether) the archive ran.
     cat > "$PROJ/.sbx/profiles/fs/cp.json" <<EOF
 {"description":"test","mounts":[
   {"source":"$HOSTDIR","dest":"/out","perm":"rw"},
-  {"source":"$ROOT/src","dest":"/copy","perm":"copy"}
+  {"source":"$ROOT/src","dest":"/copy","perm":"record"}
 ]}
 EOF
     mkdir -p "$ROOT/src"
@@ -201,7 +201,9 @@ EOF
     BG_PID=""
 
     [ -f "$HOSTDIR/join-done" ]
-    [ "$(cat "$BG_SDIR/fs/_copy/late.txt")" = "late" ]
+    local archived
+    archived=$(find "$HOME/.local/state/sbx/changes" -path "*-$BG_SESSION/_copy/late.txt" 2>/dev/null | head -n1)
+    [ "$(cat "$archived")" = "late" ]
 }
 
 @test "attaching to a session that does not exist fails" {

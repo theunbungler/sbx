@@ -3,7 +3,7 @@
 setup() {
     source "$BATS_TEST_DIRNAME/../lib/copy-mounts.sh"
     WORK="$BATS_TEST_TMPDIR/w"
-    SRC="$WORK/src"; TMP="$WORK/tmp"; OUT="$WORK/out"; STORE="$WORK/store"
+    SRC="$WORK/src"; TMP="$WORK/tmp"; OUT="$WORK/out"
     mkdir -p "$SRC"
 }
 
@@ -33,103 +33,6 @@ setup() {
     sbx_copy_seed "$WORK/missing" "$TMP"
     [ -d "$TMP" ]
     [ -z "$(ls -A "$TMP")" ]
-}
-
-@test "writeback captures a file the sandbox created" {
-    echo hello > "$SRC/a.txt"
-    sbx_copy_seed "$SRC" "$TMP"
-    echo new > "$TMP/b.txt"
-    sbx_copy_writeback "$SRC" "$TMP" "$OUT"
-    [ "$(cat "$OUT/b.txt")" = "new" ]
-}
-
-@test "writeback captures a file the sandbox modified" {
-    echo hello > "$SRC/a.txt"
-    sbx_copy_seed "$SRC" "$TMP"
-    echo changed-and-longer > "$TMP/a.txt"
-    sbx_copy_writeback "$SRC" "$TMP" "$OUT"
-    [ "$(cat "$OUT/a.txt")" = "changed-and-longer" ]
-}
-
-@test "writeback ignores a file the sandbox did not touch" {
-    echo hello > "$SRC/a.txt"
-    sbx_copy_seed "$SRC" "$TMP"
-    sbx_copy_writeback "$SRC" "$TMP" "$OUT"
-    [ ! -f "$OUT/a.txt" ]
-}
-
-@test "writeback never modifies the host source" {
-    echo hello > "$SRC/a.txt"
-    sbx_copy_seed "$SRC" "$TMP"
-    echo clobbered > "$TMP/a.txt"
-    echo new > "$TMP/b.txt"
-    sbx_copy_writeback "$SRC" "$TMP" "$OUT"
-    [ "$(cat "$SRC/a.txt")" = "hello" ]
-    [ ! -f "$SRC/b.txt" ]
-}
-
-@test "writeback handles a single-file source deleted in the sandbox" {
-    echo hi > "$WORK/one.txt"
-    sbx_copy_seed "$WORK/one.txt" "$TMP"
-    rm "$TMP/one.txt"
-    run sbx_copy_writeback "$WORK/one.txt" "$TMP" "$OUT"
-    [ "$status" -eq 0 ]
-}
-
-@test "seed overlays store entries on top of the host copy" {
-    echo host > "$SRC/a.txt"
-    mkdir -p "$STORE"
-    echo stored > "$STORE/a.txt"
-    sbx_copy_seed "$SRC" "$TMP" "$STORE"
-    [ "$(cat "$TMP/a.txt")" = "stored" ]
-}
-
-@test "seed brings through host files absent from the store" {
-    echo host > "$SRC/a.txt"
-    echo hostonly > "$SRC/b.txt"
-    mkdir -p "$STORE"
-    echo stored > "$STORE/a.txt"
-    sbx_copy_seed "$SRC" "$TMP" "$STORE"
-    [ "$(cat "$TMP/b.txt")" = "hostonly" ]
-}
-
-@test "seed brings through store files absent from the host" {
-    echo host > "$SRC/a.txt"
-    mkdir -p "$STORE"
-    echo storeonly > "$STORE/c.txt"
-    sbx_copy_seed "$SRC" "$TMP" "$STORE"
-    [ "$(cat "$TMP/c.txt")" = "storeonly" ]
-}
-
-@test "seed tolerates a store that does not exist yet" {
-    echo host > "$SRC/a.txt"
-    sbx_copy_seed "$SRC" "$TMP" "$WORK/no-such-store"
-    [ "$(cat "$TMP/a.txt")" = "host" ]
-}
-
-@test "seed overlays nested store paths" {
-    mkdir -p "$SRC/sub"
-    echo host > "$SRC/sub/a.txt"
-    mkdir -p "$STORE/sub"
-    echo stored > "$STORE/sub/a.txt"
-    sbx_copy_seed "$SRC" "$TMP" "$STORE"
-    [ "$(cat "$TMP/sub/a.txt")" = "stored" ]
-}
-
-# The round trip: a store-only file must reach the working copy, and must
-# still be in the store after a session that never modified it. The
-# mid-test assertion is what makes this depend on the overlay — without it
-# the test passes even with the overlay removed entirely.
-@test "a stored file survives a session that never touches it" {
-    echo host > "$SRC/a.txt"
-    mkdir -p "$STORE"
-    echo stored > "$STORE/b.txt"
-    sbx_copy_seed "$SRC" "$TMP" "$STORE"
-    # The overlay reached the working copy.
-    [ "$(cat "$TMP/b.txt")" = "stored" ]
-    sbx_copy_writeback "$SRC" "$TMP" "$STORE"
-    # Write-back left an untouched store entry alone.
-    [ "$(cat "$STORE/b.txt")" = "stored" ]
 }
 
 @test "manifest_build records a hash per file" {

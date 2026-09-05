@@ -10,7 +10,6 @@ setup() {
     # /tmp/sbxh.XXXXXX (66 chars total) works. Keep this path short.
     ROOT="$(mktemp -d /tmp/sbxh.XXXXXX)"
     export HOME="$ROOT/h"
-    STORE_ROOT="$HOME/.local/state/sbx/profiles/cli"
     PROJ="$ROOT/p"
     HOSTDIR="$ROOT/s"
     mkdir -p "$HOME" "$PROJ/.sbx/profiles/cli" "$PROJ/.sbx/profiles/fs" "$HOSTDIR"
@@ -24,13 +23,6 @@ setup() {
     # store path assertion below needs this slug of $PROJ.
     PROJ_SLUG=$(echo "$PROJ" | tr '/' '-')
     echo hostfile > "$HOSTDIR/host.txt"
-
-    cat > "$PROJ/.sbx/profiles/cli/tst.json" <<EOF
-{"description":"test","mounts":[{"source":"$HOSTDIR","dest":"/tmp/tstmount","perm":"copy"}]}
-EOF
-    cat > "$PROJ/.sbx/profiles/fs/tstfs.json" <<EOF
-{"description":"test","mounts":[{"source":"$HOSTDIR","dest":"/tmp/tstmount","perm":"copy"}]}
-EOF
 
     FORKED_ROOT="$HOME/.local/state/sbx/forked"
     cat > "$PROJ/.sbx/profiles/cli/fk.json" <<EOF
@@ -66,72 +58,29 @@ latest_archive() {
         LC_ALL=C sort | tail -n1
 }
 
-@test "a cli copy mount persists a new file into the profile store" {
-    run_sbx "--cli tst" "echo made > /tmp/tstmount/new.txt"
-    [ "$(cat "$STORE_ROOT/tst/$PROJ_SLUG/_tmp_tstmount/new.txt")" = "made" ]
-}
-
-@test "a file created in one session is visible in the next" {
-    run_sbx "--cli tst" "echo made > /tmp/tstmount/new.txt"
-    run_sbx "--cli tst" "cp /tmp/tstmount/new.txt /tmp/tstmount/echoed.txt"
-    [ "$(cat "$STORE_ROOT/tst/$PROJ_SLUG/_tmp_tstmount/echoed.txt")" = "made" ]
-}
-
-@test "a stored file survives a session that never touches it" {
-    run_sbx "--cli tst" "echo made > /tmp/tstmount/new.txt"
-    run_sbx "--cli tst" "true"
-    [ -f "$STORE_ROOT/tst/$PROJ_SLUG/_tmp_tstmount/new.txt" ]
-}
-
-@test "host changes reach the sandbox for files it has not touched" {
-    run_sbx "--cli tst" "echo made > /tmp/tstmount/new.txt"
-    echo updated > "$HOSTDIR/host.txt"
-    run_sbx "--cli tst" "cp /tmp/tstmount/host.txt /tmp/tstmount/seen.txt"
-    [ "$(cat "$STORE_ROOT/tst/$PROJ_SLUG/_tmp_tstmount/seen.txt")" = "updated" ]
-}
-
-@test "the store shadows later host changes to the same file" {
-    run_sbx "--cli tst" "echo sandbox > /tmp/tstmount/host.txt"
-    echo updated > "$HOSTDIR/host.txt"
-    run_sbx "--cli tst" "cp /tmp/tstmount/host.txt /tmp/tstmount/seen.txt"
-    [ "$(cat "$STORE_ROOT/tst/$PROJ_SLUG/_tmp_tstmount/seen.txt")" = "sandbox" ]
-}
-
-@test "a file deleted in the sandbox returns on the next launch" {
-    run_sbx "--cli tst" "rm /tmp/tstmount/host.txt"
-    run_sbx "--cli tst" "test -f /tmp/tstmount/host.txt && echo back > /tmp/tstmount/back.txt"
-    [ -f "$STORE_ROOT/tst/$PROJ_SLUG/_tmp_tstmount/back.txt" ]
-}
-
-@test "fs profile copy mounts stay ephemeral and create no store" {
-    run_sbx "--fs tstfs" "echo made > /tmp/tstmount/new.txt"
-    [ ! -d "$HOME/.local/state/sbx/profiles" ]
-    run bash -c "find '$HOME/.local/state/sbx' -path '*/fs/_tmp_tstmount/new.txt'"
-    [ -n "$output" ]
-}
-
-@test "the host source directory is never modified" {
-    run_sbx "--cli tst" "echo sandbox > /tmp/tstmount/host.txt; echo x > /tmp/tstmount/new.txt"
-    [ "$(cat "$HOSTDIR/host.txt")" = "hostfile" ]
-    [ ! -f "$HOSTDIR/new.txt" ]
-}
-
-@test "different launch directories get independent cli-profile stores" {
-    PROJ2="$ROOT/p2"
-    mkdir -p "$PROJ2/.sbx/profiles/cli"
-    cat > "$PROJ2/.sbx/profiles/cli/tst.json" <<EOF
-{"description":"test","mounts":[{"source":"$HOSTDIR","dest":"/tmp/tstmount","perm":"copy"}]}
+@test "the copy perm is rejected with a message naming both replacements" {
+    cat > "$PROJ/.sbx/profiles/fs/old.json" <<EOF
+{"description":"test","mounts":[{"source":"$HOSTDIR","dest":"/tmp/o","perm":"copy"}]}
 EOF
-    PROJ2_SLUG=$(echo "$PROJ2" | tr '/' '-')
+    run bash -c "cd '$PROJ' && $SBX --fs old -- true 2>&1"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *forked* ]]
+    [[ "$output" == *record* ]]
+}
 
-    run_sbx "--cli tst" "echo fromproj1 > /tmp/tstmount/marker1.txt"
-    run_sbx_in "$PROJ2" "--cli tst" "echo fromproj2 > /tmp/tstmount/marker2.txt"
+@test "every shipped profile loads" {
+    for p in "$BATS_TEST_DIRNAME"/../profiles/*/*.json; do
+        run jq -e '[.mounts[]?.perm] | all(. == "ro" or . == "rw" or . == "dev" or . == "forked" or . == "record")' "$p"
+        [ "$status" -eq 0 ]
+    done
+}
 
-    [ "$(cat "$STORE_ROOT/tst/$PROJ_SLUG/_tmp_tstmount/marker1.txt")" = "fromproj1" ]
-    [ ! -f "$STORE_ROOT/tst/$PROJ_SLUG/_tmp_tstmount/marker2.txt" ]
-
-    [ "$(cat "$STORE_ROOT/tst/$PROJ2_SLUG/_tmp_tstmount/marker2.txt")" = "fromproj2" ]
-    [ ! -f "$STORE_ROOT/tst/$PROJ2_SLUG/_tmp_tstmount/marker1.txt" ]
+@test "a pre-migration cli store is carried over to the forked layout" {
+    mkdir -p "$HOME/.local/state/sbx/profiles/cli/fk/$PROJ_SLUG/_tmp_fkmount"
+    echo carried > "$HOME/.local/state/sbx/profiles/cli/fk/$PROJ_SLUG/_tmp_fkmount/old.txt"
+    run_sbx "--cli fk" "cp /tmp/fkmount/old.txt /tmp/fkmount/seen.txt"
+    [ "$(cat "$FORKED_ROOT/fk/$PROJ_SLUG/_tmp_fkmount/seen.txt")" = "carried" ]
+    [ ! -d "$HOME/.local/state/sbx/profiles" ]
 }
 
 @test "a forked mount is seeded from the host on first launch" {

@@ -4,7 +4,7 @@
     {
       "source": "./src",
       "dest": "/home/user/src",
-      "perm": "copy"
+      "perm": "record"
     },
     {
       "source": "/usr/include",

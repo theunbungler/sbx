@@ -12,7 +12,7 @@
         {"source": "$HOME/.npm-global", "dest": "$HOME/.npm-global", "perm": "ro"},
         {"source": "$HOME/.npm", "dest": "$HOME/.npm", "perm": "rw"},
         {"source": "$HOME/.local", "dest": "$HOME/.local", "perm": "ro"},
-        {"source": "$HOME/.claude", "dest": "$HOME/.claude", "perm": "copy"},
-        {"source": "$HOME/.claude.json", "dest": "$HOME/.claude.json", "perm": "copy"}
+        {"source": "$HOME/.claude", "dest": "$HOME/.claude", "perm": "forked"},
+        {"source": "$HOME/.claude.json", "dest": "$HOME/.claude.json", "perm": "forked"}
     ]
 }
