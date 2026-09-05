@@ -76,6 +76,51 @@ PARK='while [ ! -f /out/stop ]; do sleep 0.2; done'
     [[ "$(cat "$HOSTDIR/join.caps")" == *"0000000000000000"* ]]
 }
 
+@test "a window the tmux server forks is capless" {
+    # The join's own first process is not the only thing the server forks:
+    # new-window/split-window are default key bindings, and whatever they
+    # start must be capless too, or the drop is one keystroke from gone.
+    cat > "$HOSTDIR/probe.sh" <<'EOF'
+#!/bin/sh
+grep ^CapBnd /proc/self/status > /out/win.caps
+EOF
+    chmod +x "$HOSTDIR/probe.sh"
+
+    start_bg_sbx "--fs caps" "$PARK"
+    join_sbx "tmux new-window -d /out/probe.sh; for i in 1 2 3 4 5 6 7 8 9 10; do [ -s /out/win.caps ] && break; sleep 0.4; done"
+    [ -s "$HOSTDIR/win.caps" ]
+    [[ "$(cat "$HOSTDIR/win.caps")" == *"0000000000000000"* ]]
+}
+
+@test "a join is capless even after the sandbox tampers with the session dir" {
+    # --join must not execute anything the sandbox can write. The session
+    # directory is bound rw inside, so any on-disk join script there is
+    # attacker-controlled.
+    start_bg_sbx "--fs caps" "$PARK"
+
+    # Nothing --join runs may live in the writable session directory.
+    [ ! -e "$BG_SDIR/join_wrapper.sh" ]
+
+    cat > "$HOSTDIR/tamper.sh" <<EOF
+#!/bin/sh
+printf '#!/bin/sh\necho TAMPERED > /out/tamper.txt\nexec "\$@"\n' > "$BG_SDIR/join_wrapper.sh"
+chmod +x "$BG_SDIR/join_wrapper.sh"
+echo ok > /out/tamper-installed
+EOF
+    chmod +x "$HOSTDIR/tamper.sh"
+
+    join_sbx "/out/tamper.sh"
+    # The tamper really did land: the directory is writable from inside,
+    # so a passing test below is not vacuous.
+    [ -s "$HOSTDIR/tamper-installed" ]
+
+    join_sbx "grep ^CapBnd /proc/self/status > /out/join2.caps"
+    [ -s "$HOSTDIR/join2.caps" ]
+    [[ "$(cat "$HOSTDIR/join2.caps")" == *"0000000000000000"* ]]
+    run test -e "$HOSTDIR/tamper.txt"
+    [ "$status" -ne 0 ]
+}
+
 @test "a join gets its own pty, separate from the payload's" {
     start_bg_sbx "--fs caps" "tty > /out/payload.tty; $PARK"
     join_sbx "tty > /out/join.tty"
@@ -97,9 +142,18 @@ PARK='while [ ! -f /out/stop ]; do sleep 0.2; done'
     export DISPLAY=":99"
     export SSH_AUTH_SOCK="/tmp/fake-agent.sock"
     export SBX_TEST_SECRET=hunter2
+    # PATH is carried into a spawned pane by tmux itself, from the client,
+    # independently of update-environment — so it needs its own canary.
+    export PATH="/HOST/LEAK/MARKER:$PATH"
     start_bg_sbx "--fs caps" "$PARK"
     join_sbx "env > /out/join.env"
     [ -s "$HOSTDIR/join.env" ]
+    run grep -q '/HOST/LEAK/MARKER' "$HOSTDIR/join.env"
+    [ "$status" -ne 0 ]
+    # Not merely "the marker is absent": the session's own PATH, with
+    # $SESSION_DIR/bin (the docker shim) first, is what must be there.
+    run grep -q "^PATH=$BG_SDIR/bin:" "$HOSTDIR/join.env"
+    [ "$status" -eq 0 ]
     run grep -q '^DISPLAY=:99' "$HOSTDIR/join.env"
     [ "$status" -ne 0 ]
     run grep -q '^SSH_AUTH_SOCK=' "$HOSTDIR/join.env"
@@ -126,8 +180,14 @@ EOF
     ( cd "$PROJ" && script -qec "$SBX --join $BG_SESSION -- /bin/sh -c 'while [ ! -f /out/join-go ]; do sleep 0.2; done; echo late > /copy/late.txt; echo done > /out/join-done'" /dev/null >/dev/null 2>&1 ) &
     local join_pid=$!
 
-    # Let the join reach its wait loop, then end the payload.
-    sleep 1
+    # Wait for the join's session to actually exist before releasing the
+    # payload. A fixed sleep races on a loaded machine: if the join has not
+    # registered yet, the server briefly has zero sessions and exit-empty
+    # tears it down, failing the socket assertion below spuriously.
+    for _ in $(seq 100); do
+        [[ "$(tmux -S "$BG_SDIR/tmux.sock" list-sessions 2>/dev/null | wc -l)" -ge 2 ]] && break
+        sleep 0.1
+    done
     touch "$HOSTDIR/payload-go"
     sleep 1
 
