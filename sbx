@@ -14,27 +14,6 @@ source "$SCRIPT_DIR/lib/copy-mounts.sh"
 GUI_MODE=false
 XPRA_DISPLAY=""
 
-# Session multiplexer. abduco is preferred; dtach (its ancestor) is the
-# fallback, because distros carry one or the other — abduco is missing from
-# Ubuntu/Debian, dtach from the Arch repos. They are command-line compatible
-# for the only two things sbx asks of them: `-c <socket> <cmd>` to create a
-# session and attach to it, and `-a <socket>` to reattach. Resolved to an
-# absolute path because the launch script runs it inside bwrap, where /usr
-# is bound read-only at the same path as on the host.
-SESSION_MUX=""
-find_session_mux() {
-    [[ -n "$SESSION_MUX" ]] && return 0
-    local candidate
-    for candidate in abduco dtach; do
-        if SESSION_MUX=$(command -v "$candidate" 2>/dev/null); then
-            return 0
-        fi
-    done
-    SESSION_MUX=""
-    echo "Error: neither 'abduco' nor 'dtach' was found on PATH; sbx needs one of them to run a session." >&2
-    exit 1
-}
-
 # Ensure state directory exists
 mkdir -p "$STATE_DIR"
 
@@ -209,7 +188,6 @@ while [[ $# -gt 0 ]]; do
             # -S, not -f: the multiplexer's rendezvous point is a unix
             # socket, which is never a regular file.
             if [[ -d "$SDIR" && -S "$SDIR/session.sock" ]]; then
-                find_session_mux
                 "$SESSION_MUX" -a "$SDIR/session.sock"
             else
                 echo "Error: Session '$JOIN_SESSION' not found or no socket available." >&2
@@ -332,10 +310,6 @@ for profile in "${FS_PROFILES[@]}" "$CLI_PROFILE" "${NET_PROFILES[@]}"; do
     confirm_project_profile "$profile"
 done
 
-# Resolved here, not at launch-script generation time, so a host missing
-# both multiplexers fails before any session state or xpra display exists.
-find_session_mux
-
 # Same reasoning for the rest of the toolchain. bwrap in particular used to
 # be discovered only when the generated launch.sh tried to exec it, which
 # reported nothing but "bwrap: not found" and exit 127 — after a session
@@ -358,12 +332,13 @@ require_tools() {
             jq)       echo "  jq       — Debian/Ubuntu: apt install jq           Arch: pacman -S jq" >&2 ;;
             envsubst) echo "  envsubst — Debian/Ubuntu: apt install gettext-base Arch: pacman -S gettext" >&2 ;;
             setpriv)  echo "  setpriv  — Debian/Ubuntu: apt install util-linux   Arch: pacman -S util-linux" >&2 ;;
+            tmux)     echo "  tmux     — Debian/Ubuntu: apt install tmux        Arch: pacman -S tmux" >&2 ;;
         esac
     done
     exit 1
 }
 
-require_tools bwrap jq envsubst setpriv
+require_tools bwrap tmux jq envsubst setpriv
 if [[ ${#NET_PROFILES[@]} -gt 0 ]]; then
     require_tools pasta nft dnsmasq
 fi
@@ -1302,7 +1277,8 @@ teardown() {
     done
 
     rm -rf "$SESSION_DIR/tmp_mounts"
-    rm -f "$SESSION_DIR/session.sock" "$SESSION_DIR/wrapper.sh"
+    rm -f "$SESSION_DIR/tmux.sock" "$SESSION_DIR/tmux.conf" \
+          "$SESSION_DIR/session.sh" "$SESSION_DIR/wrapper.sh"
 
     if [[ -n "$XPRA_DISPLAY" ]]; then
         echo "Stopping xpra display $XPRA_DISPLAY..."
@@ -1315,7 +1291,9 @@ teardown() {
 trap teardown EXIT
 
 # Execution
-SESSION_SOCK="$SESSION_DIR/session.sock"
+TMUX_SOCK="$SESSION_DIR/tmux.sock"
+TMUX_CONF="$SESSION_DIR/tmux.conf"
+SESSION_SCRIPT="$SESSION_DIR/session.sh"
 LAUNCH_SCRIPT="$SESSION_DIR/launch.sh"
 CAT_WRAPPER="$SESSION_DIR/wrapper.sh"
 DNSMASQ_BIN=$(which dnsmasq)
@@ -1482,6 +1460,51 @@ EOF
 fi
 chmod +x "$CAT_WRAPPER"
 
+# Per-session tmux config. The -f that loads this is not cosmetic: the
+# sandbox usually has $HOME mounted, so without it the server would read
+# the user's ~/.tmux.conf and session behaviour would depend on host
+# dotfiles. Every setting here is load-bearing:
+#   exit-empty     the session-lifetime rule — server exits with its last
+#                  session, which is what lets session.sh stop waiting.
+#   prefix C-\     a host tmux keeps C-b, so nesting needs no doubled
+#                  prefix. C-\ is also abduco's old detach chord.
+#   window-size    per-client sizing, so one join cannot resize another.
+#   status-left    makes "you are inside a sandbox" visible at a glance.
+cat > "$TMUX_CONF" <<EOF
+set -g exit-empty on
+set -g escape-time 0
+set -g window-size latest
+unbind C-b
+set -g prefix C-\\\\
+bind C-\\\\ send-prefix
+set -g status on
+set -g status-left ' sbx:$SESSION_ID '
+set -g status-left-length 40
+EOF
+
+# PID 1 inside the sandbox. This script — not the tmux server, and not the
+# payload — is what bwrap waits on, and that is the whole implementation of
+# the session-lifetime rule: the server daemonizes, so if this exited,
+# bwrap's direct child would be gone and the pid namespace would take every
+# live session with it, joins included. Instead it hangs around until the
+# server is gone, which (with exit-empty on) means the last session — payload
+# or join, whichever ends last — has exited. Only then does bwrap return and
+# launch.sh proceed to copy-writeback, so a join can never be racing the
+# write-back of its own files.
+#
+# No `set -e`: attach is expected to fail when the payload is short-lived
+# enough to have exited before we get here, and that is not an error.
+cat > "$SESSION_SCRIPT" <<EOF
+#!/bin/bash
+tmux -f $(printf '%q' "$TMUX_CONF") -S $(printf '%q' "$TMUX_SOCK") \\
+    new-session -d -s main -- $(printf '%q' "$CAT_WRAPPER")
+tmux -S $(printf '%q' "$TMUX_SOCK") attach -t main || true
+while tmux -S $(printf '%q' "$TMUX_SOCK") list-sessions >/dev/null 2>&1; do
+    sleep 0.5
+done
+EOF
+chmod +x "$SESSION_SCRIPT"
+
 # Generate the launch script with properly escaped BWRAP_ARGS.
 # pasta runs this inside the session's user and net namespaces, so the
 # network prelude lands there — outside every namespace bwrap creates.
@@ -1503,7 +1526,7 @@ fi
 for arg in "${BWRAP_ARGS[@]}"; do
     printf "%q " "$arg" >> "$LAUNCH_SCRIPT"
 done
-printf "%q -c %q %q\n" "$SESSION_MUX" "$SESSION_SOCK" "$CAT_WRAPPER" >> "$LAUNCH_SCRIPT"
+printf "%q\n" "$SESSION_SCRIPT" >> "$LAUNCH_SCRIPT"
 
 if [[ ${#NET_PROFILES[@]} -gt 0 ]]; then
     # Quoted heredoc: every expansion below belongs to launch.sh, not here.

@@ -37,9 +37,9 @@ teardown() {
     [[ -n "$ROOT" && "$ROOT" == /tmp/sbxh.* ]] && rm -rf "$ROOT"
 }
 
-# Run a shell command inside a sandbox. sbx ends in `abduco -c` (or the
-# dtach fallback), which needs a pty; `script -qec` supplies one
-# non-interactively.
+# Run a shell command inside a sandbox. sbx runs its payload under a tmux
+# server inside the sandbox, and a tmux client needs a pty; `script -qec`
+# supplies one non-interactively.
 run_sbx() {
     ( cd "$PROJ" && script -qec "$SBX $1 -- /bin/sh -c '$2'" /dev/null >/dev/null 2>&1 )
 }

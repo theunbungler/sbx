@@ -3,8 +3,8 @@
 setup() {
     SBX="$(cd "$BATS_TEST_DIRNAME/.." && pwd)/sbx"
 
-    # NOT $BATS_TEST_TMPDIR — it embeds the test name, and sbx's session
-    # socket at $HOME/.local/state/sbx/<session-id>/session.sock would blow
+    # NOT $BATS_TEST_TMPDIR — it embeds the test name, and sbx's tmux
+    # socket at $HOME/.local/state/sbx/<session-id>/tmux.sock would blow
     # the ~108-char sun_path limit. Keep this path short.
     ROOT="$(mktemp -d /tmp/sbxh.XXXXXX)"
     export HOME="$ROOT/h"
@@ -32,8 +32,8 @@ teardown() {
     fi
 }
 
-# sbx ends in `abduco -c` (or the dtach fallback), which needs a pty;
-# `script -qec` supplies one non-interactively.
+# sbx runs its payload under a tmux server inside the sandbox, and a tmux
+# client needs a pty; `script -qec` supplies one non-interactively.
 run_sbx() {
     ( cd "$PROJ" && script -qec "$SBX $1 -- /bin/sh -c '$2'" /dev/null >/dev/null 2>&1 )
 }
