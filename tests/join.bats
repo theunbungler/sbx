@@ -100,7 +100,10 @@ PARK='while [ ! -f /out/stop ]; do sleep 0.2; done'
     start_bg_sbx "--fs caps" "$PARK"
     join_sbx "env > /out/join.env"
     [ -s "$HOSTDIR/join.env" ]
-    ! grep -q '^DISPLAY=:99' "$HOSTDIR/join.env"
-    ! grep -q '^SSH_AUTH_SOCK=' "$HOSTDIR/join.env"
-    ! grep -q 'hunter2' "$HOSTDIR/join.env"
+    run grep -q '^DISPLAY=:99' "$HOSTDIR/join.env"
+    [ "$status" -ne 0 ]
+    run grep -q '^SSH_AUTH_SOCK=' "$HOSTDIR/join.env"
+    [ "$status" -ne 0 ]
+    run grep -q 'hunter2' "$HOSTDIR/join.env"
+    [ "$status" -ne 0 ]
 }
