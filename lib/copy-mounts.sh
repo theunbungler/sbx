@@ -102,3 +102,45 @@ sbx_copy_writeback() {
         fi
     fi
 }
+
+# Manifest of a tree's file contents, used as the diff baseline for a
+# `record` mount.
+#
+# One line per regular file: "<sha256>  <relpath>" — exactly sha256sum's
+# own output format, with the leading "./" stripped, sorted bytewise.
+#
+# Content only, no mode. The single batched `find -exec sha256sum {} +` is
+# what keeps this affordable on a large tree; collecting modes as well needs
+# a second walk or a per-file subshell, and a mode-only change with
+# byte-identical content is not worth either. Such a change is not detected.
+#
+# LC_ALL=C throughout: the sort order only has to be *stable between the two
+# manifests* being compared, and a locale-dependent collation that differs
+# between the launch and teardown environments would silently desynchronize
+# comm(1) below.
+sbx_manifest_build() {
+    local tree="$1" out="$2"
+
+    : > "$out"
+    [[ -d "$tree" ]] || return 0
+
+    (
+        cd "$tree" || exit 0
+        find . -type f -exec sha256sum {} + 2>/dev/null
+    ) | sed 's|^\(\w*\)  \./|\1  |' | LC_ALL=C sort > "$out"
+}
+
+# Relative paths of the files in $2 that are absent from, or differ in
+# content from, $1. comm on whole lines: a differing hash makes the whole
+# line unique to $2, which is exactly "added or modified".
+sbx_manifest_changed() {
+    LC_ALL=C comm -13 "$1" "$2" | cut -d' ' -f3-
+}
+
+# Relative paths present in $1 and absent from $2. Compares path columns
+# only, so a file that merely changed content is not reported here.
+sbx_manifest_deleted() {
+    LC_ALL=C comm -23 \
+        <(cut -d' ' -f3- "$1" | LC_ALL=C sort) \
+        <(cut -d' ' -f3- "$2" | LC_ALL=C sort)
+}

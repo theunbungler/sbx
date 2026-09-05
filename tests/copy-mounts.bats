@@ -131,3 +131,79 @@ setup() {
     # Write-back left an untouched store entry alone.
     [ "$(cat "$STORE/b.txt")" = "stored" ]
 }
+
+@test "manifest_build records a hash per file" {
+    mkdir -p "$SRC/sub"
+    echo one > "$SRC/a.txt"
+    echo two > "$SRC/sub/b.txt"
+    sbx_manifest_build "$SRC" "$WORK/m"
+    [ "$(wc -l < "$WORK/m")" -eq 2 ]
+    grep -q ' a.txt$' "$WORK/m"
+    grep -q ' sub/b.txt$' "$WORK/m"
+}
+
+@test "manifest_build on a missing tree yields an empty manifest" {
+    sbx_manifest_build "$WORK/nope" "$WORK/m"
+    [ -f "$WORK/m" ]
+    [ ! -s "$WORK/m" ]
+}
+
+@test "manifest_build handles spaces in filenames" {
+    echo hi > "$SRC/two words.txt"
+    sbx_manifest_build "$SRC" "$WORK/m"
+    grep -q ' two words.txt$' "$WORK/m"
+}
+
+@test "manifest_changed reports an added file" {
+    echo one > "$SRC/a.txt"
+    sbx_manifest_build "$SRC" "$WORK/base"
+    echo new > "$SRC/b.txt"
+    sbx_manifest_build "$SRC" "$WORK/cur"
+    run sbx_manifest_changed "$WORK/base" "$WORK/cur"
+    [ "$output" = "b.txt" ]
+}
+
+@test "manifest_changed reports a modified file" {
+    echo one > "$SRC/a.txt"
+    sbx_manifest_build "$SRC" "$WORK/base"
+    echo changed > "$SRC/a.txt"
+    sbx_manifest_build "$SRC" "$WORK/cur"
+    run sbx_manifest_changed "$WORK/base" "$WORK/cur"
+    [ "$output" = "a.txt" ]
+}
+
+@test "manifest_changed ignores an untouched file" {
+    echo one > "$SRC/a.txt"
+    sbx_manifest_build "$SRC" "$WORK/base"
+    sbx_manifest_build "$SRC" "$WORK/cur"
+    run sbx_manifest_changed "$WORK/base" "$WORK/cur"
+    [ -z "$output" ]
+}
+
+@test "manifest_changed does not report a deleted file" {
+    echo one > "$SRC/a.txt"
+    sbx_manifest_build "$SRC" "$WORK/base"
+    rm "$SRC/a.txt"
+    sbx_manifest_build "$SRC" "$WORK/cur"
+    run sbx_manifest_changed "$WORK/base" "$WORK/cur"
+    [ -z "$output" ]
+}
+
+@test "manifest_deleted reports a removed file" {
+    echo one > "$SRC/a.txt"
+    echo two > "$SRC/b.txt"
+    sbx_manifest_build "$SRC" "$WORK/base"
+    rm "$SRC/a.txt"
+    sbx_manifest_build "$SRC" "$WORK/cur"
+    run sbx_manifest_deleted "$WORK/base" "$WORK/cur"
+    [ "$output" = "a.txt" ]
+}
+
+@test "manifest_deleted is silent when a file only changed" {
+    echo one > "$SRC/a.txt"
+    sbx_manifest_build "$SRC" "$WORK/base"
+    echo changed > "$SRC/a.txt"
+    sbx_manifest_build "$SRC" "$WORK/cur"
+    run sbx_manifest_deleted "$WORK/base" "$WORK/cur"
+    [ -z "$output" ]
+}
