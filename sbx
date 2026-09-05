@@ -24,6 +24,7 @@ Usage: $(basename "$0") [options] [command]
 Options:
   --list-profiles        Show available profiles
   --list-sessions        Show active sessions
+  --changes [<id>]       Show what a record mount changed (default: latest)
   --join <session>       Open a new shell inside a running session
                          (--join <session> -- <cmd> runs <cmd> instead)
   --attach <session>     Reattach to a session's original terminal
@@ -180,6 +181,30 @@ while [[ $# -gt 0 ]]; do
                         fi
                     fi
                 fi
+            done
+            exit 0
+            ;;
+        --changes)
+            CHANGES_DIR="$STATE_DIR/changes/$(sbx_copy_path_slug "$PWD")"
+            if [[ -n "${2-}" && "$2" != -* ]]; then
+                target="$CHANGES_DIR/$2"; shift 2
+            else
+                target=$(find "$CHANGES_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null |
+                         LC_ALL=C sort | tail -n1)
+                shift
+            fi
+            if [[ -z "$target" || ! -d "$target" ]]; then
+                echo "No recorded changes for this directory." >&2
+                exit 1
+            fi
+            echo "$target"
+            # Paths are attacker-authored (a record mount's contents come
+            # from inside the sandbox), so strip control characters before
+            # echoing them to a terminal — same reasoning as --list-sessions.
+            find "$target" -mindepth 2 -type f -printf '  + %P\n' | tr -d '\000-\037'
+            for d in "$target"/*.deleted; do
+                [[ -f "$d" ]] || continue
+                sed 's/^/  - /' "$d" | tr -d '\000-\037'
             done
             exit 0
             ;;
@@ -798,6 +823,7 @@ COPY_MOUNTS=()     # fs-profile copy mounts,  "source:dest" — ephemeral
 CLI_COPY_MOUNTS=() # cli-profile copy mounts, "source:dest" — persistent
 SKIPPED_MOUNTS=()  # profile mounts whose source is absent on this host
 FORKED_MOUNTS=()   # "profile<TAB>source<TAB>dest" — sandbox-owned, seeded once
+RECORD_MOUNTS=()   # "source<TAB>dest" — host-owned, reseeded, changes archived
 
 apply_mounts() {
     local profile="$1" kind="${2:-fs}"
@@ -867,6 +893,9 @@ apply_mounts() {
                 ;;
             forked)
                 FORKED_MOUNTS+=("$profile_name"$'\t'"$source"$'\t'"$dest")
+                ;;
+            record)
+                RECORD_MOUNTS+=("$source"$'\t'"$dest")
                 ;;
         esac
     done <<< "$mounts"
@@ -940,6 +969,29 @@ for fm in "${FORKED_MOUNTS[@]}"; do
     else
         BWRAP_ARGS+=(--tmpfs "$f_dest")
         BWRAP_ARGS+=(--bind "$f_store" "$f_dest")
+    fi
+done
+
+# Host-owned mounts with change detection. A private working copy is seeded
+# fresh every launch and hashed into a manifest; teardown diffs the working
+# copy against THAT manifest rather than against the live host source, so a
+# host edit made while the session runs cannot be misattributed to the
+# sandbox.
+RECORD_WORK_DIR="$STATE_DIR/work/$SESSION_ID"
+for rm_ in "${RECORD_MOUNTS[@]}"; do
+    IFS=$'\t' read -r r_src r_dest <<< "$rm_"
+    r_id=$(sbx_copy_mount_id "$r_dest")
+    r_work="$RECORD_WORK_DIR/$r_id"
+
+    mkdir -p "$r_work"
+    sbx_copy_seed "$r_src" "$r_work"
+    sbx_manifest_build "$r_work" "$RECORD_WORK_DIR/$r_id.manifest"
+
+    if [[ -f "$r_src" ]]; then
+        BWRAP_ARGS+=(--bind "$r_work/$(basename "$r_src")" "$r_dest")
+    else
+        BWRAP_ARGS+=(--tmpfs "$r_dest")
+        BWRAP_ARGS+=(--bind "$r_work" "$r_dest")
     fi
 done
 
@@ -1442,6 +1494,33 @@ teardown() {
         mount_id=$(sbx_copy_mount_id "$dst")
         sbx_copy_writeback "$src" "$SESSION_DIR/tmp_mounts/$mount_id" "$CLI_STORE_DIR/$mount_id"
     done
+
+    # Change archive for record mounts. The baseline is the launch-time
+    # manifest, not the host source, so this reports what the SANDBOX did.
+    if [[ ${#RECORD_MOUNTS[@]} -gt 0 ]]; then
+        arch_dir="$STATE_DIR/changes/$(sbx_copy_path_slug "$PWD")/$(date +%Y%m%d-%H%M%S)-$SESSION_ID"
+        for rm_ in "${RECORD_MOUNTS[@]}"; do
+            IFS=$'\t' read -r r_src r_dest <<< "$rm_"
+            r_id=$(sbx_copy_mount_id "$r_dest")
+            r_work="$RECORD_WORK_DIR/$r_id"
+            r_base="$RECORD_WORK_DIR/$r_id.manifest"
+            [[ -d "$r_work" ]] || continue
+
+            r_cur="$RECORD_WORK_DIR/$r_id.manifest.now"
+            sbx_manifest_build "$r_work" "$r_cur"
+
+            mkdir -p "$arch_dir/$r_id"
+            while IFS= read -r rel; do
+                [[ -z "$rel" ]] && continue
+                mkdir -p "$arch_dir/$r_id/$(dirname "$rel")"
+                cp -a "$r_work/$rel" "$arch_dir/$r_id/$rel"
+            done < <(sbx_manifest_changed "$r_base" "$r_cur")
+
+            sbx_manifest_deleted "$r_base" "$r_cur" > "$arch_dir/$r_id.deleted"
+            echo "Changes from this session: $arch_dir/$r_id"
+        done
+    fi
+    rm -rf "$RECORD_WORK_DIR"
 
     rm -rf "$SESSION_DIR/tmp_mounts"
     rm -f "$SESSION_DIR/tmux.sock" "$SESSION_DIR/tmux.conf" \

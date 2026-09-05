@@ -36,6 +36,11 @@ EOF
     cat > "$PROJ/.sbx/profiles/cli/fk.json" <<EOF
 {"description":"test","mounts":[{"source":"$HOSTDIR","dest":"/tmp/fkmount","perm":"forked"}]}
 EOF
+
+    CHANGES_ROOT="$HOME/.local/state/sbx/changes"
+    cat > "$PROJ/.sbx/profiles/fs/rec.json" <<EOF
+{"description":"test","mounts":[{"source":"$HOSTDIR","dest":"/tmp/recmount","perm":"record"}]}
+EOF
 }
 
 teardown() {
@@ -53,6 +58,12 @@ run_sbx() {
 # key's cwd slug can be varied across tests.
 run_sbx_in() {
     ( cd "$1" && script -qec "$SBX $2 -- /bin/sh -c '$3'" /dev/null >/dev/null 2>&1 )
+}
+
+# The single archive directory produced by the most recent record session.
+latest_archive() {
+    find "$CHANGES_ROOT" -mindepth 2 -maxdepth 2 -type d 2>/dev/null |
+        LC_ALL=C sort | tail -n1
 }
 
 @test "a cli copy mount persists a new file into the profile store" {
@@ -161,4 +172,61 @@ EOF
     run_sbx_in "$OTHER" "--cli fk" "echo there > /tmp/fkmount/where.txt"
     [ "$(cat "$FORKED_ROOT/fk/$PROJ_SLUG/_tmp_fkmount/where.txt")" = "here" ]
     [ "$(cat "$FORKED_ROOT/fk/$OTHER_SLUG/_tmp_fkmount/where.txt")" = "there" ]
+}
+
+@test "a record mount archives a file the sandbox created" {
+    run_sbx "--fs rec" "echo made > /tmp/recmount/new.txt"
+    [ "$(cat "$(latest_archive)/_tmp_recmount/new.txt")" = "made" ]
+}
+
+@test "a record mount archives a file the sandbox modified" {
+    run_sbx "--fs rec" "echo changed > /tmp/recmount/host.txt"
+    [ "$(cat "$(latest_archive)/_tmp_recmount/host.txt")" = "changed" ]
+}
+
+@test "a record mount does not archive an untouched file" {
+    run_sbx "--fs rec" "echo made > /tmp/recmount/new.txt"
+    [ ! -f "$(latest_archive)/_tmp_recmount/host.txt" ]
+}
+
+@test "a record mount lists a deleted file and does not archive it" {
+    run_sbx "--fs rec" "rm /tmp/recmount/host.txt"
+    [ "$(cat "$(latest_archive)/_tmp_recmount.deleted")" = "host.txt" ]
+    [ ! -f "$(latest_archive)/_tmp_recmount/host.txt" ]
+}
+
+@test "a record mount resets to host state on the next launch" {
+    run_sbx "--fs rec" "echo made > /tmp/recmount/new.txt"
+    run_sbx "--fs rec" "test -f /tmp/recmount/new.txt && echo leaked > /tmp/recmount/leak.txt"
+    [ ! -f "$(latest_archive)/_tmp_recmount/leak.txt" ]
+}
+
+@test "a record mount never modifies the host source" {
+    run_sbx "--fs rec" "echo sandbox > /tmp/recmount/host.txt; rm -f /tmp/recmount/host.txt; echo x > /tmp/recmount/new.txt"
+    [ "$(cat "$HOSTDIR/host.txt")" = "hostfile" ]
+    [ ! -f "$HOSTDIR/new.txt" ]
+}
+
+# The regression test for the defect this design exists to fix. Against the
+# old sbx_copy_writeback, which diffed against the live host source at
+# teardown, a host edit made mid-session shows up in the egress as though
+# the sandbox had made it. The manifest baseline is captured at launch, so
+# it cannot.
+@test "a host edit during the session is not attributed to the sandbox" {
+    ( cd "$PROJ" && script -qec \
+        "$SBX --fs rec -- /bin/sh -c 'echo ready > /tmp/recmount/ready.txt; sleep 5'" \
+        /dev/null >/dev/null 2>&1 ) &
+    local bg=$!
+    for _ in $(seq 1 40); do
+        [[ -n "$(find "$HOME/.local/state/sbx/work" -name 'ready.txt' 2>/dev/null)" ]] && break
+        sleep 0.25
+    done
+    echo "edited-by-host" > "$HOSTDIR/host.txt"
+    wait $bg
+    [ ! -f "$(latest_archive)/_tmp_recmount/host.txt" ]
+}
+
+@test "the work directory is removed at teardown" {
+    run_sbx "--fs rec" "echo made > /tmp/recmount/new.txt"
+    [ -z "$(find "$HOME/.local/state/sbx/work" -mindepth 1 2>/dev/null)" ]
 }
