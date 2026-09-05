@@ -207,3 +207,46 @@ setup() {
     run sbx_manifest_deleted "$WORK/base" "$WORK/cur"
     [ -z "$output" ]
 }
+
+@test "manifest_build records a file with a backslash in its name" {
+    touch "$SRC/back\\slash.txt"
+    sbx_manifest_build "$SRC" "$WORK/m"
+    grep -q ' back\\slash.txt$' "$WORK/m"
+}
+
+@test "manifest_changed reports a modified file with spaces in the name" {
+    echo one > "$SRC/two words.txt"
+    sbx_manifest_build "$SRC" "$WORK/base"
+    echo changed > "$SRC/two words.txt"
+    sbx_manifest_build "$SRC" "$WORK/cur"
+    run sbx_manifest_changed "$WORK/base" "$WORK/cur"
+    [ "$output" = "two words.txt" ]
+}
+
+@test "manifest_changed reports a modified file with a backslash in the name" {
+    echo one > "$SRC/back\\slash.txt"
+    sbx_manifest_build "$SRC" "$WORK/base"
+    echo changed > "$SRC/back\\slash.txt"
+    sbx_manifest_build "$SRC" "$WORK/cur"
+    run sbx_manifest_changed "$WORK/base" "$WORK/cur"
+    [ "$output" = "back\\slash.txt" ]
+    [ -f "$SRC/$output" ]
+}
+
+@test "manifest_deleted reports a removed file with spaces in the name" {
+    echo one > "$SRC/two words.txt"
+    sbx_manifest_build "$SRC" "$WORK/base"
+    rm "$SRC/two words.txt"
+    sbx_manifest_build "$SRC" "$WORK/cur"
+    run sbx_manifest_deleted "$WORK/base" "$WORK/cur"
+    [ "$output" = "two words.txt" ]
+}
+
+@test "manifest_deleted reports a removed file with a backslash in the name" {
+    echo one > "$SRC/back\\slash.txt"
+    sbx_manifest_build "$SRC" "$WORK/base"
+    rm "$SRC/back\\slash.txt"
+    sbx_manifest_build "$SRC" "$WORK/cur"
+    run sbx_manifest_deleted "$WORK/base" "$WORK/cur"
+    [ "$output" = "back\\slash.txt" ]
+}

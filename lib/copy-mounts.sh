@@ -114,6 +114,12 @@ sbx_copy_writeback() {
 # a second walk or a per-file subshell, and a mode-only change with
 # byte-identical content is not worth either. Such a change is not detected.
 #
+# When a filename contains a backslash, sha256sum escapes it (prefixes the
+# line with `\` and writes `\\` for each backslash in the name). This
+# function normalizes such lines: strips the leading escape marker, unescapes
+# backslashes, and strips the leading "./". Files with embedded newlines are
+# skipped and a count is printed to stderr.
+#
 # LC_ALL=C throughout: the sort order only has to be *stable between the two
 # manifests* being compared, and a locale-dependent collation that differs
 # between the launch and teardown environments would silently desynchronize
@@ -127,7 +133,59 @@ sbx_manifest_build() {
     (
         cd "$tree" || exit 0
         find . -type f -exec sha256sum {} + 2>/dev/null
-    ) | sed 's|^\(\w*\)  \./|\1  |' | LC_ALL=C sort > "$out"
+    ) | awk '
+BEGIN {
+    skipped = 0
+}
+/^\\/  {
+    # This is an escaped line from sha256sum
+    line = $0
+    line = substr(line, 2)  # Strip leading \
+
+    # Find double-space separator between hash and path
+    idx = index(line, "  ")
+    hash = substr(line, 1, idx - 1)
+    path = substr(line, idx + 2)
+
+    # Check for embedded newline (we cannot represent in a line-oriented format)
+    if (index(path, "\\n") > 0) {
+        skipped++
+        next
+    }
+
+    # Unescape backslashes: replace \\ with single \
+    while (match(path, /\\\\/)) {
+        pos = RSTART
+        path = substr(path, 1, pos - 1) "\\" substr(path, pos + 2)
+    }
+
+    # Strip leading ./
+    if (substr(path, 1, 2) == "./") {
+        path = substr(path, 3)
+    }
+
+    print hash "  " path
+    next
+}
+{
+    # Normal unescaped line
+    idx = index($0, "  ")
+    hash = substr($0, 1, idx - 1)
+    path = substr($0, idx + 2)
+
+    # Strip leading ./
+    if (substr(path, 1, 2) == "./") {
+        path = substr(path, 3)
+    }
+
+    print hash "  " path
+}
+END {
+    if (skipped > 0) {
+        print "warning: skipped " skipped " file(s) with newlines in name" > "/dev/stderr"
+    }
+}
+' | LC_ALL=C sort > "$out"
 }
 
 # Relative paths of the files in $2 that are absent from, or differ in
