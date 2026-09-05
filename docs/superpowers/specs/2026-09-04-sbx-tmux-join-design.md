@@ -26,11 +26,15 @@ not the bwrap child inside the namespaces — so there is no re-entry handle to
 target without adding one.
 
 More importantly, entering from outside means reconstructing the sandbox's
-security posture by hand. The payload runs under
-`setpriv --bounding-set=-all --inh-caps=-all --ambient-caps=-all` (`sbx:1479`);
-an `nsenter`-spawned shell would sidestep that unless every flag were
-replicated at the join site, and would drift the moment the wrapper changed.
-A process forked by something *already inside* inherits the drop for free.
+security posture by hand. The whole session runs under
+`setpriv --bounding-set=-all --inh-caps=-all --ambient-caps=-all`, applied in
+`launch.sh` above `session.sh`; an `nsenter`-spawned shell would sidestep that
+unless every flag were replicated at the join site, and would drift the moment
+the drop changed.
+A process forked by something *already inside* inherits the sandbox's
+namespaces for free; the capability drop is a separate matter, and is handled
+by dropping once above the tmux server so that everything it forks is capless
+by construction (see "Joins are capless" below).
 
 ## Approach: tmux server inside, tmux client outside
 
@@ -94,15 +98,19 @@ over that job, which it does by construction.
 ## Architecture
 
 ```
-pasta → launch.sh → bwrap → session.sh                     [PID 1 in sandbox]
-                              ├─ tmux -f tmux.conf -S tmux.sock \
-                              │       new-session -d -s main -- wrapper.sh
-                              ├─ tmux attach -t main       [foreground, owns bwrap stdio]
-                              └─ while has-session; do sleep; done
+pasta → launch.sh → bwrap → setpriv → session.sh           [PID 1 in sandbox]
+                                 (drops every cap, once, for everything below)
+                                        ├─ tmux -f tmux.conf -S tmux.sock \
+                                        │       new-session -d -s main -- wrapper.sh
+                                        ├─ tmux attach -t main   [foreground, owns bwrap stdio]
+                                        └─ while has-session; do sleep; done
 ```
 
-`session.sh` replaces `wrapper.sh` as bwrap's argument; `wrapper.sh` itself is
-unchanged and becomes the `main` session's command.
+`session.sh` replaces `wrapper.sh` as bwrap's argument, and the capability drop
+moves out of `wrapper.sh` and up to `setpriv`, above `session.sh`, so it covers
+the tmux server and everything the server ever forks rather than the payload
+alone. `wrapper.sh` is otherwise unchanged and becomes the `main` session's
+command. (`"caps": "keep"` sessions omit the `setpriv` step entirely.)
 
 `session.sh` is *generated* into `$SESSION_DIR` at launch, exactly as
 `launch.sh` and `wrapper.sh` already are (`sbx:1319`, `sbx:1320`): `sbx`
@@ -131,6 +139,28 @@ introduce: writeback (`sbx:1294`, `sbx:1301`) copies sandbox state back to the
 host the moment the payload exits, so a join still writing files during
 writeback would have its work partially copied or lost.
 
+The waiter is not sufficient on its own, and the guarantee must not be stated
+as though it were. Its liveness test is "can a client connect to this socket",
+and both the socket and the server are inside the sandbox's writable set: a
+payload that runs `rm $SESSION_DIR/tmux.sock` or `tmux kill-server` ends the
+loop whenever it likes. Verified — the session tore down with a join mid-write,
+and the join's file never reached `fs/_copy`.
+
+The enforcing half therefore lives on the host. `--join` takes a *shared*
+`flock` on `$STATE_DIR/<id>.joinlock` for its whole life, and `teardown()`
+takes the same lock *exclusively* before running copy-writeback. That path is
+outside `$SESSION_DIR` and behind the `--tmpfs "$STATE_DIR"` mask, so it does
+not exist from inside the sandbox and nothing in there can touch it. The wait
+is bounded (`flock -w 30`) and warns loudly rather than blocking forever, so a
+stale lock cannot wedge a teardown.
+
+What that does and does not promise: writeback never *overlaps* a live join,
+whatever the sandbox does to the socket. It cannot keep a hostile payload from
+ending its own sandbox and taking a live join down with it — bwrap's child is
+PID 1 of the namespace, and nothing on the host can stop it exiting. The
+property is "writeback and a join never run at the same time", not "a join
+cannot be killed".
+
 Accepted consequence: the launching terminal is occupied for the session's
 whole life. Detaching returns to the waiter, not to a shell prompt. A
 `--detach` flag could address this later; out of scope.
@@ -149,11 +179,20 @@ current suite: every `$status` assertion is on an argument-validation path
 `sbx_copy_writeback` shell-function unit tests (`tests/copy-mounts.bats:76`).
 The e2e helpers discard status entirely (`tests/persistent-cli.bats:44`).
 
+This covers the *payload's* status only. A **launch** failure is a different
+thing and is not swallowed: if `new-session` fails, `session.sh` prints to
+stderr and exits 1 rather than falling into a wait loop whose first
+`list-sessions` also fails, and `sbx` exits non-zero and says the payload may
+never have run instead of "Changes saved". Without that check, any reason the
+server cannot start — an over-long socket path, no tmux in the sandbox's
+`/usr` view, an unparseable `tmux.conf` — produced a fast, silent, successful
+looking no-op that a CI job could not tell from a successful run.
+
 ## Interface
 
 | Flag | Behaviour |
 |---|---|
-| `--join <session>` | `tmux -S "$SDIR/tmux.sock" new-session [-- cmd]` — a fresh PTY inside the sandbox. No command → the sandbox's `$SHELL`. |
+| `--join <session>` | `tmux -S "$SDIR/tmux.sock" new-session -c <workdir> -- /usr/bin/env PATH=<session PATH> <cmd>` — a fresh PTY inside the sandbox. No command → `/bin/bash`. The whole argv is built on the host; `-c` and `PATH` come from the host-side sidecar, because tmux would otherwise use the client's cwd and the client's `PATH`. |
 | `--attach <session>` | `tmux -S "$SDIR/tmux.sock" attach -t main` — reattach to the payload's own terminal. |
 
 Mirroring is gone from `--join`; `--attach` exists so that detaching the main
@@ -197,17 +236,54 @@ not the sandbox's *controlling* terminal — `TIOCSTI` on a non-controlling tty
 requires `CAP_SYS_ADMIN`, which the payload does not have. `--new-session` and
 the capability drop both survive the swap unchanged.
 
-**Joins are capless by construction.** The server runs under the payload's
-`setpriv` drop, so every session it forks inherits an empty bounding set with
-no code of ours. Probe: payload `CapBnd: 0000000000000000`, join identical.
+**Joins are capless because the drop is applied above the server.** The
+first design assumed the server would run under the *payload's* `setpriv`. It
+does not: the server is started by `session.sh`, which is a sibling of the
+payload, so it would hold the session's retained `CAP_SETPCAP` for the whole
+life of the sandbox and hand it to every process it forks — a join, but
+equally `new-window` and `split-window`, which are default key bindings.
+Measured on a live session before the fix: the join itself
+`CapBnd: 0000000000000000`, a window opened inside it
+`CapBnd: 0000000000000100`.
+
+The drop therefore happens *once*, at the highest point it can: `launch.sh`
+makes bwrap's direct child `setpriv --bounding-set=-all --inh-caps=-all
+--ambient-caps=-all -- session.sh`. CAP_SETPCAP is spent there and is gone
+before the tmux server, the payload or any join exists, so every
+server-forked process — by any route, including `respawn-pane`, `run-shell`,
+hooks and `default-command` — is capless by construction. `wrapper.sh` carries
+no `setpriv` of its own any more; a second `--bounding-set=-all` under an
+already-empty bounding set fails with EPERM, since emptying one requires
+CAP_SETPCAP.
+
+Setting `default-command` in `tmux.conf` was considered and rejected: it
+enumerates fork paths instead of covering them, and the payload holds the
+server socket, so it can simply `tmux set -g default-command` its way out.
+
+`"caps": "keep"` sessions are deliberately not wrapped, and their joins keep
+capabilities too — which is why `--join` needs no capability logic of its own.
 
 **The socket sits in sandbox-writable space.** `$SESSION_DIR` is bound rw
-inside, so the payload can interfere with `tmux.sock` and `tmux.conf`. This is
-the pre-existing posture — `session.json` is already treated as
-attacker-authored (`sbx:184`) — and the exposure does not grow: a malicious
-payload already controls the bytes on its own PTY. Narrowing the bind so only
-`fs/`, `tmp/` and the socket are writable is a worthwhile follow-up but is out
-of scope here.
+inside, so the payload can interfere with `tmux.sock` and `tmux.conf`, and
+`session.json` is already treated as attacker-authored (`sbx:184`).
+
+The exposure *would* grow if `--join` executed anything from that directory.
+An earlier revision did — it ran a generated `join_wrapper.sh` — and that was
+demonstrably defeatable: an in-sandbox process overwrote the script, and the
+next host-initiated join ran the attacker's version with
+`CapEff: 0000000000000100`. Under abduco a joiner knew they were looking at
+the payload's own terminal; `--join` advertises a fresh, sbx-provided shell,
+which is a new trust relationship, and handing the sandbox the script behind
+it gives that relationship away.
+
+So nothing `--join` runs comes from inside. The wrapper is gone; the host
+builds the whole argv (`/usr/bin/env PATH=… -- <cmd>`), and everything it
+needs to know about the session — `PATH`, working directory, capability
+policy — is read from a sidecar at `$STATE_DIR/<id>.join.json`, which is
+outside `$SESSION_DIR` and therefore behind the `--tmpfs "$STATE_DIR"` mask
+that hides sibling state from the sandbox. Narrowing the bind so only `fs/`,
+`tmp/` and the socket are writable remains a worthwhile follow-up, but the
+join path no longer depends on it.
 
 **Path length.** tmux sockets inherit the ~108-char `sun_path` limit that
 already constrains e2e tests to a short `$HOME`
@@ -224,7 +300,7 @@ this spec was written:
 |---|---|
 | Host client reaches the in-sandbox server across the bind | socket visible, `list-sessions` works |
 | A host-initiated join runs inside the namespaces | join pid ns `4026533663` = payload's ≠ host's; pid inside is `12` |
-| Joins are capless with no extra code | `CapBnd: 0000000000000000`, identical to payload |
+| Joins are capless *because the drop is applied above the tmux server* | with the drop at `launch.sh`: join and a window opened inside it both `CapBnd: 0000000000000000`. With it applied only in `wrapper.sh` (the original design): join `0000000000000000` but server-forked window `0000000000000100`. The original probe measured the payload's own session, not a `new-session` fork, so it did not show what this row first claimed. |
 | A PID-1 waiter outlives the payload and dies with the last session | waiter exited only after the server was gone |
 | Host env does not leak | **failed** without `update-environment ""` — `DISPLAY` reached the join |
 
