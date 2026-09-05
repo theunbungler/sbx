@@ -22,6 +22,11 @@ What that buys you, in a session without `"caps": "keep"`:
 
 - **`ro` mounts are read-only.** The payload holds no capabilities, so it
   cannot remount a bind read-write.
+- **`--join` gets the same containment as the payload.** The drop is applied
+  once, above the in-sandbox tmux server, so everything the session ever
+  forks — the payload, a join, and any window or pane opened from inside one
+  — starts with an empty bounding set. `--join` also takes no input from the
+  sandbox: its command, `PATH` and working directory are built on the host.
 - **The egress allow-list is not removable.** `nft` and `dnsmasq` run outside
   the sandbox's PID and mount namespaces; nothing inside can flush the
   ruleset or signal the resolver.

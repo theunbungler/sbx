@@ -211,16 +211,58 @@ while [[ $# -gt 0 ]]; do
             if [[ ${#JOIN_CMD[@]} -eq 0 ]]; then
                 JOIN_CMD=("/bin/bash")
             fi
+            # Everything --join needs to know about the session comes from
+            # this sidecar. It deliberately does NOT live in $SESSION_DIR:
+            # that directory is bound rw into the sandbox, so session.json
+            # and any generated script in it are attacker-authored as far as
+            # the host is concerned. $STATE_DIR itself is masked by a
+            # --tmpfs inside the sandbox with only $SESSION_DIR bound back
+            # in, so a file at this path is unreachable from inside.
+            # Absent means the session was not launched by this sbx: fail
+            # closed rather than guess at its capability policy.
+            JOIN_META="$STATE_DIR/$JOIN_SESSION.join.json"
+            if [[ ! -f "$JOIN_META" ]]; then
+                echo "Error: Session '$JOIN_SESSION' has no join metadata; it was not started by this version of sbx." >&2
+                exit 1
+            fi
+            JOIN_PATH=$(jq -r '.path' "$JOIN_META")
+            JOIN_WD=$(jq -r '.workdir' "$JOIN_META")
+            # Held for the whole life of the join, and released by the kernel
+            # when this process finally exits. teardown() takes the same lock
+            # exclusively before copy-writeback, which is what makes
+            # "writeback never overlaps a live join" actually true: the
+            # in-sandbox wait loop cannot guarantee it on its own, because
+            # the payload can delete the socket or run `tmux kill-server`.
+            # The fd survives the exec below on purpose.
+            JOIN_LOCK="$STATE_DIR/$JOIN_SESSION.joinlock"
+            if exec 9>>"$JOIN_LOCK"; then
+                flock -s 9 || echo "Warning: could not lock $JOIN_LOCK; teardown may not wait for this join." >&2
+            fi
             # new-session, NOT attach: a second client on the SAME session
             # would mirror the payload's terminal, which is exactly the
             # behaviour this flag exists to stop doing. A new session in the
             # same server is an independent client with its own pty and its
-            # own size, and the server forks it — already inside the
-            # namespaces, but NOT already under a capability drop, since only
-            # the original payload command was setpriv'd. join_wrapper.sh
-            # (generated alongside wrapper.sh at launch) reapplies the same
-            # setpriv drop generically, so a joined shell is capless too.
-            exec tmux -S "$SDIR/tmux.sock" new-session -- "$SDIR/join_wrapper.sh" "${JOIN_CMD[@]}"
+            # own size, and the server forks it.
+            #
+            # No capability drop here, and no on-disk wrapper to hold one:
+            # the drop happens once, at the top, where launch.sh starts
+            # session.sh under setpriv (see the comment there). The tmux
+            # server is therefore already capless and everything it forks —
+            # this join, and equally new-window/split-window/run-shell —
+            # inherits an empty bounding set by construction. Re-applying
+            # setpriv here would in fact fail with EPERM, since emptying a
+            # bounding set needs the CAP_SETPCAP that is already gone.
+            #
+            # env PATH: tmux copies the *client's* PATH into a spawned pane
+            # regardless of `update-environment ''`, so the host's PATH would
+            # otherwise reach every join. /usr/bin/env by absolute path for
+            # the same reason — it must not be resolved through that PATH.
+            # -c: without it tmux uses the host client's cwd, so a join would
+            # ignore the session's --wd. A directory that does not exist
+            # inside the sandbox makes tmux fall back to $HOME, which is the
+            # same default the payload gets.
+            exec tmux -S "$SDIR/tmux.sock" new-session -c "$JOIN_WD" -- \
+                /usr/bin/env "PATH=$JOIN_PATH" "${JOIN_CMD[@]}"
             ;;
         --attach)
             ATTACH_SESSION="$2"
@@ -377,13 +419,14 @@ require_tools() {
             jq)       echo "  jq       — Debian/Ubuntu: apt install jq           Arch: pacman -S jq" >&2 ;;
             envsubst) echo "  envsubst — Debian/Ubuntu: apt install gettext-base Arch: pacman -S gettext" >&2 ;;
             setpriv)  echo "  setpriv  — Debian/Ubuntu: apt install util-linux   Arch: pacman -S util-linux" >&2 ;;
+            flock)    echo "  flock    — Debian/Ubuntu: apt install util-linux   Arch: pacman -S util-linux" >&2 ;;
             tmux)     echo "  tmux     — Debian/Ubuntu: apt install tmux        Arch: pacman -S tmux" >&2 ;;
         esac
     done
     exit 1
 }
 
-require_tools bwrap tmux jq envsubst setpriv
+require_tools bwrap tmux jq envsubst setpriv flock
 if [[ ${#NET_PROFILES[@]} -gt 0 ]]; then
     require_tools pasta nft dnsmasq
 fi
@@ -623,13 +666,21 @@ fi
 # modes.
 #
 # CAP_SETPCAP is retained deliberately and is the ONLY capability kept.
-# It is the privilege the wrapper's setpriv needs to empty the bounding
-# set, which bwrap leaves full whenever it JOINS an existing user
-# namespace instead of creating one — i.e. the --net path. Dropping it
-# here makes setpriv fail with "apply bounding set: Operation not
-# permitted" and every session exit 127. CAP_SETPCAP cannot mount,
-# configure networking, or change ownership, so holding it across the
-# single exec into setpriv is not an escape surface.
+# It is the privilege setpriv needs to empty the bounding set, which bwrap
+# leaves full whenever it JOINS an existing user namespace instead of
+# creating one — i.e. the --net path. Dropping it here makes setpriv fail
+# with "apply bounding set: Operation not permitted" and every session
+# exit 127.
+#
+# Why that is not an escape surface: the setpriv that spends it is
+# launch.sh's, above session.sh (see the comment there), so CAP_SETPCAP is
+# held across one exec by one process and is gone before the tmux server,
+# the payload, or any join exists. This ordering is load-bearing and was
+# not always so — while the drop lived in wrapper.sh, the server ran
+# holding CAP_SETPCAP for the life of the sandbox and handed it to every
+# pane it forked, which is a long-lived RPC-reachable service parked on a
+# capability, not a single exec. CAP_SETPCAP cannot mount, configure
+# networking, or change ownership in any case.
 #
 # The "caps": "keep" opt-out needs --cap-add ALL in BOTH modes, not just
 # --net. Where bwrap creates the user namespace itself (the no-net path) it
@@ -1198,6 +1249,28 @@ cat > "$SESSION_DIR/session.json" <<EOF
 }
 EOF
 
+# The join sidecar. Same information session.json would have carried, but
+# kept OUTSIDE $SESSION_DIR on purpose: that directory is bound rw into the
+# sandbox, so anything in it is attacker-authored, and --join must not take
+# security-relevant input from the sandbox it is about to enter. $STATE_DIR
+# is masked by a --tmpfs inside with only $SESSION_DIR bound back in, so
+# this path does not exist from the sandbox's point of view.
+#   path      the session's own PATH, which --join re-imposes because tmux
+#             otherwise hands the pane the host client's PATH.
+#   workdir   what `tmux new-session -c` should use, so a join starts where
+#             the payload did rather than in the host's cwd. Empty --wd means
+#             "wherever bwrap would have landed", which is the launch dir.
+#   caps_keep informational: the drop is applied (or not) once at launch, in
+#             launch.sh, so --join does not consult this. Recorded so a
+#             capful join is explainable without re-deriving the profiles.
+cat > "$STATE_DIR/$SESSION_ID.join.json" <<EOF
+{
+    "path": $(jq -R . <<< "$SESSION_DIR/bin:$SANDBOX_PATH"),
+    "workdir": $(jq -R . <<< "${WORKDIR:-$PWD}"),
+    "caps_keep": $([[ "$CAPS_KEEP" == "true" ]] && echo true || echo false)
+}
+EOF
+
 # GUI Setup (xpra virtual display)
 if [[ "$GUI_FLAG" == "true" ]]; then
     if ! command -v xpra >/dev/null 2>&1; then
@@ -1297,8 +1370,28 @@ BWRAP_ARGS+=(--tmpfs "$CONFIG_DIR")
 
 # Teardown Logic
 teardown() {
+    # Must be the first line: in an EXIT trap $? is the status the script is
+    # dying with, i.e. bwrap's. That is NOT the payload's exit code (a tmux
+    # session's status does not reach its client, and dropping it is
+    # deliberate) — it is the launch's own, and a caller has to be able to
+    # tell "the sandbox never came up" apart from "the session ran".
+    local exit_status=$?
     echo "Tearing down session $SESSION_ID..."
-    
+
+    # The in-sandbox wait loop is not sufficient to keep writeback off a
+    # live join: its liveness test is "can a client connect to this socket",
+    # and both the socket and the server are under the payload's control
+    # (`rm tmux.sock`, `tmux kill-server`). This lock is on the host side and
+    # on a path the sandbox cannot see (see the --join branch), so it holds
+    # regardless of what happens inside. Bounded, never an unbounded block:
+    # a stale lock must not be able to hang teardown forever.
+    JOIN_LOCK="$STATE_DIR/$SESSION_ID.joinlock"
+    if exec 9>>"$JOIN_LOCK"; then
+        if ! flock -w 30 -x 9; then
+            echo "Warning: a --join still holds the session lock after 30s; running write-back anyway." >&2
+        fi
+    fi
+
     # Egress for copy mounts. fs-profile mounts land in this session's
     # fs/ directory; cli-profile mounts land in the profile's persistent
     # store (keyed by profile + launch dir), where the next --cli session
@@ -1323,15 +1416,22 @@ teardown() {
 
     rm -rf "$SESSION_DIR/tmp_mounts"
     rm -f "$SESSION_DIR/tmux.sock" "$SESSION_DIR/tmux.conf" \
-          "$SESSION_DIR/session.sh" "$SESSION_DIR/wrapper.sh" \
-          "$SESSION_DIR/join_wrapper.sh"
+          "$SESSION_DIR/session.sh" "$SESSION_DIR/wrapper.sh"
+    # Both live outside $SESSION_DIR; go once the session cannot be joined.
+    rm -f "$STATE_DIR/$SESSION_ID.join.json" "$JOIN_LOCK"
 
     if [[ -n "$XPRA_DISPLAY" ]]; then
         echo "Stopping xpra display $XPRA_DISPLAY..."
         xpra stop "$XPRA_DISPLAY" >/dev/null 2>&1 || true
     fi
 
-    echo "Session $SESSION_ID finished. Changes saved to $SESSION_DIR/fs"
+    if [[ "$exit_status" -ne 0 ]]; then
+        # Saying "changes saved" here would be a lie a CI job cannot see
+        # through: the sandbox may never have got as far as running anything.
+        echo "Session $SESSION_ID ended with status $exit_status; the payload may never have run." >&2
+    else
+        echo "Session $SESSION_ID finished. Changes saved to $SESSION_DIR/fs"
+    fi
 }
 
 trap teardown EXIT
@@ -1342,7 +1442,6 @@ TMUX_CONF="$SESSION_DIR/tmux.conf"
 SESSION_SCRIPT="$SESSION_DIR/session.sh"
 LAUNCH_SCRIPT="$SESSION_DIR/launch.sh"
 CAT_WRAPPER="$SESSION_DIR/wrapper.sh"
-JOIN_WRAPPER="$SESSION_DIR/join_wrapper.sh"
 DNSMASQ_BIN=$(which dnsmasq)
 
 # Opt-in podman docker-API service ("docker_api": true in any profile).
@@ -1492,38 +1591,23 @@ $(printf "%q " "${COMMAND[@]}")
 $DOCKER_API_STOP
 EOF
 else
-    # setpriv spends the retained CAP_SETPCAP to empty the bounding set,
-    # then execs the payload with every capability set at zero. If setpriv
-    # is absent or fails, the exec fails and the payload never runs: the
-    # failure mode is closed, not open. exec because a capless session has
-    # no docker-API service to stop afterwards. USERNS_NET_SETUP and
-    # DOCKER_API_START are both podman operations and are unreachable
-    # without capabilities, so they are absent here by construction.
+    # No setpriv here any more. The drop used to sit in this wrapper, which
+    # covered the payload and nothing else — the tmux server, being started
+    # by session.sh, kept CAP_SETPCAP and handed it to every pane it forked
+    # (new-window and split-window are default key bindings). It now happens
+    # once in launch.sh, above session.sh, so this process is already capless
+    # before it starts and a second --bounding-set=-all would fail with
+    # EPERM: emptying a bounding set itself requires CAP_SETPCAP.
+    # exec because a capless session has no docker-API service to stop
+    # afterwards. USERNS_NET_SETUP and DOCKER_API_START are both podman
+    # operations and are unreachable without capabilities, so they are
+    # absent here by construction.
     cat > "$CAT_WRAPPER" <<EOF
 #!/bin/bash
-exec setpriv --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- \\
-    $(printf "%q " "${COMMAND[@]}")
+exec $(printf "%q " "${COMMAND[@]}")
 EOF
 fi
 chmod +x "$CAT_WRAPPER"
-
-# Generic counterpart to $CAT_WRAPPER for --join: the payload's command is
-# fixed at launch time, but a join's command is only known when it happens,
-# so this wrapper execs whatever tmux hands it as "$@" instead of a command
-# baked in at generation time. Same capability handling as the payload:
-# setpriv drops to nothing unless the session opted to keep caps.
-if [[ "$CAPS_KEEP" == "true" ]]; then
-    cat > "$JOIN_WRAPPER" <<'EOF'
-#!/bin/bash
-exec "$@"
-EOF
-else
-    cat > "$JOIN_WRAPPER" <<'EOF'
-#!/bin/bash
-exec setpriv --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- "$@"
-EOF
-fi
-chmod +x "$JOIN_WRAPPER"
 
 # Per-session tmux config. The -f that loads this is not cosmetic: the
 # sandbox usually has $HOME mounted, so without it the server would read
@@ -1534,6 +1618,9 @@ chmod +x "$JOIN_WRAPPER"
 #                  sessions — by default DISPLAY, SSH_AUTH_SOCK and friends.
 #                  Leaving it at the default drives a host-env hole straight
 #                  through the --clearenv policy above. Emptied deliberately.
+#                  NOT sufficient on its own: tmux copies the client's PATH
+#                  into a spawned pane regardless of this list, which is why
+#                  --join re-imposes the session's PATH itself.
 #   exit-empty     the session-lifetime rule — server exits with its last
 #                  session, which is what lets session.sh stop waiting.
 #   prefix C-\     a host tmux keeps C-b, so nesting needs no doubled
@@ -1560,15 +1647,27 @@ EOF
 # live session with it, joins included. Instead it hangs around until the
 # server is gone, which (with exit-empty on) means the last session — payload
 # or join, whichever ends last — has exited. Only then does bwrap return and
-# launch.sh proceed to copy-writeback, so a join can never be racing the
-# write-back of its own files.
+# launch.sh proceed to copy-writeback. Note what this does and does not
+# promise: it keeps the sandbox alive for joins the payload has finished
+# outliving, but it is not itself a guarantee that write-back never overlaps
+# a live join. Its liveness test is socket connectivity, and the payload can
+# delete the socket or run `tmux kill-server` — it can end its own sandbox
+# whenever it likes, taking any live join with it. The host-side flock in
+# teardown() is what makes the no-overlap property true.
 #
 # No `set -e`: attach is expected to fail when the payload is short-lived
-# enough to have exited before we get here, and that is not an error.
+# enough to have exited before we get here, and that is not an error. A
+# failure to start the server is a different thing entirely and is checked
+# explicitly: without it, `attach` fails into `|| true`, the loop's first
+# list-sessions fails, this script exits 0 and sbx reports a session whose
+# payload never ran as one whose changes were saved.
 cat > "$SESSION_SCRIPT" <<EOF
 #!/bin/bash
-tmux -f $(printf '%q' "$TMUX_CONF") -S $(printf '%q' "$TMUX_SOCK") \\
-    new-session -d -s main -- $(printf '%q' "$CAT_WRAPPER")
+if ! tmux -f $(printf '%q' "$TMUX_CONF") -S $(printf '%q' "$TMUX_SOCK") \\
+    new-session -d -s main -- $(printf '%q' "$CAT_WRAPPER"); then
+    echo "sbx: the in-sandbox tmux server failed to start; the payload did not run." >&2
+    exit 1
+fi
 tmux -S $(printf '%q' "$TMUX_SOCK") attach -t main || true
 while tmux -S $(printf '%q' "$TMUX_SOCK") list-sessions >/dev/null 2>&1; do
     sleep 0.5
@@ -1597,6 +1696,27 @@ fi
 for arg in "${BWRAP_ARGS[@]}"; do
     printf "%q " "$arg" >> "$LAUNCH_SCRIPT"
 done
+# THE capability drop, applied exactly once and as high up as it can go.
+# bwrap's direct child is setpriv, which empties every capability set and
+# then execs session.sh as PID 1 — so the tmux server, the payload, every
+# join, and every pane the server forks by any route (new-window,
+# split-window, respawn-pane, run-shell, hooks, default-command) is capless
+# by construction rather than because some wrapper remembered to re-apply a
+# drop. This is deliberately not done in tmux.conf's default-command: the
+# payload holds the server socket and could simply `tmux set -g
+# default-command` its way out of that one.
+#
+# The retained CAP_SETPCAP (--cap-add CAP_SETPCAP above) is spent here, by
+# this setpriv, and is gone before any of the session's own code runs. If
+# setpriv is missing or fails, the exec fails and nothing runs: the failure
+# mode is closed, not open.
+#
+# "caps": "keep" sessions are deliberately not wrapped — keeping
+# capabilities is the entire point of that opt-out, and it extends to their
+# joins, which is why --join needs no capability logic of its own.
+if [[ "$CAPS_KEEP" != "true" ]]; then
+    printf "setpriv --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- " >> "$LAUNCH_SCRIPT"
+fi
 printf "%q\n" "$SESSION_SCRIPT" >> "$LAUNCH_SCRIPT"
 
 if [[ ${#NET_PROFILES[@]} -gt 0 ]]; then
