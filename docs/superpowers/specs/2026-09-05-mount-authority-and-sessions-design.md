@@ -133,6 +133,42 @@ deletions, which the current content-diff cannot express at all.
 not the live host source at teardown. A host edit during the session
 cannot masquerade as a sandbox change.
 
+### Setup progress reporting
+
+Seeding a `record` mount can take real time on a large tree, and the work
+happens before bwrap runs, so an unadorned sbx looks hung. Setup reports
+progress, under three constraints.
+
+**It is threshold- and TTY-gated.** Nothing is printed unless the phase has
+been running longer than ~1s *and* stderr is a TTY. This matters more than
+it sounds: a 300 MB same-filesystem btrfs seed completes in ~4ms via
+reflink, versus ~144ms with `--reflink=never` — a 37x difference measured
+on the design host. Progress is only ever needed in the case where reflink
+is unavailable, which is exactly the case where it is slow enough to be
+worth showing. CI and pipelines print nothing. Output goes to stderr so it
+cannot contaminate stdout.
+
+**It starts indeterminate and upgrades.** The numerator is `rchar` from
+`/proc/<cp_pid>/io`: bytes the copy has consumed, obtained without walking
+the filesystem at all. The denominator requires `du -sb` on the source,
+which is a full stat walk and can itself take seconds on `/mnt/c`, where
+every stat is a 9p round trip. Paying that cost up front would add latency
+to the exact case it is meant to improve. So `du` runs in the background,
+concurrently with the copy: the display starts as bytes-plus-elapsed and
+switches to a percentage when `du` returns, or never switches if the copy
+finishes first. `rchar` includes directory reads and so slightly overshoots;
+the displayed percentage is capped at 99 until the copy actually exits.
+
+**It covers both phases.** Seeding is byte-denominated as above. The
+manifest hash pass that follows it is file-denominated, and its total is
+already known from the copy that just completed.
+
+Fallbacks: if `/proc/<pid>/io` is unreadable — hardened procfs, or a
+non-Linux host — the display degrades to a spinner with elapsed time and a
+phase label. The line is erased on completion, and `teardown()` must clear
+it too, so an interrupt mid-seed does not strand a partial bar on the
+terminal.
+
 ### Overlayfs was evaluated and rejected
 
 Overlayfs is the obvious implementation for both perms: `upperdir` is the
@@ -354,6 +390,12 @@ deleted.
   current implementation.
 - A second launch sees host content, not the first launch's changes.
 - Archive pruning keeps exactly N.
+
+**Progress:**
+- A seed completing under the threshold prints nothing.
+- With stderr redirected to a file, nothing is printed regardless of
+  duration.
+- An interrupt during a seed leaves no partial bar on the terminal.
 
 **Sessions:**
 - `sessions/<name>/` does not exist after a clean exit.
