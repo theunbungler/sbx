@@ -24,7 +24,8 @@ Usage: $(basename "$0") [options] [command]
 Options:
   --list-profiles        Show available profiles
   --list-sessions        Show active sessions
-  --join <session>       Attach to an existing session
+  --join <session>       Open a new shell inside a running session
+                         (--join <session> -- <cmd> runs <cmd> instead)
   --fs <profile>         Apply a filesystem profile (multiple allowed)
   --net <profile>        Apply a network profile (multiple allowed)
   --cli <profile>        Apply a CLI/environment profile
@@ -184,16 +185,41 @@ while [[ $# -gt 0 ]]; do
         --join)
             JOIN_SESSION="$2"
             shift 2
+            # A trailing `-- cmd` has to be consumed here: this branch exits
+            # before the main loop ever reaches the `--` case.
+            JOIN_CMD=()
+            if [[ "${1-}" == "--" ]]; then
+                shift
+                JOIN_CMD=("$@")
+            fi
             SDIR="$STATE_DIR/$JOIN_SESSION"
-            # -S, not -f: the multiplexer's rendezvous point is a unix
-            # socket, which is never a regular file.
-            if [[ -d "$SDIR" && -S "$SDIR/session.sock" ]]; then
-                "$SESSION_MUX" -a "$SDIR/session.sock"
-            else
+            # -S, not -f: the server's rendezvous point is a unix socket,
+            # which is never a regular file.
+            if [[ ! -d "$SDIR" || ! -S "$SDIR/tmux.sock" ]]; then
                 echo "Error: Session '$JOIN_SESSION' not found or no socket available." >&2
                 exit 1
             fi
-            exit 0
+            # Inline check, not require_tools: that function is defined
+            # further down and does not exist yet during argument parsing.
+            if ! command -v tmux >/dev/null 2>&1; then
+                echo "Error: sbx requires tmux, which is not on PATH." >&2
+                exit 1
+            fi
+            # No command means an interactive shell, matching the default
+            # sbx runs when launched with no command at all.
+            if [[ ${#JOIN_CMD[@]} -eq 0 ]]; then
+                JOIN_CMD=("/bin/bash")
+            fi
+            # new-session, NOT attach: a second client on the SAME session
+            # would mirror the payload's terminal, which is exactly the
+            # behaviour this flag exists to stop doing. A new session in the
+            # same server is an independent client with its own pty and its
+            # own size, and the server forks it — already inside the
+            # namespaces, but NOT already under a capability drop, since only
+            # the original payload command was setpriv'd. join_wrapper.sh
+            # (generated alongside wrapper.sh at launch) reapplies the same
+            # setpriv drop generically, so a joined shell is capless too.
+            exec tmux -S "$SDIR/tmux.sock" new-session -- "$SDIR/join_wrapper.sh" "${JOIN_CMD[@]}"
             ;;
         --fs)
             FS_PROFILES+=("$(resolve_profile fs "$2")")
@@ -1278,7 +1304,8 @@ teardown() {
 
     rm -rf "$SESSION_DIR/tmp_mounts"
     rm -f "$SESSION_DIR/tmux.sock" "$SESSION_DIR/tmux.conf" \
-          "$SESSION_DIR/session.sh" "$SESSION_DIR/wrapper.sh"
+          "$SESSION_DIR/session.sh" "$SESSION_DIR/wrapper.sh" \
+          "$SESSION_DIR/join_wrapper.sh"
 
     if [[ -n "$XPRA_DISPLAY" ]]; then
         echo "Stopping xpra display $XPRA_DISPLAY..."
@@ -1296,6 +1323,7 @@ TMUX_CONF="$SESSION_DIR/tmux.conf"
 SESSION_SCRIPT="$SESSION_DIR/session.sh"
 LAUNCH_SCRIPT="$SESSION_DIR/launch.sh"
 CAT_WRAPPER="$SESSION_DIR/wrapper.sh"
+JOIN_WRAPPER="$SESSION_DIR/join_wrapper.sh"
 DNSMASQ_BIN=$(which dnsmasq)
 
 # Opt-in podman docker-API service ("docker_api": true in any profile).
@@ -1459,6 +1487,24 @@ exec setpriv --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- \\
 EOF
 fi
 chmod +x "$CAT_WRAPPER"
+
+# Generic counterpart to $CAT_WRAPPER for --join: the payload's command is
+# fixed at launch time, but a join's command is only known when it happens,
+# so this wrapper execs whatever tmux hands it as "$@" instead of a command
+# baked in at generation time. Same capability handling as the payload:
+# setpriv drops to nothing unless the session opted to keep caps.
+if [[ "$CAPS_KEEP" == "true" ]]; then
+    cat > "$JOIN_WRAPPER" <<'EOF'
+#!/bin/bash
+exec "$@"
+EOF
+else
+    cat > "$JOIN_WRAPPER" <<'EOF'
+#!/bin/bash
+exec setpriv --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- "$@"
+EOF
+fi
+chmod +x "$JOIN_WRAPPER"
 
 # Per-session tmux config. The -f that loads this is not cosmetic: the
 # sandbox usually has $HOME mounted, so without it the server would read

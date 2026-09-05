@@ -8,7 +8,7 @@
   - **CLI Profiles**: Set environment variables, paths, and mounts (e.g., `dev`, `gemini`, `pi`).
   - **Filesystem (FS) Profiles**: Define mounts and filesystem-level configurations (e.g., `chrome`, `sandbox`).
   - **Network (NET) Profiles**: Control network access and connectivity (e.g., `web`, `test_net`).
-- **Session Management**: List active sessions and easily join existing ones.
+- **Session Management**: List active sessions, and open additional shells inside a running one.
 - **GUI Support**: Enable isolated graphical interfaces using `xpra`.
 - **Flexible Configuration**: Profiles can be stored locally, in your home directory, or in system-wide paths.
 
@@ -63,7 +63,7 @@ To see all available commands and options, run:
 |---------|-------------|
 | `--list-profiles` | Show all available CLI, FS, and NET profiles. |
 | `--list-sessions` | List all currently active sandbox sessions. |
-| `--join <session>` | Attach to an existing sandbox session. |
+| `--join <session>` | Open a new shell inside a running sandbox session, with its own terminal. Append `-- <cmd>` to run a command instead. |
 | `--wd <path>` | Start the session in this directory inside the sandbox. |
 | `--host-port <spec>` | Reach a service running on the host's `127.0.0.1:<port>` from inside the sandbox. `<spec>` is `<port>[/tcp\|/udp]`; a bare number means TCP. Repeatable. |
 | `--gui` | Start a session with isolated GUI support via `xpra`. |
