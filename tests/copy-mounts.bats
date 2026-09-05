@@ -250,3 +250,19 @@ setup() {
     run sbx_manifest_deleted "$WORK/base" "$WORK/cur"
     [ "$output" = "back\\slash.txt" ]
 }
+
+@test "manifest_build records a file with two consecutive backslashes in its name" {
+    touch "$SRC/double\\\\slash.txt"
+    sbx_manifest_build "$SRC" "$WORK/m"
+    grep -q ' double\\\\slash.txt$' "$WORK/m"
+}
+
+@test "manifest_changed reports a modified file with two consecutive backslashes in the name" {
+    echo one > "$SRC/double\\\\slash.txt"
+    sbx_manifest_build "$SRC" "$WORK/base"
+    echo changed > "$SRC/double\\\\slash.txt"
+    sbx_manifest_build "$SRC" "$WORK/cur"
+    run sbx_manifest_changed "$WORK/base" "$WORK/cur"
+    [ "$output" = "double\\\\slash.txt" ]
+    [ -f "$SRC/$output" ]
+}

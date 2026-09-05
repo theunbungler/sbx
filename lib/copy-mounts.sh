@@ -153,11 +153,11 @@ BEGIN {
         next
     }
 
-    # Unescape backslashes: replace \\ with single \
-    while (match(path, /\\\\/)) {
-        pos = RSTART
-        path = substr(path, 1, pos - 1) "\\" substr(path, pos + 2)
-    }
+    # Unescape backslashes: replace \\ with single \. gsub advances past
+    # each replacement instead of rescanning it, so overlapping runs of
+    # backslashes are not double-consumed the way a match()-based loop
+    # restarting from position 1 would.
+    gsub(/\\\\/, "\\", path)
 
     # Strip leading ./
     if (substr(path, 1, 2) == "./") {
