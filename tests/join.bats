@@ -107,3 +107,39 @@ PARK='while [ ! -f /out/stop ]; do sleep 0.2; done'
     run grep -q 'hunter2' "$HOSTDIR/join.env"
     [ "$status" -ne 0 ]
 }
+
+@test "writeback waits for a join that outlives the payload" {
+    # A copy mount, not a plain rw bind: rw writes through immediately, so
+    # it would pass regardless of when (or whether) writeback ran.
+    cat > "$PROJ/.sbx/profiles/fs/cp.json" <<EOF
+{"description":"test","mounts":[
+  {"source":"$HOSTDIR","dest":"/out","perm":"rw"},
+  {"source":"$ROOT/src","dest":"/copy","perm":"copy"}
+]}
+EOF
+    mkdir -p "$ROOT/src"
+
+    # Payload exits as soon as it is released; the join keeps running past
+    # that point and writes only after the payload is gone.
+    start_bg_sbx "--fs cp" "while [ ! -f /out/payload-go ]; do sleep 0.2; done"
+
+    ( cd "$PROJ" && script -qec "$SBX --join $BG_SESSION -- /bin/sh -c 'while [ ! -f /out/join-go ]; do sleep 0.2; done; echo late > /copy/late.txt; echo done > /out/join-done'" /dev/null >/dev/null 2>&1 ) &
+    local join_pid=$!
+
+    # Let the join reach its wait loop, then end the payload.
+    sleep 1
+    touch "$HOSTDIR/payload-go"
+    sleep 1
+
+    # The session must still be alive with the payload gone — that is the
+    # whole point of the PID-1 waiter.
+    [ -S "$BG_SDIR/tmux.sock" ]
+
+    touch "$HOSTDIR/join-go"
+    wait "$join_pid" 2>/dev/null || true
+    wait "$BG_PID" 2>/dev/null || true
+    BG_PID=""
+
+    [ -f "$HOSTDIR/join-done" ]
+    [ "$(cat "$BG_SDIR/fs/_copy/late.txt")" = "late" ]
+}
