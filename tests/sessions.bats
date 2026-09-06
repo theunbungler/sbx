@@ -260,3 +260,25 @@ EOF
     [[ "$output" == *"session socket path is too long"* ]]
     [[ "$output" != *"error connecting"* ]]
 }
+
+# The claim lock is meant to fail loudly, never silently. `flock -x 8`
+# failing already warns; but `exec 8>>"$CLAIM_LOCK"` failing is a distinct
+# failure path that must warn just as loudly, or a launch proceeds unlocked
+# with no sign anything is wrong — silently reintroducing the exact race
+# the lock exists to prevent. Make the open fail (not the flock) by
+# pre-creating claim.lock as a directory: `exec 8>>` on a directory fails
+# with EISDIR while $STATE_DIR itself stays writable, so the rest of the
+# launch can still proceed.
+@test "a launch still succeeds and warns when the claim lock cannot be opened" {
+    mkdir -p "$HOME/.local/state/sbx"
+    mkdir -p "$HOME/.local/state/sbx/claim.lock"
+    # script merges the wrapped command's stdout and stderr into the pty it
+    # drives, so redirecting script's own fd 2 does not capture the
+    # child's stderr — only the typescript file does.
+    local typescript="$ROOT/typescript.txt"
+    ( cd "$PROJ" && script -qec "$SBX --fs t -- /bin/sh -c 'echo up > /out/up.txt'" "$typescript" \
+        >/dev/null 2>&1 )
+    [ -f "$HOSTDIR/up.txt" ]
+    grep -aq "claim.lock" "$typescript"
+    grep -aqi "warning" "$typescript"
+}

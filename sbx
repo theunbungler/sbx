@@ -666,8 +666,22 @@ mkdir -p "$STATE_DIR/sessions" "$STATE_DIR/join"
 # join/.claim.lock. It is covered by the same --tmpfs mask as join/, and
 # --list-sessions ignores it because that requires a directory.
 CLAIM_LOCK="$STATE_DIR/claim.lock"
+# Both branches below must warn, and warn with the same specific
+# consequence, on failure. Failing to open the lock file is not a smaller
+# problem than failing to acquire it: either way the loop below runs
+# unlocked, silently reintroducing the exact race described above. A lock
+# whose open failure is invisible is not a lock.
+#
+# We still proceed rather than exit in either case. The race requires two
+# concurrent launches from the same directory, which is uncommon; refusing
+# to launch at all would instead break every single-launch user on a
+# filesystem whose flock is unsupported or whose state dir can't be opened
+# for append — common, and far worse than a warning. Making the degraded
+# state visible on stderr is the fix; declining to launch is not.
 if exec 8>>"$CLAIM_LOCK"; then
     flock -x 8 || echo "Warning: could not lock $CLAIM_LOCK; a concurrent launch may race for this name." >&2
+else
+    echo "Warning: could not open $CLAIM_LOCK; a concurrent launch may race for this name." >&2
 fi
 
 SESSION_NAME="$SESSION_BASE"
