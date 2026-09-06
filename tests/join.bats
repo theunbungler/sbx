@@ -36,7 +36,7 @@ start_bg_sbx() {
     BG_PID=$!
     local sock
     for _ in $(seq 100); do
-        sock=$(find "$HOME/.local/state/sbx" -maxdepth 2 -name tmux.sock 2>/dev/null | head -n1)
+        sock=$(find "$HOME/.local/state/sbx" -maxdepth 3 -name tmux.sock 2>/dev/null | head -n1)
         if [[ -S "$sock" ]]; then
             BG_SDIR=$(dirname "$sock")
             BG_SESSION=$(basename "$BG_SDIR")

@@ -188,25 +188,19 @@ while [[ $# -gt 0 ]]; do
             ;;
         --list-sessions)
             echo "Active Sessions (this directory):"
-            for sdir in "$STATE_DIR"/*; do
-                if [[ -d "$sdir" && -f "$sdir/session.json" ]]; then
-                    # session.json sits inside the session directory, which
-                    # is bound rw into the sandbox — treat every field as
-                    # attacker-authored and strip control characters before
-                    # echoing them to a terminal.
-                    scwd=$(jq -r '.cwd' "$sdir/session.json" | tr -d '\000-\037')
-                    if [[ "$scwd" == "$PWD" ]]; then
-                        sid=$(jq -r '.id' "$sdir/session.json" | tr -d '\000-\037')
-                        pid=$(jq -r '.pid // empty' "$sdir/session.json" | tr -d '\000-\037')
-                        # Validated, not merely non-empty: an unchecked $pid
-                        # reaching kill is a signal sent wherever the sandbox
-                        # chose.
-                        if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
-                            echo "  $sid (active, PID: $pid)"
-                        else
-                            echo "  $sid (inactive)"
-                        fi
-                    fi
+            for sdir in "$STATE_DIR"/sessions/*; do
+                [[ -d "$sdir" && -f "$sdir/session.json" ]] || continue
+                # session.json lives inside a directory bound rw into the
+                # sandbox — every field is attacker-authored. Strip control
+                # characters before echoing them to a terminal.
+                scwd=$(jq -r '.cwd' "$sdir/session.json" 2>/dev/null | tr -d '\000-\037')
+                [[ "$scwd" == "$PWD" ]] || continue
+                sid=$(jq -r '.id' "$sdir/session.json" 2>/dev/null | tr -d '\000-\037')
+                pid=$(jq -r '.pid // empty' "$sdir/session.json" 2>/dev/null | tr -d '\000-\037')
+                # Validated, not merely non-empty: an unchecked $pid
+                # reaching kill is a signal sent wherever the sandbox chose.
+                if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+                    echo "  $sid (PID: $pid)"
                 fi
             done
             exit 0
@@ -245,7 +239,7 @@ while [[ $# -gt 0 ]]; do
                 shift
                 JOIN_CMD=("$@")
             fi
-            SDIR="$STATE_DIR/$JOIN_SESSION"
+            SDIR="$STATE_DIR/sessions/$JOIN_SESSION"
             # -S, not -f: the server's rendezvous point is a unix socket,
             # which is never a regular file.
             if [[ ! -d "$SDIR" || ! -S "$SDIR/tmux.sock" ]]; then
@@ -272,7 +266,7 @@ while [[ $# -gt 0 ]]; do
             # in, so a file at this path is unreachable from inside.
             # Absent means the session was not launched by this sbx: fail
             # closed rather than guess at its capability policy.
-            JOIN_META="$STATE_DIR/$JOIN_SESSION.join.json"
+            JOIN_META="$STATE_DIR/join/$JOIN_SESSION.json"
             if [[ ! -f "$JOIN_META" ]]; then
                 echo "Error: Session '$JOIN_SESSION' has no join metadata; it was not started by this version of sbx." >&2
                 exit 1
@@ -286,7 +280,7 @@ while [[ $# -gt 0 ]]; do
             # true: the in-sandbox wait loop cannot guarantee it on its own,
             # because the payload can delete the socket or run
             # `tmux kill-server`. The fd survives the exec below on purpose.
-            JOIN_LOCK="$STATE_DIR/$JOIN_SESSION.joinlock"
+            JOIN_LOCK="$STATE_DIR/join/$JOIN_SESSION.lock"
             if exec 9>>"$JOIN_LOCK"; then
                 flock -s 9 || echo "Warning: could not lock $JOIN_LOCK; teardown may not wait for this join." >&2
             fi
@@ -319,7 +313,7 @@ while [[ $# -gt 0 ]]; do
         --attach)
             ATTACH_SESSION="$2"
             shift 2
-            SDIR="$STATE_DIR/$ATTACH_SESSION"
+            SDIR="$STATE_DIR/sessions/$ATTACH_SESSION"
             if [[ ! -d "$SDIR" || ! -S "$SDIR/tmux.sock" ]]; then
                 echo "Error: Session '$ATTACH_SESSION' not found or no socket available." >&2
                 exit 1
@@ -591,8 +585,45 @@ if [[ "$CAPS_KEEP" == "true" ]]; then
 fi
 
 # Session Initialization
-SESSION_ID=$(date +%Y%m%d-%H%M%S)-$(printf "%04x" $RANDOM)
-SESSION_DIR="$STATE_DIR/$SESSION_ID"
+#
+# Session name. Derived from the launch directory's basename, because the
+# thing a user types at --join should be recognisable; the old
+# date-plus-random id was unique and unusable. Capped at 32 characters: the
+# tmux socket lives at $SESSION_DIR/tmux.sock and a Unix socket path over
+# ~108 bytes fails quietly with "File name too long".
+#
+# Uniqueness is established by mkdir succeeding — an atomic claim, so two
+# simultaneous launches cannot both take a name. A directory whose
+# supervising pid is gone is crash residue, not a session: it is removed and
+# the name reclaimed.
+SESSION_BASE=$(printf '%s' "$(basename "$PWD")" |
+               tr '[:upper:]' '[:lower:]' |
+               tr -c 'a-z0-9._-' '-' |
+               cut -c1-32)
+SESSION_BASE="${SESSION_BASE#-}"
+SESSION_BASE="${SESSION_BASE%-}"
+[[ -z "$SESSION_BASE" ]] && SESSION_BASE="sbx"
+
+mkdir -p "$STATE_DIR/sessions" "$STATE_DIR/join"
+SESSION_NAME="$SESSION_BASE"
+session_n=1
+while ! mkdir "$STATE_DIR/sessions/$SESSION_NAME" 2>/dev/null; do
+    stale_pid=$(jq -r '.pid // empty' \
+        "$STATE_DIR/sessions/$SESSION_NAME/session.json" 2>/dev/null | tr -d '\000-\037')
+    if [[ ! "$stale_pid" =~ ^[0-9]+$ ]] || ! kill -0 "$stale_pid" 2>/dev/null; then
+        rm -rf "${STATE_DIR:?}/sessions/$SESSION_NAME"
+        continue
+    fi
+    session_n=$((session_n + 1))
+    if [[ $session_n -gt 99 ]]; then
+        echo "Error: too many live sessions named '$SESSION_BASE'." >&2
+        exit 1
+    fi
+    SESSION_NAME="$SESSION_BASE-$session_n"
+done
+
+SESSION_ID="$SESSION_NAME"   # retained: session.json's .id field
+SESSION_DIR="$STATE_DIR/sessions/$SESSION_NAME"
 mkdir -p "$SESSION_DIR/tmp"
 
 # Bwrap Arguments
@@ -1323,7 +1354,7 @@ EOF
 #   caps_keep informational: the drop is applied (or not) once at launch, in
 #             launch.sh, so --join does not consult this. Recorded so a
 #             capful join is explainable without re-deriving the profiles.
-cat > "$STATE_DIR/$SESSION_ID.join.json" <<EOF
+cat > "$STATE_DIR/join/$SESSION_ID.json" <<EOF
 {
     "path": $(jq -R . <<< "$SESSION_DIR/bin:$SANDBOX_PATH"),
     "workdir": $(jq -R . <<< "${WORKDIR:-$PWD}"),
@@ -1445,7 +1476,7 @@ teardown() {
     # on a path the sandbox cannot see (see the --join branch), so it holds
     # regardless of what happens inside. Bounded, never an unbounded block:
     # a stale lock must not be able to hang teardown forever.
-    JOIN_LOCK="$STATE_DIR/$SESSION_ID.joinlock"
+    JOIN_LOCK="$STATE_DIR/join/$SESSION_ID.lock"
     if exec 9>>"$JOIN_LOCK"; then
         if ! flock -w 30 -x 9; then
             echo "Warning: a --join still holds the session lock after 30s; archiving record-mount changes anyway." >&2
@@ -1479,10 +1510,11 @@ teardown() {
     fi
     rm -rf "$RECORD_WORK_DIR"
 
-    rm -f "$SESSION_DIR/tmux.sock" "$SESSION_DIR/tmux.conf" \
-          "$SESSION_DIR/session.sh" "$SESSION_DIR/wrapper.sh"
-    # Both live outside $SESSION_DIR; go once the session cannot be joined.
-    rm -f "$STATE_DIR/$SESSION_ID.join.json" "$JOIN_LOCK"
+    # Nothing durable lives here: forked stores, change archives and the
+    # join sidecar are all outside. Removing the directory outright is the
+    # whole fix for --list-sessions accumulating dead entries.
+    rm -rf "${SESSION_DIR:?}"
+    rm -f "$STATE_DIR/join/$SESSION_ID.json" "$JOIN_LOCK"
 
     if [[ -n "$XPRA_DISPLAY" ]]; then
         echo "Stopping xpra display $XPRA_DISPLAY..."

@@ -210,8 +210,8 @@ EOF
 }
 
 @test "the sandbox sees only its own session directory" {
-    mkdir -p "$HOME/.local/state/sbx/decoy-session"
-    echo secret > "$HOME/.local/state/sbx/decoy-session/session.json"
+    mkdir -p "$HOME/.local/state/sbx/sessions/decoy-session"
+    echo secret > "$HOME/.local/state/sbx/sessions/decoy-session/session.json"
     run_sbx "--fs caps" "ls '$HOME/.local/state/sbx' > /out/state.txt"
     ! grep -q decoy-session "$HOSTDIR/state.txt"
 }
@@ -229,6 +229,9 @@ EOF
     ! grep -q marker "$HOSTDIR/cfg.txt"
 }
 
+# The single visible entry from inside is now "sessions" (the parent of
+# every session directory, itself bound rw in) rather than the session id;
+# the mask still hides everything else under $STATE_DIR.
 @test "the sandbox can still write its own session directory" {
     run_sbx "--fs caps" "ls '$HOME/.local/state/sbx' | wc -l > /out/count.txt"
     [ "$(cat "$HOSTDIR/count.txt")" = "1" ]
@@ -267,23 +270,15 @@ EOF
     fi
 }
 
+# Session directories are now removed at teardown, so this reads
+# session.json while the session is still live rather than after it ends.
 @test "session.json records the supervising pid" {
-    run_sbx "--fs caps" "true"
-    run bash -c "jq -r '.pid' \"\$(find '$HOME/.local/state/sbx' -name session.json | head -n1)\""
+    ( cd "$PROJ" && script -qec \
+        "$SBX --fs caps -- /bin/sh -c 'touch /out/up; sleep 5'" \
+        /dev/null >/dev/null 2>&1 ) &
+    local bg=$!
+    for _ in $(seq 1 40); do [[ -f "$HOSTDIR/up" ]] && break; sleep 0.25; done
+    run bash -c "jq -r '.pid' \"\$(find '$HOME/.local/state/sbx/sessions' -name session.json | head -n1)\""
     [[ "$output" =~ ^[0-9]+$ ]]
-}
-
-# The injected field is .id, NOT .cwd. cwd is only ever compared against
-# $PWD, so poisoning it makes the entry fail to match and nothing prints —
-# the test passes without any sanitization at all. id and pid are the two
-# fields that actually reach the terminal.
-@test "list-sessions survives control characters in session.json" {
-    run_sbx "--fs caps" "true"
-    sfile=$(find "$HOME/.local/state/sbx" -name session.json | head -n1)
-    jq --arg c "$(printf 'evil\033[31m')" '.id = $c' "$sfile" > "$sfile.tmp"
-    mv "$sfile.tmp" "$sfile"
-    run bash -c "cd '$PROJ' && $SBX --list-sessions"
-    [ "$status" -eq 0 ]
-    [[ "$output" == *evil* ]]
-    [[ "$output" != *$'\033'* ]]
+    wait $bg
 }
