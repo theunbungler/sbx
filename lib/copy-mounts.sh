@@ -23,8 +23,9 @@ sbx_copy_path_slug() {
 #
 # --reflink=auto makes this metadata-only on btrfs/xfs when src and tmp
 # share a filesystem, and silently falls back to a full copy otherwise. On
-# the design host that is a 37x difference on 300MB (4ms vs 144ms) — worth
-# knowing if seeding ever feels slow: it means the fallback path is engaged.
+# the design host that is a 37x difference on 300MB (4ms vs 144ms). Callers
+# that want a progress display for the slow fallback path should use
+# sbx_copy_seed_progress below instead of calling this directly.
 sbx_copy_seed() {
     local src="$1" tmp="$2"
 
@@ -135,4 +136,77 @@ sbx_manifest_deleted() {
     LC_ALL=C comm -23 \
         <(cut -d' ' -f3- "$1" | LC_ALL=C sort) \
         <(cut -d' ' -f3- "$2" | LC_ALL=C sort)
+}
+
+# sbx_copy_seed, with a progress line for copies slow enough to look hung.
+#
+# Gated on BOTH a time threshold and stderr being a TTY, because the fast
+# path needs no instrumentation at all: a 300MB same-filesystem btrfs seed
+# is a reflink and completes in ~4ms, versus ~144ms with --reflink=never.
+# Progress is only ever wanted where reflink is unavailable, which is
+# exactly where it is slow. CI and pipelines print nothing.
+#
+# The numerator is rchar from /proc/<pid>/io — bytes the copy has consumed,
+# obtained without walking the filesystem. The denominator needs du -sb,
+# which is itself a full stat walk and can take seconds on a 9p mount like
+# WSL2's /mnt/c, so it runs CONCURRENTLY: the display starts as
+# bytes-plus-elapsed and upgrades to a percentage if and when du returns.
+# rchar counts directory reads too and so overshoots slightly; the
+# percentage is capped at 99 until the copy actually exits.
+sbx_copy_seed_progress() {
+    local src="$1" tmp="$2" label="$3"
+    local delay="${SBX_PROGRESS_DELAY:-1}"
+
+    mkdir -p "$tmp"
+    [[ -e "$src" ]] || return 0
+
+    local cp_pid du_pid du_out total="" start shown=0
+    du_out=$(mktemp)
+
+    if [[ -d "$src" ]]; then
+        cp -a --reflink=auto "$src/." "$tmp/" & cp_pid=$!
+    else
+        cp -a --reflink=auto "$src" "$tmp/" & cp_pid=$!
+    fi
+
+    # Written to directly, not through a `| cut` pipe: piping would make
+    # $! the pid of the pipe's last stage (cut), not du itself, and then
+    # `kill "$du_pid"` below would leave du orphaned on a slow stat walk
+    # instead of reaping it.
+    du -sb "$src" > "$du_out" 2>/dev/null & du_pid=$!
+    start=$SECONDS
+
+    while kill -0 "$cp_pid" 2>/dev/null; do
+        sleep 0.2
+        [[ -t 2 ]] || continue
+        (( SECONDS - start < delay )) && continue
+
+        if [[ -z "$total" ]] && ! kill -0 "$du_pid" 2>/dev/null; then
+            total=$(awk '{print $1}' "$du_out" 2>/dev/null) || true
+            [[ "$total" =~ ^[0-9]+$ ]] || total="unknown"
+        fi
+
+        local done_b
+        done_b=$(awk '/^rchar:/{print $2}' "/proc/$cp_pid/io" 2>/dev/null) || true
+        shown=1
+        if [[ -n "$total" && "$total" != unknown && -n "$done_b" && "$total" -gt 0 ]]; then
+            local pct=$(( done_b * 100 / total ))
+            (( pct > 99 )) && pct=99
+            printf '\r\033[K  %s: %d%% (%ds)' "$label" "$pct" "$(( SECONDS - start ))" >&2
+        elif [[ -n "$done_b" ]]; then
+            printf '\r\033[K  %s: %s copied (%ds)' \
+                "$label" "$(numfmt --to=iec "$done_b" 2>/dev/null || echo "$done_b B")" \
+                "$(( SECONDS - start ))" >&2
+        else
+            # /proc/<pid>/io unreadable — hardened procfs, or not Linux.
+            printf '\r\033[K  %s: working (%ds)' "$label" "$(( SECONDS - start ))" >&2
+        fi
+    done
+
+    wait "$cp_pid"; local rc=$?
+    kill "$du_pid" 2>/dev/null || true
+    wait "$du_pid" 2>/dev/null || true
+    rm -f "$du_out"
+    (( shown )) && printf '\r\033[K' >&2
+    return $rc
 }

@@ -169,3 +169,25 @@ setup() {
     [ "$output" = "double\\\\slash.txt" ]
     [ -f "$SRC/$output" ]
 }
+
+@test "seed_progress copies the tree like seed does" {
+    mkdir -p "$SRC/sub"
+    echo one > "$SRC/a.txt"
+    echo two > "$SRC/sub/b.txt"
+    sbx_copy_seed_progress "$SRC" "$TMP" "test" 2>/dev/null
+    [ "$(cat "$TMP/a.txt")" = "one" ]
+    [ "$(cat "$TMP/sub/b.txt")" = "two" ]
+}
+
+@test "seed_progress prints nothing when stderr is not a tty" {
+    echo one > "$SRC/a.txt"
+    run bash -c "source '$BATS_TEST_DIRNAME/../lib/copy-mounts.sh'; \
+                 SBX_PROGRESS_DELAY=0 sbx_copy_seed_progress '$SRC' '$TMP' test 2>&1"
+    [ -z "$output" ]
+}
+
+@test "seed_progress copies a single file" {
+    echo hi > "$WORK/one.txt"
+    sbx_copy_seed_progress "$WORK/one.txt" "$TMP" "test" 2>/dev/null
+    [ "$(cat "$TMP/one.txt")" = "hi" ]
+}

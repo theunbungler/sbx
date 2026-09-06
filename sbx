@@ -1304,7 +1304,7 @@ for fm in "${FORKED_MOUNTS[@]}"; do
 
     if [[ ! -e "$f_store" ]]; then
         mkdir -p "$f_store"
-        sbx_copy_seed "$f_src" "$f_store"
+        sbx_copy_seed_progress "$f_src" "$f_store" "Seeding $f_dest"
     fi
 
     if [[ -f "$f_src" ]]; then
@@ -1327,7 +1327,7 @@ for rm_ in "${RECORD_MOUNTS[@]}"; do
     r_work="$RECORD_WORK_DIR/$r_id"
 
     mkdir -p "$r_work"
-    sbx_copy_seed "$r_src" "$r_work"
+    sbx_copy_seed_progress "$r_src" "$r_work" "Seeding $r_dest"
     sbx_manifest_build "$r_work" "$RECORD_WORK_DIR/$r_id.manifest"
 
     if [[ -f "$r_src" ]]; then
@@ -1810,6 +1810,10 @@ teardown() {
     # deliberate) — it is the launch's own, and a caller has to be able to
     # tell "the sandbox never came up" apart from "the session ran".
     local exit_status=$?
+
+    # A seed interrupted mid-progress leaves a partial line on the terminal.
+    [[ -t 2 ]] && printf '\r\033[K' >&2
+
     echo "Tearing down session $SESSION_ID..."
 
     # The in-sandbox wait loop is not sufficient to keep writeback off a
