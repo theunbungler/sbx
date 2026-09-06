@@ -375,3 +375,232 @@ EOF
     [ "$status" -ne 0 ]
     [[ "$output" == *"Aborted"* ]]
 }
+
+# --- --gc and the claim lock ---
+
+make_fk_profile() {
+    mkdir -p "$PROJ/.sbx/profiles/cli"
+    cat > "$PROJ/.sbx/profiles/cli/fk.json" <<EOF
+{"description":"test","mounts":[{"source":"$HOSTDIR","dest":"/tmp/fkmount","perm":"forked"}]}
+EOF
+}
+
+# The claim is two steps — mkdir sessions/<name>, then write join/<name>.pid —
+# serialized by claim.lock precisely so nobody observes the gap. --gc is that
+# observer: a directory with no pid record is exactly what it calls crash
+# residue. Unlocked, it deletes a session that is mid-claim and very much
+# alive. Simulated here by holding claim.lock while the pid record is still
+# missing, then completing the claim before releasing.
+@test "gc waits for the claim lock instead of collecting a mid-claim session" {
+    mkdir -p "$HOME/.local/state/sbx/sessions/claiming" "$HOME/.local/state/sbx/join"
+    : > "$HOME/.local/state/sbx/claim.lock"
+    flock -x "$HOME/.local/state/sbx/claim.lock" \
+        -c "sleep 3; echo $$ > '$HOME/.local/state/sbx/join/claiming.pid'" &
+    local holder=$!
+    # Let the holder actually acquire the lock before --gc reaches for it.
+    sleep 0.5
+    run bash -c "cd '$PROJ' && $SBX --gc"
+    wait $holder
+    [ "$status" -eq 0 ]
+    [ -d "$HOME/.local/state/sbx/sessions/claiming" ]
+    [ -f "$HOME/.local/state/sbx/join/claiming.pid" ]
+}
+
+# The orphaned-sidecar sweep has the same blind spot from the other side: a
+# pid record whose session directory is not yet visible.
+@test "gc waits for the claim lock before sweeping orphaned sidecars" {
+    mkdir -p "$HOME/.local/state/sbx/join"
+    : > "$HOME/.local/state/sbx/claim.lock"
+    echo $$ > "$HOME/.local/state/sbx/join/claiming.pid"
+    flock -x "$HOME/.local/state/sbx/claim.lock" \
+        -c "sleep 3; mkdir -p '$HOME/.local/state/sbx/sessions/claiming'" &
+    local holder=$!
+    sleep 0.5
+    run bash -c "cd '$PROJ' && $SBX --gc"
+    wait $holder
+    [ "$status" -eq 0 ]
+    [ -f "$HOME/.local/state/sbx/join/claiming.pid" ]
+}
+
+@test "gc says nothing about forked stores when there are none" {
+    mkdir -p "$HOME/.local/state/sbx/forked"
+    run bash -c "cd '$PROJ' && $SBX --gc"
+    [ "$status" -eq 0 ]
+    if [[ "$output" == *"Forked stores"* ]]; then
+        echo "gc printed the forked-store header with nothing to report: $output" >&2
+        return 1
+    fi
+}
+
+# --- SBX_KEEP_CHANGES validation ---
+
+# Bash arithmetic reads a non-numeric word as an unset variable, i.e. 0, so
+# "+$((keep + 1))" becomes "tail -n +1" and every archive is pruned. A value
+# inherited from a project .envrc must never be able to do that.
+@test "a non-numeric SBX_KEEP_CHANGES prunes nothing and warns" {
+    local slug
+    slug=$(echo "$PROJ" | tr '/' '-')
+    for i in 1 2 3 4 5; do
+        mkdir -p "$HOME/.local/state/sbx/changes/$slug/2026090$i-000000-myproj"
+    done
+    run bash -c "cd '$PROJ' && SBX_KEEP_CHANGES=abc $SBX --gc"
+    [ "$status" -eq 0 ]
+    [ "$(find "$HOME/.local/state/sbx/changes/$slug" -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 5 ]
+    [[ "$output" == *"SBX_KEEP_CHANGES"* ]]
+}
+
+@test "a negative SBX_KEEP_CHANGES prunes nothing and warns" {
+    local slug
+    slug=$(echo "$PROJ" | tr '/' '-')
+    for i in 1 2 3 4 5; do
+        mkdir -p "$HOME/.local/state/sbx/changes/$slug/2026090$i-000000-myproj"
+    done
+    run bash -c "cd '$PROJ' && SBX_KEEP_CHANGES=-3 $SBX --gc"
+    [ "$status" -eq 0 ]
+    [ "$(find "$HOME/.local/state/sbx/changes/$slug" -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 5 ]
+    [[ "$output" != *"invalid number of lines"* ]]
+}
+
+# Bash evaluates command substitution inside an array subscript within
+# $(( )), so an unvalidated SBX_KEEP_CHANGES is arbitrary host-side code.
+@test "SBX_KEEP_CHANGES is never evaluated as arithmetic" {
+    local marker="$ROOT/PWNED"
+    run bash -c "cd '$PROJ' && SBX_KEEP_CHANGES='x[\$(touch $marker)]' $SBX --gc"
+    if [[ -e "$marker" ]]; then
+        echo "SBX_KEEP_CHANGES reached bash arithmetic and executed a command" >&2
+        return 1
+    fi
+}
+
+# The same unvalidated value reaches the teardown-time pruning, which runs on
+# every ordinary launch — no --gc required.
+@test "teardown pruning also ignores a non-numeric SBX_KEEP_CHANGES" {
+    local slug
+    slug=$(echo "$PROJ" | tr '/' '-')
+    for i in 1 2 3 4 5; do
+        mkdir -p "$HOME/.local/state/sbx/changes/$slug/2026090$i-000000-myproj"
+    done
+    mkdir -p "$PROJ/.sbx/profiles/fs"
+    cat > "$PROJ/.sbx/profiles/fs/rec.json" <<EOF
+{"description":"test","mounts":[{"source":"$HOSTDIR","dest":"/rec","perm":"record"}]}
+EOF
+    ( cd "$PROJ" && SBX_KEEP_CHANGES=abc script -qec \
+        "$SBX --fs rec -- /bin/sh -c 'echo x > /rec/x.txt'" /dev/null >/dev/null 2>&1 )
+    # The session's own archive is added, so five pre-existing ones must all
+    # still be there alongside it.
+    [ "$(find "$HOME/.local/state/sbx/changes/$slug" -mindepth 1 -maxdepth 1 -type d -name '*-000000-myproj' | wc -l)" -eq 5 ]
+}
+
+# --- --reseed and live sessions ---
+
+# A forked store is bind-mounted rw into the running sandbox. rm -rf on the
+# host empties it underneath the live process, destroying the auth tokens and
+# conversation history it is using right now.
+@test "the join sidecar records the forked stores the session mounted" {
+    make_fk_profile
+    ( cd "$PROJ" && script -qec \
+        "$SBX --cli fk --fs t -- /bin/sh -c 'echo up > /out/up.txt; sleep 6'" \
+        /dev/null >/dev/null 2>&1 ) &
+    local bg=$!
+    for _ in $(seq 1 60); do [[ -f "$HOSTDIR/up.txt" ]] && break; sleep 0.25; done
+    local store
+    store=$(find "$HOME/.local/state/sbx/forked" -mindepth 3 -maxdepth 3 -type d | head -n1)
+    [ -n "$store" ]
+    run jq -r '.forked_stores[]?' "$HOME/.local/state/sbx/join/myproj.json"
+    wait $bg
+    [[ "$output" == *"$store"* ]]
+}
+
+@test "reseed refuses while a live session lists the store in its sidecar" {
+    make_fk_profile
+    run_sbx "--cli fk --fs t" "true"
+    local store
+    store=$(find "$HOME/.local/state/sbx/forked" -mindepth 3 -maxdepth 3 -type d | head -n1)
+    [ -n "$store" ]
+    mkdir -p "$HOME/.local/state/sbx/sessions/holder" "$HOME/.local/state/sbx/join"
+    echo $$ > "$HOME/.local/state/sbx/join/holder.pid"
+    jq -n --arg s "$store" \
+        '{path:"/usr/bin",workdir:"/tmp",caps_keep:false,forked_stores:[$s]}' \
+        > "$HOME/.local/state/sbx/join/holder.json"
+    run bash -c "cd '$PROJ' && $SBX --cli fk --reseed --yes"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"holder"* ]]
+    [ -d "$store" ]
+}
+
+# The sidecar json is written long after the pid claim, so a session caught in
+# between is live with nothing recorded. Unknown must mean refuse: a refusal is
+# recoverable, deleting a live session's auth store is not.
+@test "reseed refuses when a live session has no sidecar yet" {
+    make_fk_profile
+    run_sbx "--cli fk --fs t" "true"
+    local store
+    store=$(find "$HOME/.local/state/sbx/forked" -mindepth 3 -maxdepth 3 -type d | head -n1)
+    [ -n "$store" ]
+    mkdir -p "$HOME/.local/state/sbx/sessions/starting" "$HOME/.local/state/sbx/join"
+    echo $$ > "$HOME/.local/state/sbx/join/starting.pid"
+    run bash -c "cd '$PROJ' && $SBX --cli fk --reseed --yes"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"starting"* ]]
+    [ -d "$store" ]
+}
+
+# The refusal must be about liveness, not about the sidecar existing: a dead
+# session's leftovers must not wedge --reseed forever.
+@test "reseed proceeds when the session listing the store is dead" {
+    make_fk_profile
+    run_sbx "--cli fk --fs t" "true"
+    local store
+    store=$(find "$HOME/.local/state/sbx/forked" -mindepth 3 -maxdepth 3 -type d | head -n1)
+    [ -n "$store" ]
+    mkdir -p "$HOME/.local/state/sbx/sessions/gone" "$HOME/.local/state/sbx/join"
+    echo 999999 > "$HOME/.local/state/sbx/join/gone.pid"
+    jq -n --arg s "$store" \
+        '{path:"/usr/bin",workdir:"/tmp",caps_keep:false,forked_stores:[$s]}' \
+        > "$HOME/.local/state/sbx/join/gone.json"
+    run bash -c "cd '$PROJ' && $SBX --cli fk --reseed --yes"
+    [ "$status" -eq 0 ]
+    [ ! -d "$store" ]
+}
+
+# What --reseed deletes is the store, so the prompt has to name it — dest and
+# source alone do not tell you what is about to go.
+@test "the reseed prompt names the store path and its size" {
+    make_fk_profile
+    run_sbx "--cli fk --fs t" "true"
+    local store
+    store=$(find "$HOME/.local/state/sbx/forked" -mindepth 3 -maxdepth 3 -type d | head -n1)
+    [ -n "$store" ]
+    run bash -c "cd '$PROJ' && $SBX --cli fk --reseed </dev/null"
+    [[ "$output" == *"$store"* ]]
+}
+
+# --reseed runs after the name claim but before the EXIT trap is installed, so
+# it exits leaving a session directory and pid record nobody will ever clean up.
+@test "reseed leaves no session claim behind" {
+    make_fk_profile
+    run bash -c "cd '$PROJ' && $SBX --cli fk --reseed --yes"
+    [ "$status" -eq 0 ]
+    if [[ -d "$HOME/.local/state/sbx/sessions/myproj" ]]; then
+        echo "reseed left a session directory behind" >&2
+        return 1
+    fi
+    if [[ -f "$HOME/.local/state/sbx/join/myproj.pid" ]]; then
+        echo "reseed left a pid record behind" >&2
+        return 1
+    fi
+}
+
+@test "an aborted reseed leaves no session claim behind" {
+    make_fk_profile
+    run bash -c "cd '$PROJ' && $SBX --cli fk --reseed </dev/null"
+    [ "$status" -ne 0 ]
+    if [[ -d "$HOME/.local/state/sbx/sessions/myproj" ]]; then
+        echo "an aborted reseed left a session directory behind" >&2
+        return 1
+    fi
+    if [[ -f "$HOME/.local/state/sbx/join/myproj.pid" ]]; then
+        echo "an aborted reseed left a pid record behind" >&2
+        return 1
+    fi
+}

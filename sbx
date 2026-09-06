@@ -17,6 +17,35 @@ XPRA_DISPLAY=""
 # Ensure state directory exists
 mkdir -p "$STATE_DIR"
 
+# Serializes every observation of the two-step session claim (see the claim
+# loop below for what the two steps are and why the gap between them must
+# never be seen). Defined here rather than beside the claim loop because
+# --gc, which runs during argument parsing, has to take the same lock: it is
+# exactly the observer the claim loop is protecting against.
+#
+# It lives directly under $STATE_DIR rather than in join/ because session
+# names may begin with "." — a session named ".claim" would collide with
+# join/.claim.lock. It is covered by the same --tmpfs mask as join/, and
+# --list-sessions ignores it because that requires a directory.
+CLAIM_LOCK="$STATE_DIR/claim.lock"
+
+# SBX_KEEP_CHANGES is inherited from the environment — plausibly from a
+# project .envrc — and reaches $(( )) in the archive pruning. Bash arithmetic
+# reads a non-numeric word as an unset variable, i.e. 0, which turns
+# "tail -n +$((keep + 1))" into "tail -n +1" and prunes EVERY archive; and it
+# expands command substitution inside an array subscript, so a value like
+# 'x[$(rm -rf ~)]' would run. Nothing may reach the arithmetic unvalidated,
+# and both pruning sites (--gc and teardown) go through here so the two can
+# never drift apart.
+sbx_keep_changes() {
+    local keep="${SBX_KEEP_CHANGES:-10}"
+    if [[ ! "$keep" =~ ^[0-9]+$ ]]; then
+        echo "Warning: ignoring non-numeric SBX_KEEP_CHANGES='$keep'; using 10." >&2
+        keep=10
+    fi
+    printf '%s\n' "$keep"
+}
+
 # One-time relocation of the pre-`forked` cli store. The old path is
 # $STATE_DIR/profiles/cli/<profile>/<slug>/<mount-id>, which is the same
 # shape the forked store uses, so this is a rename rather than a conversion
@@ -193,6 +222,29 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         --gc)
+            # Both sweeps below judge a session dead by the absence of a
+            # liveness record, which is exactly the intermediate state the
+            # claim loop hides behind this lock: between its mkdir and its
+            # pid write, a LIVE session looks like crash residue. Held
+            # across both sweeps rather than per entry — the per-entry work
+            # is a stat, a kill -0 and an rm -rf, and the claim loop already
+            # rm -rf's residue under this same lock, so the worst stall a
+            # launch can see here is the one the design already accepts.
+            #
+            # fd 8 is free: the claim loop uses 8 and teardown's join lock
+            # uses 9, and --gc exits before either runs.
+            #
+            # Warn and continue on failure, on both the open and the acquire
+            # path, exactly as the claim loop does: refusing to collect
+            # anything on a filesystem without working flock would be worse
+            # than collecting it unlocked, but a lock whose failure is
+            # invisible is not a lock.
+            if exec 8>>"$CLAIM_LOCK"; then
+                flock -x 8 || echo "Warning: could not lock $CLAIM_LOCK; a concurrent launch's session may be collected mid-claim." >&2
+            else
+                echo "Warning: could not open $CLAIM_LOCK; a concurrent launch's session may be collected mid-claim." >&2
+            fi
+
             for sdir in "$STATE_DIR"/sessions/*; do
                 [[ -d "$sdir" ]] || continue
                 sname=$(basename "$sdir")
@@ -234,7 +286,9 @@ while [[ $# -gt 0 ]]; do
                 rm -f "${sc:?}"
             done
 
-            keep="${SBX_KEEP_CHANGES:-10}"
+            exec 8>&-
+
+            keep=$(sbx_keep_changes)
             for cdir in "$STATE_DIR"/changes/*; do
                 [[ -d "$cdir" ]] || continue
                 find "$cdir" -mindepth 1 -maxdepth 1 -type d |
@@ -246,9 +300,15 @@ while [[ $# -gt 0 ]]; do
             # accumulated tool state, and deleting it on a heuristic is not
             # recoverable. Reported so the space is at least visible; use
             # --reseed to actually discard one.
-            if [[ -d "$STATE_DIR/forked" ]]; then
+            # The header is worth nothing without rows under it: forked/
+            # exists as soon as any store ever has, including after the last
+            # one is reseeded away, so "-d forked" alone announces a list
+            # that is empty. Collect first, print only if there is something
+            # to print.
+            forked_report=$(du -sh "$STATE_DIR"/forked/*/*/* 2>/dev/null | sed 's/^/  /')
+            if [[ -n "$forked_report" ]]; then
                 echo "Forked stores (not removed; use --reseed):"
-                du -sh "$STATE_DIR"/forked/*/*/* 2>/dev/null | sed 's/^/  /'
+                echo "$forked_report"
             fi
             exit 0
             ;;
@@ -733,13 +793,9 @@ mkdir -p "$STATE_DIR/sessions" "$STATE_DIR/join"
 # mkdir, so without serialization a competitor entering this loop in that
 # window sees a directory with no liveness record, calls a LIVE session
 # crash residue, and rm -rf's it. The lock is held across both steps so that
-# intermediate state is never observable.
+# intermediate state is never observable. $CLAIM_LOCK is defined at the top
+# of the script because --gc has to take the same lock.
 #
-# It lives directly under $STATE_DIR rather than in join/ because session
-# names may begin with "." — a session named ".claim" would collide with
-# join/.claim.lock. It is covered by the same --tmpfs mask as join/, and
-# --list-sessions ignores it because that requires a directory.
-CLAIM_LOCK="$STATE_DIR/claim.lock"
 # Both branches below must warn, and warn with the same specific
 # consequence, on failure. Failing to open the lock file is not a smaller
 # problem than failing to acquire it: either way the loop below runs
@@ -1030,6 +1086,7 @@ BWRAP_ARGS+=(--setenv DOCKER_HOST "unix://$PODMAN_SOCK")
 
 SKIPPED_MOUNTS=()  # profile mounts whose source is absent on this host
 FORKED_MOUNTS=()   # "profile<TAB>source<TAB>dest" — sandbox-owned, seeded once
+FORKED_STORES=()   # host store path per forked mount, filled by the seeding loop
 RECORD_MOUNTS=()   # "source<TAB>dest" — host-owned, reseeded, changes archived
 
 apply_mounts() {
@@ -1128,15 +1185,96 @@ if [[ ${#SKIPPED_MOUNTS[@]} -gt 0 ]]; then
     done
 fi
 
+# Where a forked mount's store lives on the host. Both --reseed and the
+# seeding loop below need this path, and they must never disagree about it:
+# --reseed deleting anything other than what the next launch would use is
+# either a no-op or a deletion of the wrong tree.
+sbx_forked_store() {   # <profile> <dest>
+    printf '%s\n' "$STATE_DIR/forked/$1/$(sbx_copy_path_slug "$PWD")/$(sbx_copy_mount_id "$2")"
+}
+
 if [[ "$RESEED" == "true" ]]; then
+    # Give the session name back before anything else. --reseed never
+    # launches, and the EXIT trap that would release the claim is installed
+    # much further down, so every exit below would otherwise strand
+    # sessions/<name> and its pid record — residue that a later --gc or claim
+    # reclaim has to clean up. Releasing here also keeps our own pid record
+    # out of the liveness scan below, which would otherwise see a live
+    # session with no sidecar yet — us — and refuse.
+    rm -rf "${SESSION_DIR:?}"
+    rm -f "${SESSION_PID_FILE:?}"
+
     if [[ ${#FORKED_MOUNTS[@]} -eq 0 ]]; then
         echo "No forked mounts in the selected profiles; nothing to reseed." >&2
         exit 1
     fi
-    echo "This will delete the sandbox-owned copies of:"
+
+    RESEED_TARGETS=()
     for fm in "${FORKED_MOUNTS[@]}"; do
         IFS=$'\t' read -r f_prof f_src f_dest <<< "$fm"
+        RESEED_TARGETS+=("$(sbx_forked_store "$f_prof" "$f_dest")")
+    done
+
+    # A store is bind-mounted rw into its session for as long as that session
+    # runs. rm -rf here would empty the tree underneath a live sandbox,
+    # destroying the auth tokens and history it is using at that moment — the
+    # exact state `forked` exists to accumulate. There is no way to derive
+    # which store a session holds after the fact (the key includes the launch
+    # directory, and session.json is sandbox-writable and so forgeable), so
+    # the mapping is read back from the host-written join sidecar, which
+    # lives in the tmpfs-masked join/ area and records it at launch.
+    RESEED_BLOCKER=""
+    for spid in "$STATE_DIR"/join/*.pid; do
+        [[ -f "$spid" ]] || continue
+        sname=$(basename "$spid" .pid)
+        lpid=""
+        read -r lpid < "$spid" || true
+        # Validated numeric before kill: an unchecked pid signals whoever it
+        # names.
+        if [[ ! "$lpid" =~ ^[0-9]+$ ]] || ! kill -0 "$lpid" 2>/dev/null; then
+            continue
+        fi
+        # The sidecar is written long after the pid claim, so a session
+        # caught in between is live with nothing recorded. Unknown means
+        # refuse, not "no conflict": a refusal is recoverable, deleting a
+        # live session's auth store is not.
+        if [[ ! -f "$STATE_DIR/join/$sname.json" ]]; then
+            RESEED_BLOCKER="$sname (still starting up — its mounts are not recorded yet)"
+            break
+        fi
+        while IFS= read -r lstore; do
+            [[ -n "$lstore" ]] || continue
+            for rt in "${RESEED_TARGETS[@]}"; do
+                if [[ "$lstore" == "$rt" ]]; then
+                    RESEED_BLOCKER="$sname"
+                fi
+            done
+        done < <(jq -r '.forked_stores[]?' "$STATE_DIR/join/$sname.json" 2>/dev/null || true)
+        if [[ -n "$RESEED_BLOCKER" ]]; then
+            break
+        fi
+    done
+    if [[ -n "$RESEED_BLOCKER" ]]; then
+        echo "Error: session '$RESEED_BLOCKER' is live and may have these stores mounted." >&2
+        echo "Refusing to reseed: deleting a store under a running session destroys the state it is using." >&2
+        echo "End that session and try again." >&2
+        exit 1
+    fi
+
+    # Name the store, not just the mount: the store is the thing being
+    # deleted, and its size is the only hint of how much accumulated state
+    # goes with it.
+    echo "This will delete the sandbox-owned copies of:"
+    for i in "${!FORKED_MOUNTS[@]}"; do
+        IFS=$'\t' read -r f_prof f_src f_dest <<< "${FORKED_MOUNTS[$i]}"
+        f_store="${RESEED_TARGETS[$i]}"
+        if [[ -d "$f_store" ]]; then
+            f_size=$(du -sh "$f_store" 2>/dev/null | cut -f1)
+        else
+            f_size="not yet created"
+        fi
         echo "  $f_dest  (re-seeded from $f_src)"
+        echo "    $f_store  [$f_size]"
     done
     if [[ "$ASSUME_YES" != "true" ]]; then
         # `|| true`: read exits non-zero on EOF (e.g. a non-interactive
@@ -1145,9 +1283,7 @@ if [[ "$RESEED" == "true" ]]; then
         read -r -p "Proceed? [y/N] " reply || true
         [[ "$reply" == [yY]* ]] || { echo "Aborted." >&2; exit 1; }
     fi
-    for fm in "${FORKED_MOUNTS[@]}"; do
-        IFS=$'\t' read -r f_prof f_src f_dest <<< "$fm"
-        f_store="$STATE_DIR/forked/$f_prof/$(sbx_copy_path_slug "$PWD")/$(sbx_copy_mount_id "$f_dest")"
+    for f_store in "${RESEED_TARGETS[@]}"; do
         rm -rf "${f_store:?}"
     done
     echo "Reseeded. The next launch will read from the host."
@@ -1161,8 +1297,10 @@ fi
 # write-back at teardown and nothing to diff.
 for fm in "${FORKED_MOUNTS[@]}"; do
     IFS=$'\t' read -r f_prof f_src f_dest <<< "$fm"
-    f_id=$(sbx_copy_mount_id "$f_dest")
-    f_store="$STATE_DIR/forked/$f_prof/$(sbx_copy_path_slug "$PWD")/$f_id"
+    f_store=$(sbx_forked_store "$f_prof" "$f_dest")
+    # Recorded for the join sidecar, which is what tells a later --reseed
+    # that this store belongs to a running session.
+    FORKED_STORES+=("$f_store")
 
     if [[ ! -e "$f_store" ]]; then
         mkdir -p "$f_store"
@@ -1549,11 +1687,21 @@ EOF
 #   caps_keep informational: the drop is applied (or not) once at launch, in
 #             launch.sh, so --join does not consult this. Recorded so a
 #             capful join is explainable without re-deriving the profiles.
+#   forked_stores
+#             the host paths this session has bind-mounted rw, so --reseed
+#             can refuse to rm -rf a store out from under a running sandbox.
+#             Recorded rather than derived because it cannot be recovered
+#             later: the store key is (profile, slug of the LAUNCH dir,
+#             mount id), and the only host-side record of a session's launch
+#             dir is session.json, which lives inside the sandbox and is
+#             therefore forgeable. workdir above is not a substitute — --wd
+#             makes it a different directory entirely.
 cat > "$STATE_DIR/join/$SESSION_ID.json" <<EOF
 {
     "path": $(jq -R . <<< "$SESSION_DIR/bin:$SANDBOX_PATH"),
     "workdir": $(jq -R . <<< "${WORKDIR:-$PWD}"),
-    "caps_keep": $([[ "$CAPS_KEEP" == "true" ]] && echo true || echo false)
+    "caps_keep": $([[ "$CAPS_KEEP" == "true" ]] && echo true || echo false),
+    "forked_stores": $(printf '%s\n' "${FORKED_STORES[@]}" | jq -R . | jq -s 'map(select(. != ""))')
 }
 EOF
 
@@ -1706,7 +1854,7 @@ teardown() {
         # Prune old archives here too, not only on an explicit --gc, so
         # they never accumulate unbounded just because nobody remembered to
         # run it.
-        keep="${SBX_KEEP_CHANGES:-10}"
+        keep=$(sbx_keep_changes)
         find "$STATE_DIR/changes/$(sbx_copy_path_slug "$PWD")" \
             -mindepth 1 -maxdepth 1 -type d 2>/dev/null |
             LC_ALL=C sort -r | tail -n "+$((keep + 1))" |
