@@ -68,6 +68,24 @@ EOF
     [[ "$output" == *record* ]]
 }
 
+@test "an unrecognized perm is rejected with a message naming it" {
+    cat > "$PROJ/.sbx/profiles/fs/bogus.json" <<EOF
+{"description":"test","mounts":[{"source":"$HOSTDIR","dest":"/tmp/o","perm":"bogus"}]}
+EOF
+    run bash -c "cd '$PROJ' && $SBX --fs bogus -- true 2>&1"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *bogus* ]]
+}
+
+@test "a mount missing perm entirely is rejected" {
+    cat > "$PROJ/.sbx/profiles/fs/noperm.json" <<EOF
+{"description":"test","mounts":[{"source":"$HOSTDIR","dest":"/tmp/o"}]}
+EOF
+    run bash -c "cd '$PROJ' && $SBX --fs noperm -- true 2>&1"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *null* ]]
+}
+
 @test "every shipped profile loads" {
     for p in "$BATS_TEST_DIRNAME"/../profiles/*/*.json; do
         run jq -e '[.mounts[]?.perm] | all(. == "ro" or . == "rw" or . == "dev" or . == "forked" or . == "record")' "$p"
@@ -81,6 +99,33 @@ EOF
     run_sbx "--cli fk" "cp /tmp/fkmount/old.txt /tmp/fkmount/seen.txt"
     [ "$(cat "$FORKED_ROOT/fk/$PROJ_SLUG/_tmp_fkmount/seen.txt")" = "carried" ]
     [ ! -d "$HOME/.local/state/sbx/profiles" ]
+}
+
+@test "a migration interrupted partway resumes on the next launch" {
+    # Simulate an interrupt after one profile's store already moved: forked/
+    # exists (with "moved" already in it) while a second store, "fk", is
+    # still stranded under profiles/cli/.
+    mkdir -p "$HOME/.local/state/sbx/forked/moved/$PROJ_SLUG/_tmp_fkmount"
+    echo already > "$HOME/.local/state/sbx/forked/moved/$PROJ_SLUG/_tmp_fkmount/x.txt"
+    mkdir -p "$HOME/.local/state/sbx/profiles/cli/fk/$PROJ_SLUG/_tmp_fkmount"
+    echo carried > "$HOME/.local/state/sbx/profiles/cli/fk/$PROJ_SLUG/_tmp_fkmount/old.txt"
+    run_sbx "--cli fk" "cp /tmp/fkmount/old.txt /tmp/fkmount/seen.txt"
+    [ "$(cat "$FORKED_ROOT/fk/$PROJ_SLUG/_tmp_fkmount/seen.txt")" = "carried" ]
+    [ "$(cat "$FORKED_ROOT/moved/$PROJ_SLUG/_tmp_fkmount/x.txt")" = "already" ]
+    [ ! -d "$HOME/.local/state/sbx/profiles" ]
+}
+
+@test "a store present in both old and new locations is not destroyed, and warns" {
+    mkdir -p "$HOME/.local/state/sbx/forked/fk/$PROJ_SLUG/_tmp_fkmount"
+    echo new_store > "$HOME/.local/state/sbx/forked/fk/$PROJ_SLUG/_tmp_fkmount/marker.txt"
+    OLD_STORE="$HOME/.local/state/sbx/profiles/cli/fk/$PROJ_SLUG/_tmp_fkmount"
+    mkdir -p "$OLD_STORE"
+    echo old_store > "$OLD_STORE/marker.txt"
+    OUT="$ROOT/collision.out"
+    ( cd "$PROJ" && script -qec "$SBX --cli fk -- /bin/sh -c true" /dev/null >"$OUT" 2>&1 )
+    [ "$(cat "$FORKED_ROOT/fk/$PROJ_SLUG/_tmp_fkmount/marker.txt")" = "new_store" ]
+    [ "$(cat "$OLD_STORE/marker.txt")" = "old_store" ]
+    grep -qF "$HOME/.local/state/sbx/profiles/cli/fk" "$OUT"
 }
 
 @test "a forked mount is seeded from the host on first launch" {

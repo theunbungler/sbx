@@ -136,7 +136,7 @@ CLI profiles configure the shell environment inside the sandbox. They control en
     "mounts": [
         {"source": "$HOME/.nvm", "dest": "$HOME/.nvm", "perm": "ro"},
         {"source": "$HOME/.npm-global", "dest": "$HOME/.npm-global", "perm": "ro"},
-        {"source": "$HOME/.pi", "dest": "$HOME/.pi", "perm": "copy"}
+        {"source": "$HOME/.pi", "dest": "$HOME/.pi", "perm": "forked"}
     ]
 }
 ```
@@ -163,15 +163,14 @@ Each entry in the `mounts` array has these fields:
 |-------|------|----------|-------------|
 | `source` | string | Yes | Host path. Supports `$HOME`, `$PWD`, and other environment variables via `envsubst`. |
 | `dest` | string | Yes | Destination path inside the sandbox. Also supports variable substitution. |
-| `perm` | string | Yes | Mount permission: one of `ro` (read-only bind), `rw` (read-write bind), `dev` (device bind, for files under `/dev`), or `copy` (writable snapshot — see below; behavior differs between fs and cli profiles) |
+| `perm` | string | Yes | Mount permission: one of `ro` (read-only bind), `rw` (read-write bind), `dev` (device bind, for files under `/dev`), `forked` (sandbox-owned, seeded from the host once — see below), or `record` (host-owned, reseeded every launch, changes archived — see below) |
 
 **Permission modes explained:**
 
 - **`ro`** — Read-only bind mount. The sandbox sees the host directory but cannot modify it.
 - **`rw`** — Read-write bind mount. Changes made inside the sandbox are reflected on the host.
-- **`copy`** — Writable snapshot. The source is copied into a session-local working directory at start and bound into the sandbox; the original host path is never modified. What happens to the changes depends on the profile type:
-  - In an **fs** profile, changes are **ephemeral**. At teardown, new or modified files are saved to `~/.local/state/sbx/<session-id>/fs/<mount_id>/` and nothing is carried into the next session.
-  - In a **cli** profile, changes are **persistent**. They are saved to `~/.local/state/sbx/profiles/cli/<profile-name>/<cwd-slug>/<mount_id>/` and replayed on top of the host copy the next time that profile is used *from the same directory*, so a CLI tool's sessions, history, and local config survive across sandboxes. `<cwd-slug>` is the directory you launched `sbx` from, so each project keeps its own persistent state.
+- **`forked`** — Sandbox-owned. The first time a given profile/mount is launched from a given directory, the source is copied into a persistent store at `~/.local/state/sbx/forked/<profile-name>/<cwd-slug>/<mount_id>/`, which is then bound straight into the sandbox. After that first seed, the host source is never consulted again — the store *is* the tree, edits and deletions inside the sandbox persist there across launches, and later changes to the host original have no effect on it. This is what lets `sbx --cli claude` keep the sessions, history, and auth it accumulated last time. `<cwd-slug>` is the launch directory (`$PWD`) with slashes dashed, so each project gets its own store.
+- **`record`** — Host-owned. A private working copy is seeded fresh from the host source on *every* launch, and bound into the sandbox; the sandbox never touches the host original. At teardown, files the session created or modified (relative to that launch's seed) are archived to `~/.local/state/sbx/changes/<cwd-slug>/<stamp>-<session-id>/<mount_id>/`, and deletions are listed in a sibling `<mount_id>.deleted` file — see [Forked and Record Mounts](#forked-and-record-mounts) below and `--changes`.
 - **`dev`** — Device bind mount (`--dev-bind`). Like `rw`, but allows device-node access (a plain `ro`/`rw` bind mounts `nodev`, so opening a device file would fail). Used for things like `/dev/kvm` and `/dev/net/tun`.
 
 **Example:**
@@ -274,43 +273,40 @@ A profile that still carries `workingDirectory` is not honored; sbx warns and na
 3. Create a JSON file at `<location>/<type>/<name>.json`.
 4. Verify it appears with `./sbx --list-profiles`.
 
-## Copy Mount Egress
+## Forked and Record Mounts
 
-With `copy` mounts, the sandbox isolates changes from the host. At teardown, `sbx` compares the working copy against the **original host source** and saves only the files that are **new or modified**. Where they are saved depends on the profile the mount was declared in.
+`forked` and `record` mounts both isolate the sandbox from the host — the original host directory is never modified by either — but they disagree about who owns the data afterward.
 
-**fs profiles — ephemeral.** Changes go to `~/.local/state/sbx/<session-id>/fs/<mount_id>/` and stay there. Each session starts from the host's state.
+**`forked` — sandbox-owned.** The first launch of a given profile/mount from a given directory copies the host source into a persistent store at `~/.local/state/sbx/forked/<profile-name>/<cwd-slug>/<mount_id>/` and binds that store straight into the sandbox. Every later launch of the same profile from the same directory reuses that store directly — the host source is never re-read, so host-side edits made after the first seed simply don't show up, and deletions made inside the sandbox stay deleted. This is what lets `sbx --cli claude` keep the sessions, history, and auth tokens it accumulated last time. `<cwd-slug>` is the launch directory (`$PWD`) with slashes dashed, so each project keeps its own store; `<mount_id>` is the sandbox destination path, also slashes-to-underscores.
 
-**cli profiles — persistent.** Changes go to `~/.local/state/sbx/profiles/cli/<profile-name>/<cwd-slug>/<mount_id>/`, and the next session using that profile *from the same directory* overlays this store on top of a fresh copy of the host source. This is what lets `sbx --cli claude` resume with the sessions and history it accumulated last time. `<cwd-slug>` is the launch directory (`$PWD`) with slashes dashed, so different projects get independent stores.
+To start a profile over from a clean host copy, delete its store: `~/.local/state/sbx/forked/<profile-name>/<cwd-slug>/`. Other directories' stores for the same profile are unaffected.
 
-In both cases:
-- The **original host directory is never modified**.
-- Only **changed files** are written; the comparison baseline is always the host source, never the store.
-- The egress uses `rsync --compare-dest` when available, otherwise a file-by-file size and timestamp comparison.
-- The session's temporary working copies are cleaned up afterwards.
+**`record` — host-owned.** A private working copy is seeded fresh from the host source on *every* launch (in `~/.local/state/sbx/work/<session-id>/`, removed at teardown), so the sandbox always starts from current host state. At teardown, `sbx` diffs the working copy against a manifest taken right after that launch's seed — not against the live host source, so a host-side edit made while the session was running can never be misattributed to the sandbox. Files the session created or modified are archived to `~/.local/state/sbx/changes/<cwd-slug>/<stamp>-<session-id>/<mount_id>/`, and anything the session deleted is listed (one path per line) in a sibling `<mount_id>.deleted` file. Nothing is replayed into the next launch — `record` mounts always start clean from the host.
 
-**Persistent store behavior.** Two consequences follow from the overlay model and are intentional:
+Use `./sbx --changes [<id>]` to inspect the most recent (or a named) archive for the current directory; it prints the archive path followed by each changed file (`+`) and deleted path (`-`).
 
-- **Deletions do not persist.** A file deleted inside the sandbox is restored from the host on the next launch — the host directory is the floor. If you want it gone, delete it from the store.
-- **Written files shadow the host.** Once a session writes a given file, the store's version wins on every later launch, so subsequent host-side edits to *that file* are not seen. Host changes to files the sandbox has never touched still come through normally. To start over, delete this directory's store (`~/.local/state/sbx/profiles/cli/<profile-name>/<cwd-slug>/`); other directories' stores for the same profile are unaffected.
-
-The store key is the profile name plus the launch directory: `sbx --cli claude` resumes only when re-run from the same directory, and two directories keep independent stores. Concurrent sessions from the same directory are allowed and are not locked — write-back is per file, and the last session to tear down wins for any file it changed. This matches how the CLI tools already behave across concurrent sessions on the host.
+Both permissions use `rsync --compare-dest` for the diff when available, falling back to a file-by-file size and timestamp comparison otherwise.
 
 **Example directory structure:**
 
 ```
 ~/.local/state/sbx/
-  20260627-143000-0001/
-    session.json
-    fs/
-      _home_user_myproject/    # ephemeral egress from an fs profile copy mount
-  profiles/
-    cli/
-      claude/
-        -home-user-projA/          # store for `--cli claude` launched from ~/projA
-          _home_user_.claude/
-          _home_user_.claude.json
-        -home-user-projB/          # independent store for the same profile in ~/projB
-          _home_user_.claude/
+  work/
+    20260627-143000-0001/           # a record mount's working copy, live only for the session
+      _tmp_recmount/
+  changes/
+    -home-user-projA/               # record archives, keyed by launch directory
+      20260627-143512-20260627-143000-0001/
+        _tmp_recmount/
+          new.txt
+        _tmp_recmount.deleted
+  forked/
+    claude/
+      -home-user-projA/             # store for `--cli claude` launched from ~/projA
+        _home_user_.claude/
+        _home_user_.claude.json
+      -home-user-projB/             # independent store for the same profile in ~/projB
+        _home_user_.claude/
 ```
 
 ## GUI Attachment

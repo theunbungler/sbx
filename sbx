@@ -22,10 +22,24 @@ mkdir -p "$STATE_DIR"
 # shape the forked store uses, so this is a rename rather than a conversion
 # — the contents are already a valid sandbox-owned tree. ("profiles/" was
 # always a poor name for state; nothing else lives under it.)
-if [[ -d "$STATE_DIR/profiles/cli" && ! -d "$STATE_DIR/forked" ]]; then
-    mkdir -p "$STATE_DIR/forked"
+#
+# The guard is per-entry, not "does forked/ exist": forked/ is created by
+# ordinary use (or by moving the very first entry below), so an "absent"
+# check on it can only ever fire once and then never again. That turned an
+# interrupted migration into a permanent one — stores after the first would
+# be stranded under profiles/cli forever. Testing each destination
+# individually makes this resumable: an interrupt just means the next
+# launch finishes what the last one started.
+if [[ -d "$STATE_DIR/profiles/cli" ]]; then
     for old_store in "$STATE_DIR/profiles/cli"/*; do
-        [[ -d "$old_store" ]] && mv "$old_store" "$STATE_DIR/forked/"
+        [[ -d "$old_store" ]] || continue
+        new_store="$STATE_DIR/forked/$(basename "$old_store")"
+        if [[ -e "$new_store" ]]; then
+            echo "Warning: both $old_store and $new_store exist; leaving the old store in place — reconcile manually." >&2
+            continue
+        fi
+        mkdir -p "$STATE_DIR/forked"
+        mv "$old_store" "$new_store"
     done
     rmdir "$STATE_DIR/profiles/cli" "$STATE_DIR/profiles" 2>/dev/null || true
 fi
@@ -267,11 +281,11 @@ while [[ $# -gt 0 ]]; do
             JOIN_WD=$(jq -r '.workdir' "$JOIN_META")
             # Held for the whole life of the join, and released by the kernel
             # when this process finally exits. teardown() takes the same lock
-            # exclusively before copy-writeback, which is what makes
-            # "writeback never overlaps a live join" actually true: the
-            # in-sandbox wait loop cannot guarantee it on its own, because
-            # the payload can delete the socket or run `tmux kill-server`.
-            # The fd survives the exec below on purpose.
+            # exclusively before archiving record-mount changes, which is
+            # what makes "the archive never overlaps a live join" actually
+            # true: the in-sandbox wait loop cannot guarantee it on its own,
+            # because the payload can delete the socket or run
+            # `tmux kill-server`. The fd survives the exec below on purpose.
             JOIN_LOCK="$STATE_DIR/$JOIN_SESSION.joinlock"
             if exec 9>>"$JOIN_LOCK"; then
                 flock -s 9 || echo "Warning: could not lock $JOIN_LOCK; teardown may not wait for this join." >&2
@@ -819,7 +833,7 @@ FORKED_MOUNTS=()   # "profile<TAB>source<TAB>dest" — sandbox-owned, seeded onc
 RECORD_MOUNTS=()   # "source<TAB>dest" — host-owned, reseeded, changes archived
 
 apply_mounts() {
-    local profile="$1" kind="${2:-fs}"
+    local profile="$1"
     local profile_name
     profile_name=$(basename "$profile" .json)
     # Use jq to extract mounts
@@ -897,11 +911,11 @@ apply_mounts() {
 }
 
 for profile in "${FS_PROFILES[@]}"; do
-    apply_mounts "$profile" fs
+    apply_mounts "$profile"
 done
 
 if [[ -n "$CLI_PROFILE" ]]; then
-    apply_mounts "$CLI_PROFILE" cli
+    apply_mounts "$CLI_PROFILE"
 fi
 
 # A -try mount that finds nothing is dropped without a word from bwrap, which
@@ -1434,7 +1448,7 @@ teardown() {
     JOIN_LOCK="$STATE_DIR/$SESSION_ID.joinlock"
     if exec 9>>"$JOIN_LOCK"; then
         if ! flock -w 30 -x 9; then
-            echo "Warning: a --join still holds the session lock after 30s; running write-back anyway." >&2
+            echo "Warning: a --join still holds the session lock after 30s; archiving record-mount changes anyway." >&2
         fi
     fi
 
@@ -1697,11 +1711,12 @@ EOF
 # live session with it, joins included. Instead it hangs around until the
 # server is gone, which (with exit-empty on) means the last session — payload
 # or join, whichever ends last — has exited. Only then does bwrap return and
-# launch.sh proceed to copy-writeback. Note what this does and does not
-# promise: it keeps the sandbox alive for joins the payload has finished
-# outliving, but it is not itself a guarantee that write-back never overlaps
-# a live join. Its liveness test is socket connectivity, and the payload can
-# delete the socket or run `tmux kill-server` — it can end its own sandbox
+# launch.sh proceed to teardown and the record-mount change archive. Note
+# what this does and does not promise: it keeps the sandbox alive for joins
+# the payload has finished outliving, but it is not itself a guarantee that
+# the archive never overlaps a live join. Its liveness test is socket
+# connectivity, and the payload can delete the socket or run
+# `tmux kill-server` — it can end its own sandbox
 # whenever it likes, taking any live join with it. The host-side flock in
 # teardown() is what makes the no-overlap property true.
 #

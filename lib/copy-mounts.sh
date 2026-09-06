@@ -19,12 +19,12 @@ sbx_copy_path_slug() {
     echo "$1" | tr '/' '-'
 }
 
-# Populate a copy mount's working directory from the host source.
+# Populate a forked or record mount's working directory from the host source.
 #
 # --reflink=auto makes this metadata-only on btrfs/xfs when src and tmp
 # share a filesystem, and silently falls back to a full copy otherwise. On
-# the design host that is a 37x difference on 300MB (4ms vs 144ms), which
-# is why setup progress reporting only ever engages on the fallback path.
+# the design host that is a 37x difference on 300MB (4ms vs 144ms) — worth
+# knowing if seeding ever feels slow: it means the fallback path is engaged.
 sbx_copy_seed() {
     local src="$1" tmp="$2"
 
