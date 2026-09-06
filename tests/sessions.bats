@@ -93,3 +93,23 @@ EOF
     [[ "$output" == *evil* ]]
     [[ "$output" != *$'\033'* ]]
 }
+
+# session.json lives in a directory bound rw into the sandbox, so its
+# contents are attacker-authored — they may be truncated, empty, binary, or
+# not JSON at all. One unreadable entry must not take out the listing for
+# every other live session.
+@test "a malformed session.json does not break list-sessions for other sessions" {
+    mkdir -p "$HOME/.local/state/sbx/sessions/garbage"
+    printf 'not json at all\0\xff' > "$HOME/.local/state/sbx/sessions/garbage/session.json"
+    mkdir -p "$HOME/.local/state/sbx/sessions/goodproj"
+    jq -n --arg cwd "$PROJ" --argjson pid "$$" \
+        '{id:"goodproj", cwd:$cwd, pid:$pid, fs_profiles:[], net_profiles:[], cli_profile:null}' \
+        > "$HOME/.local/state/sbx/sessions/goodproj/session.json"
+    run bash -c "cd '$PROJ' && $SBX --list-sessions"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *goodproj* ]]
+    if [[ -z "$output" ]]; then
+        echo "list-sessions produced no output at all" >&2
+        return 1
+    fi
+}
