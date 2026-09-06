@@ -196,9 +196,17 @@ while [[ $# -gt 0 ]]; do
                 scwd=$(jq -r '.cwd' "$sdir/session.json" 2>/dev/null | tr -d '\000-\037')
                 [[ "$scwd" == "$PWD" ]] || continue
                 sid=$(jq -r '.id' "$sdir/session.json" 2>/dev/null | tr -d '\000-\037')
-                pid=$(jq -r '.pid // empty' "$sdir/session.json" 2>/dev/null | tr -d '\000-\037')
+                # Liveness comes from the pid record in the masked join/
+                # area, not from session.json: the sandbox can rewrite its
+                # own session.json to claim any pid it likes, or delete it
+                # to feign death. Only display fields come from inside.
+                pid=""
+                spidf="$STATE_DIR/join/$(basename "$sdir").pid"
+                if [[ -f "$spidf" ]]; then
+                    read -r pid < "$spidf" || true
+                fi
                 # Validated, not merely non-empty: an unchecked $pid
-                # reaching kill is a signal sent wherever the sandbox chose.
+                # reaching kill is a signal sent wherever it names.
                 if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
                     echo "  $sid (PID: $pid)"
                 fi
@@ -238,6 +246,17 @@ while [[ $# -gt 0 ]]; do
             if [[ "${1-}" == "--" ]]; then
                 shift
                 JOIN_CMD=("$@")
+            fi
+            # The name is typed by hand and interpolated into several paths
+            # under $STATE_DIR, so "--join ../x" would reach outside
+            # sessions/ and join/. Same character set the launch-time
+            # derivation produces, minus "." and ".." which name directories
+            # rather than sessions. Inline rather than a helper: argument
+            # parsing runs before any function in this script is defined.
+            if [[ ! "$JOIN_SESSION" =~ ^[a-z0-9._-]+$ ||
+                  "$JOIN_SESSION" == "." || "$JOIN_SESSION" == ".." ]]; then
+                echo "Error: Invalid session name '$JOIN_SESSION'." >&2
+                exit 1
             fi
             SDIR="$STATE_DIR/sessions/$JOIN_SESSION"
             # -S, not -f: the server's rendezvous point is a unix socket,
@@ -313,6 +332,12 @@ while [[ $# -gt 0 ]]; do
         --attach)
             ATTACH_SESSION="$2"
             shift 2
+            # Same validation as --join, and for the same reason.
+            if [[ ! "$ATTACH_SESSION" =~ ^[a-z0-9._-]+$ ||
+                  "$ATTACH_SESSION" == "." || "$ATTACH_SESSION" == ".." ]]; then
+                echo "Error: Invalid session name '$ATTACH_SESSION'." >&2
+                exit 1
+            fi
             SDIR="$STATE_DIR/sessions/$ATTACH_SESSION"
             if [[ ! -d "$SDIR" || ! -S "$SDIR/tmux.sock" ]]; then
                 echo "Error: Session '$ATTACH_SESSION' not found or no socket available." >&2
@@ -588,9 +613,10 @@ fi
 #
 # Session name. Derived from the launch directory's basename, because the
 # thing a user types at --join should be recognisable; the old
-# date-plus-random id was unique and unusable. Capped at 32 characters: the
-# tmux socket lives at $SESSION_DIR/tmux.sock and a Unix socket path over
-# ~108 bytes fails quietly with "File name too long".
+# date-plus-random id was unique and unusable. Capped at 32 characters to
+# keep the tmux socket at $SESSION_DIR/tmux.sock inside the ~108-byte Unix
+# socket path limit; the cap alone does not guarantee that (a long $HOME
+# still can), so the length is checked outright below.
 #
 # Uniqueness is established by mkdir succeeding — an atomic claim, so two
 # simultaneous launches cannot both take a name. A directory whose
@@ -602,16 +628,65 @@ SESSION_BASE=$(printf '%s' "$(basename "$PWD")" |
                cut -c1-32)
 SESSION_BASE="${SESSION_BASE#-}"
 SESSION_BASE="${SESSION_BASE%-}"
-[[ -z "$SESSION_BASE" ]] && SESSION_BASE="sbx"
+# "." and ".." are directory names too, and a launch directory called "-.."
+# trims to "..". $STATE_DIR/sessions/.. is $STATE_DIR itself, so teardown's
+# rm -rf would aim at all of sbx's state; it fails closed today only because
+# POSIX rm refuses to remove "." and "..", which no refactor is obliged to
+# preserve. Fall back to the default name, as the empty case does.
+if [[ -z "$SESSION_BASE" || "$SESSION_BASE" == "." || "$SESSION_BASE" == ".." ]]; then
+    SESSION_BASE="sbx"
+fi
+
+# A Unix socket path over ~108 bytes fails at bind() with "File name too
+# long", and the failure surfaces only as tmux refusing to connect long
+# after a session directory exists. Check the worst case — the widest
+# numeric suffix the claim loop can append — before claiming anything, so a
+# long $HOME produces one clear error instead of a mystery.
+SOCK_PROBE="$STATE_DIR/sessions/$SESSION_BASE-99/tmux.sock"
+if [[ ${#SOCK_PROBE} -gt 100 ]]; then
+    echo "Error: session socket path is too long (${#SOCK_PROBE} bytes, limit 100):" >&2
+    echo "  $SOCK_PROBE" >&2
+    echo "  A Unix socket path this long cannot be bound. Use a shorter \$HOME." >&2
+    exit 1
+fi
 
 mkdir -p "$STATE_DIR/sessions" "$STATE_DIR/join"
+
+# Claiming a name is two steps that must look like one: mkdir takes the
+# name, and the pid record proves the taker is alive. Everything between
+# here and session.json — profile parsing, xpra setup, the whole copy-mount
+# seeding, which on a large record tree is minutes — happens after the
+# mkdir, so without serialization a competitor entering this loop in that
+# window sees a directory with no liveness record, calls a LIVE session
+# crash residue, and rm -rf's it. The lock is held across both steps so that
+# intermediate state is never observable.
+#
+# It lives directly under $STATE_DIR rather than in join/ because session
+# names may begin with "." — a session named ".claim" would collide with
+# join/.claim.lock. It is covered by the same --tmpfs mask as join/, and
+# --list-sessions ignores it because that requires a directory.
+CLAIM_LOCK="$STATE_DIR/claim.lock"
+if exec 8>>"$CLAIM_LOCK"; then
+    flock -x 8 || echo "Warning: could not lock $CLAIM_LOCK; a concurrent launch may race for this name." >&2
+fi
+
 SESSION_NAME="$SESSION_BASE"
 session_n=1
 while ! mkdir "$STATE_DIR/sessions/$SESSION_NAME" 2>/dev/null; do
-    stale_pid=$(jq -r '.pid // empty' \
-        "$STATE_DIR/sessions/$SESSION_NAME/session.json" 2>/dev/null | tr -d '\000-\037')
+    # Liveness comes from join/<name>.pid, never from session.json: that
+    # file lives inside a directory bound rw into the sandbox, so a payload
+    # can delete or rewrite it and make its own running session present as
+    # residue to the next launch, which would then delete it. The pid
+    # record is in the masked join/ area, unreachable from inside.
+    # Validated numeric before kill: an unchecked pid signals whoever it
+    # names.
+    stale_pid=""
+    if [[ -f "$STATE_DIR/join/$SESSION_NAME.pid" ]]; then
+        read -r stale_pid < "$STATE_DIR/join/$SESSION_NAME.pid" || true
+    fi
     if [[ ! "$stale_pid" =~ ^[0-9]+$ ]] || ! kill -0 "$stale_pid" 2>/dev/null; then
         rm -rf "${STATE_DIR:?}/sessions/$SESSION_NAME"
+        rm -f "${STATE_DIR:?}/join/$SESSION_NAME.pid"
         continue
     fi
     session_n=$((session_n + 1))
@@ -622,8 +697,14 @@ while ! mkdir "$STATE_DIR/sessions/$SESSION_NAME" 2>/dev/null; do
     SESSION_NAME="$SESSION_BASE-$session_n"
 done
 
+# Still under the lock: the claim is not complete until the name has a
+# liveness record to go with it.
+printf '%s\n' "$$" > "$STATE_DIR/join/$SESSION_NAME.pid"
+exec 8>&-
+
 SESSION_ID="$SESSION_NAME"   # retained: session.json's .id field
 SESSION_DIR="$STATE_DIR/sessions/$SESSION_NAME"
+SESSION_PID_FILE="$STATE_DIR/join/$SESSION_NAME.pid"
 mkdir -p "$SESSION_DIR/tmp"
 
 # Bwrap Arguments
@@ -1514,7 +1595,7 @@ teardown() {
     # join sidecar are all outside. Removing the directory outright is the
     # whole fix for --list-sessions accumulating dead entries.
     rm -rf "${SESSION_DIR:?}"
-    rm -f "$STATE_DIR/join/$SESSION_ID.json" "$JOIN_LOCK"
+    rm -f "$STATE_DIR/join/$SESSION_ID.json" "$JOIN_LOCK" "$SESSION_PID_FILE"
 
     if [[ -n "$XPRA_DISPLAY" ]]; then
         echo "Stopping xpra display $XPRA_DISPLAY..."

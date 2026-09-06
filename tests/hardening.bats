@@ -212,7 +212,10 @@ EOF
 @test "the sandbox sees only its own session directory" {
     mkdir -p "$HOME/.local/state/sbx/sessions/decoy-session"
     echo secret > "$HOME/.local/state/sbx/sessions/decoy-session/session.json"
-    run_sbx "--fs caps" "ls '$HOME/.local/state/sbx' > /out/state.txt"
+    # List sessions/, not $STATE_DIR: since session directories moved under
+    # sessions/, $STATE_DIR's only visible entry is "sessions" itself and the
+    # decoy could never appear there whether masking worked or not.
+    run_sbx "--fs caps" "ls '$HOME/.local/state/sbx/sessions' > /out/state.txt"
     ! grep -q decoy-session "$HOSTDIR/state.txt"
 }
 
