@@ -282,3 +282,96 @@ EOF
     grep -aq "claim.lock" "$typescript"
     grep -aqi "warning" "$typescript"
 }
+
+# --- --gc ---
+
+@test "gc removes crash residue" {
+    mkdir -p "$HOME/.local/state/sbx/sessions/dead" "$HOME/.local/state/sbx/join"
+    echo 999999 > "$HOME/.local/state/sbx/join/dead.pid"
+    run bash -c "cd '$PROJ' && $SBX --gc"
+    [ "$status" -eq 0 ]
+    [ ! -d "$HOME/.local/state/sbx/sessions/dead" ]
+}
+
+@test "gc leaves a live session alone" {
+    mkdir -p "$HOME/.local/state/sbx/sessions/alive" "$HOME/.local/state/sbx/join"
+    echo $$ > "$HOME/.local/state/sbx/join/alive.pid"
+    run bash -c "cd '$PROJ' && $SBX --gc"
+    [ "$status" -eq 0 ]
+    [ -d "$HOME/.local/state/sbx/sessions/alive" ]
+}
+
+# session.json lives in a directory bound rw into the sandbox, so a payload
+# can forge or delete it to make its own live session look dead. --gc must
+# never trust it: liveness comes only from the out-of-band join/<name>.pid.
+@test "gc ignores a forged session.json and trusts the out-of-band pid record" {
+    mkdir -p "$HOME/.local/state/sbx/sessions/liar" "$HOME/.local/state/sbx/join"
+    jq -n --argjson pid 999999 '{id:"liar",cwd:"/nope",pid:$pid}' \
+        > "$HOME/.local/state/sbx/sessions/liar/session.json"
+    echo $$ > "$HOME/.local/state/sbx/join/liar.pid"
+    run bash -c "cd '$PROJ' && $SBX --gc"
+    [ "$status" -eq 0 ]
+    [ -d "$HOME/.local/state/sbx/sessions/liar" ]
+}
+
+@test "gc removes orphaned join sidecars but leaves a live session's alone" {
+    mkdir -p "$HOME/.local/state/sbx/sessions/alive" "$HOME/.local/state/sbx/join"
+    echo $$ > "$HOME/.local/state/sbx/join/alive.pid"
+    echo '{}' > "$HOME/.local/state/sbx/join/alive.json"
+    : > "$HOME/.local/state/sbx/join/alive.lock"
+    # No sessions/ghost directory at all: pure orphan sidecars.
+    echo 999999 > "$HOME/.local/state/sbx/join/ghost.pid"
+    echo '{}' > "$HOME/.local/state/sbx/join/ghost.json"
+    : > "$HOME/.local/state/sbx/join/ghost.lock"
+    run bash -c "cd '$PROJ' && $SBX --gc"
+    [ "$status" -eq 0 ]
+    [ -f "$HOME/.local/state/sbx/join/alive.pid" ]
+    [ -f "$HOME/.local/state/sbx/join/alive.json" ]
+    [ -f "$HOME/.local/state/sbx/join/alive.lock" ]
+    [ ! -f "$HOME/.local/state/sbx/join/ghost.pid" ]
+    [ ! -f "$HOME/.local/state/sbx/join/ghost.json" ]
+    [ ! -f "$HOME/.local/state/sbx/join/ghost.lock" ]
+}
+
+@test "gc leaves claim.lock alone" {
+    mkdir -p "$HOME/.local/state/sbx"
+    : > "$HOME/.local/state/sbx/claim.lock"
+    run bash -c "cd '$PROJ' && $SBX --gc"
+    [ "$status" -eq 0 ]
+    [ -f "$HOME/.local/state/sbx/claim.lock" ]
+}
+
+@test "change archives are pruned to the keep limit" {
+    slug=$(echo "$PROJ" | tr '/' '-')
+    for i in 1 2 3 4 5; do
+        mkdir -p "$HOME/.local/state/sbx/changes/$slug/2026090$i-000000-myproj"
+    done
+    run bash -c "cd '$PROJ' && SBX_KEEP_CHANGES=2 $SBX --gc"
+    [ "$(find "$HOME/.local/state/sbx/changes/$slug" -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 2 ]
+}
+
+# --- --reseed ---
+
+@test "reseed drops a forked store so the next launch re-reads the host" {
+    mkdir -p "$PROJ/.sbx/profiles/cli"
+    cat > "$PROJ/.sbx/profiles/cli/fk.json" <<EOF
+{"description":"test","mounts":[{"source":"$HOSTDIR","dest":"/tmp/fkmount","perm":"forked"}]}
+EOF
+    echo hostfile > "$HOSTDIR/host.txt"
+    run_sbx "--cli fk --fs t" "echo owned > /tmp/fkmount/host.txt"
+    echo refreshed > "$HOSTDIR/host.txt"
+    run bash -c "cd '$PROJ' && $SBX --cli fk --reseed --yes"
+    [ "$status" -eq 0 ]
+    run_sbx "--cli fk --fs t" "cp /tmp/fkmount/host.txt /out/seen.txt"
+    [ "$(cat "$HOSTDIR/seen.txt")" = "refreshed" ]
+}
+
+@test "reseed without --yes prompts and aborts by default" {
+    mkdir -p "$PROJ/.sbx/profiles/cli"
+    cat > "$PROJ/.sbx/profiles/cli/fk.json" <<EOF
+{"description":"test","mounts":[{"source":"$HOSTDIR","dest":"/tmp/fkmount","perm":"forked"}]}
+EOF
+    run bash -c "cd '$PROJ' && $SBX --cli fk --reseed </dev/null"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Aborted"* ]]
+}

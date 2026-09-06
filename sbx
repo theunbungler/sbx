@@ -64,6 +64,10 @@ Options:
   --wd <path>            Start in this directory inside the sandbox
                          (default: launch dir if present, else \$HOME, else /)
   --gui                  Enable isolated GUI via xpra (attach with: xpra attach :<N>)
+  --reseed               Discard this directory's forked stores, so the next
+                         launch re-seeds them from the host (asks first)
+  --gc                   Remove crash residue and old change archives
+  --yes                  Do not prompt for confirmation
   -h, --help             Show this help message
 
 Profiles are searched in:
@@ -179,12 +183,82 @@ add_host_port() {
 }
 GUI_FLAG=false
 CAPS_KEEP=false
+RESEED=false
+ASSUME_YES=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --list-profiles)
             list_profiles
             exit 0
+            ;;
+        --gc)
+            for sdir in "$STATE_DIR"/sessions/*; do
+                [[ -d "$sdir" ]] || continue
+                sname=$(basename "$sdir")
+                # Liveness comes from the out-of-band pid record, never from
+                # session.json: that file lives inside a directory bound rw
+                # into the sandbox, so a payload can forge or delete it to
+                # make a live session look dead — and --gc deletes what it
+                # judges dead. Same rule as --list-sessions and the claim
+                # loop. Validated numeric before kill: an unchecked pid
+                # signals whoever it names.
+                gpid=""
+                spidf="$STATE_DIR/join/$sname.pid"
+                if [[ -f "$spidf" ]]; then
+                    read -r gpid < "$spidf" || true
+                fi
+                if [[ "$gpid" =~ ^[0-9]+$ ]] && kill -0 "$gpid" 2>/dev/null; then
+                    continue
+                fi
+                echo "Removing crash residue: $sname"
+                rm -rf "${sdir:?}"
+                rm -f "${STATE_DIR:?}/join/$sname.json" \
+                      "${STATE_DIR:?}/join/$sname.lock" \
+                      "${STATE_DIR:?}/join/$sname.pid"
+            done
+
+            # Sidecars whose session directory does not exist at all — a
+            # crash between the claim mkdir and session start, or leftovers
+            # from an interrupted GC — can never belong to a live session,
+            # since a live session always has its directory. This glob is
+            # confined to join/, so it can never reach claim.lock, which
+            # lives directly under $STATE_DIR.
+            for sc in "$STATE_DIR"/join/*; do
+                [[ -f "$sc" ]] || continue
+                scbase=$(basename "$sc")
+                scname="${scbase%.pid}"
+                scname="${scname%.json}"
+                scname="${scname%.lock}"
+                [[ -d "$STATE_DIR/sessions/$scname" ]] && continue
+                rm -f "${sc:?}"
+            done
+
+            keep="${SBX_KEEP_CHANGES:-10}"
+            for cdir in "$STATE_DIR"/changes/*; do
+                [[ -d "$cdir" ]] || continue
+                find "$cdir" -mindepth 1 -maxdepth 1 -type d |
+                    LC_ALL=C sort -r | tail -n "+$((keep + 1))" |
+                    while IFS= read -r old; do rm -rf "${old:?}"; done
+            done
+
+            # Never removed automatically: a forked store is the user's
+            # accumulated tool state, and deleting it on a heuristic is not
+            # recoverable. Reported so the space is at least visible; use
+            # --reseed to actually discard one.
+            if [[ -d "$STATE_DIR/forked" ]]; then
+                echo "Forked stores (not removed; use --reseed):"
+                du -sh "$STATE_DIR"/forked/*/*/* 2>/dev/null | sed 's/^/  /'
+            fi
+            exit 0
+            ;;
+        --reseed)
+            RESEED=true
+            shift
+            ;;
+        --yes)
+            ASSUME_YES=true
+            shift
             ;;
         --list-sessions)
             echo "Active Sessions (this directory):"
@@ -1054,6 +1128,32 @@ if [[ ${#SKIPPED_MOUNTS[@]} -gt 0 ]]; then
     done
 fi
 
+if [[ "$RESEED" == "true" ]]; then
+    if [[ ${#FORKED_MOUNTS[@]} -eq 0 ]]; then
+        echo "No forked mounts in the selected profiles; nothing to reseed." >&2
+        exit 1
+    fi
+    echo "This will delete the sandbox-owned copies of:"
+    for fm in "${FORKED_MOUNTS[@]}"; do
+        IFS=$'\t' read -r f_prof f_src f_dest <<< "$fm"
+        echo "  $f_dest  (re-seeded from $f_src)"
+    done
+    if [[ "$ASSUME_YES" != "true" ]]; then
+        # `|| true`: read exits non-zero on EOF (e.g. a non-interactive
+        # invocation with no stdin), and under `set -e` that would exit the
+        # script right here, skipping the "Aborted." message below.
+        read -r -p "Proceed? [y/N] " reply || true
+        [[ "$reply" == [yY]* ]] || { echo "Aborted." >&2; exit 1; }
+    fi
+    for fm in "${FORKED_MOUNTS[@]}"; do
+        IFS=$'\t' read -r f_prof f_src f_dest <<< "$fm"
+        f_store="$STATE_DIR/forked/$f_prof/$(sbx_copy_path_slug "$PWD")/$(sbx_copy_mount_id "$f_dest")"
+        rm -rf "${f_store:?}"
+    done
+    echo "Reseeded. The next launch will read from the host."
+    exit 0
+fi
+
 # Sandbox-owned mounts. Seeded from the host only when the store does not
 # yet exist; from then on the store IS the tree and the host source is
 # never consulted again. That is the defining property of `forked`, not an
@@ -1602,6 +1702,15 @@ teardown() {
             sbx_manifest_deleted "$r_base" "$r_cur" > "$arch_dir/$r_id.deleted"
             echo "Changes from this session: $arch_dir/$r_id"
         done
+
+        # Prune old archives here too, not only on an explicit --gc, so
+        # they never accumulate unbounded just because nobody remembered to
+        # run it.
+        keep="${SBX_KEEP_CHANGES:-10}"
+        find "$STATE_DIR/changes/$(sbx_copy_path_slug "$PWD")" \
+            -mindepth 1 -maxdepth 1 -type d 2>/dev/null |
+            LC_ALL=C sort -r | tail -n "+$((keep + 1))" |
+            while IFS= read -r old; do rm -rf "${old:?}"; done
     fi
     rm -rf "$RECORD_WORK_DIR"
 
