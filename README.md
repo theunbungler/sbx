@@ -73,6 +73,10 @@ To see all available commands and options, run:
 | `--wd <path>` | Start the session in this directory inside the sandbox. |
 | `--host-port <spec>` | Reach a service running on the host's `127.0.0.1:<port>` from inside the sandbox. `<spec>` is `<port>[/tcp\|/udp]`; a bare number means TCP. Repeatable. |
 | `--gui` | Start a session with isolated GUI support via `xpra`. |
+| `--changes [<id>]` | Show what the most recent (or a named) `record`-mount session changed, for the current directory. |
+| `--reseed` | Discard this directory's `forked` stores for the selected profiles, so the next launch seeds them from the host again. Asks first; refuses while a session holding one of those stores is still running. |
+| `--gc` | Remove crash residue — session directories and working copies left by a session that never got to shut down — and trim old change archives. Never removes a `forked` store; it reports them instead. |
+| `--yes` | Answer the confirmation prompts (`--reseed`, project-local profiles) with yes. |
 
 ### Applying Profiles
 
@@ -279,11 +283,15 @@ A profile that still carries `workingDirectory` is not honored; sbx warns and na
 
 **`forked` — sandbox-owned.** The first launch of a given profile/mount from a given directory copies the host source into a persistent store at `~/.local/state/sbx/forked/<profile-name>/<cwd-slug>/<mount_id>/` and binds that store straight into the sandbox. Every later launch of the same profile from the same directory reuses that store directly — the host source is never re-read, so host-side edits made after the first seed simply don't show up, and deletions made inside the sandbox stay deleted. This is what lets `sbx --cli claude` keep the sessions, history, and auth tokens it accumulated last time. `<cwd-slug>` is the launch directory (`$PWD`) with slashes dashed, so each project keeps its own store; `<mount_id>` is the sandbox destination path, also slashes-to-underscores.
 
-To start a profile over from a clean host copy, delete its store: `~/.local/state/sbx/forked/<profile-name>/<cwd-slug>/`. Other directories' stores for the same profile are unaffected.
+To start a profile over from a clean host copy, run `./sbx --cli <name> --reseed` from the same directory. It lists the stores it is about to delete, with their sizes, and asks before removing them; the next launch seeds them from the host again. Other directories' stores for the same profile are unaffected.
+
+Use `--reseed` rather than deleting the store directory by hand: a store is bind-mounted read-write into its session for as long as that session runs, so removing one under a live sandbox destroys the auth tokens and history it is using at that moment. `--reseed` checks for that and refuses.
 
 **`record` — host-owned.** A private working copy is seeded fresh from the host source on *every* launch (in `~/.local/state/sbx/work/<session-id>/`, removed at teardown), so the sandbox always starts from current host state. At teardown, `sbx` diffs the working copy against a manifest taken right after that launch's seed — not against the live host source, so a host-side edit made while the session was running can never be misattributed to the sandbox. Files the session created or modified are archived to `~/.local/state/sbx/changes/<cwd-slug>/<stamp>-<session-id>/<mount_id>/`, and anything the session deleted is listed (one path per line) in a sibling `<mount_id>.deleted` file. Nothing is replayed into the next launch — `record` mounts always start clean from the host.
 
 Use `./sbx --changes [<id>]` to inspect the most recent (or a named) archive for the current directory; it prints the archive path followed by each changed file (`+`) and deleted path (`-`).
+
+A session that is killed outright — `SIGKILL`, the OOM killer, power loss — never reaches teardown, so its working copy and session directory stay on disk. The next launch from that directory clears its own working copy before seeding, so nothing carries over; `./sbx --gc` is what reclaims the rest, and also trims change archives beyond the newest `SBX_KEEP_CHANGES` (default 10) per directory.
 
 Both permissions use `rsync --compare-dest` for the diff when available, falling back to a file-by-file size and timestamp comparison otherwise.
 

@@ -622,3 +622,128 @@ EOF
         return 1
     fi
 }
+
+# --- work-tree residue ---
+
+# Only teardown removed $STATE_DIR/work/<name>/, so a session killed by
+# SIGKILL, OOM or power loss stranded it. --gc advertises crash-residue
+# collection and has to reclaim it too, on exactly the same liveness rule as
+# the session and sidecar sweeps.
+@test "gc collects a stranded work tree but leaves a live session's alone" {
+    mkdir -p "$HOME/.local/state/sbx/join" \
+             "$HOME/.local/state/sbx/work/dead/_tmp_x" \
+             "$HOME/.local/state/sbx/work/alive/_tmp_x" \
+             "$HOME/.local/state/sbx/sessions/alive"
+    echo 999999 > "$HOME/.local/state/sbx/join/dead.pid"
+    echo $$ > "$HOME/.local/state/sbx/join/alive.pid"
+    run bash -c "cd '$PROJ' && $SBX --gc"
+    [ "$status" -eq 0 ]
+    [ -d "$HOME/.local/state/sbx/work/alive" ]
+    if [ -d "$HOME/.local/state/sbx/work/dead" ]; then
+        echo "gc left a dead session's work tree behind" >&2
+        return 1
+    fi
+}
+
+# A work tree whose session was never even claimed (no pid record at all) is
+# residue by the same rule the sidecar sweep already uses.
+@test "gc collects a work tree with no liveness record at all" {
+    mkdir -p "$HOME/.local/state/sbx/join" "$HOME/.local/state/sbx/work/orphan/_tmp_x"
+    run bash -c "cd '$PROJ' && $SBX --gc"
+    [ "$status" -eq 0 ]
+    if [ -d "$HOME/.local/state/sbx/work/orphan" ]; then
+        echo "gc left an orphaned work tree behind" >&2
+        return 1
+    fi
+}
+
+# --- name reclaim vs. --gc ---
+
+# The claim loop reclaimed only join/<name>.pid while --gc reclaims .pid,
+# .json and .lock. A crashed session therefore left a stale join/<name>.json
+# that outlived its name: the successor is live from the moment its pid is
+# written but does not overwrite that sidecar until ~850 lines later, and in
+# that window --reseed reads the PREDECESSOR's forked_stores list. If that
+# stale list does not name the store --reseed is targeting, the "live pid
+# but unknown mounts -> refuse" guard is bypassed and --reseed deletes a
+# store the starting session has already seeded and is about to --bind.
+#
+# --reseed goes through the same claim loop and then releases the name
+# without ever writing a sidecar of its own, which makes the reclaim
+# observable on its own.
+@test "a name reclaim removes the predecessor's json and lock, not just its pid" {
+    make_fk_profile
+    mkdir -p "$HOME/.local/state/sbx/sessions/myproj" "$HOME/.local/state/sbx/join"
+    echo 999999 > "$HOME/.local/state/sbx/join/myproj.pid"
+    echo '{"forked_stores":["/nowhere/ghost-store"]}' \
+        > "$HOME/.local/state/sbx/join/myproj.json"
+    : > "$HOME/.local/state/sbx/join/myproj.lock"
+    run bash -c "cd '$PROJ' && $SBX --cli fk --reseed --yes"
+    [ "$status" -eq 0 ]
+    if [ -f "$HOME/.local/state/sbx/join/myproj.json" ]; then
+        echo "a reclaimed name kept the predecessor's forked_stores sidecar" >&2
+        return 1
+    fi
+    if [ -f "$HOME/.local/state/sbx/join/myproj.lock" ]; then
+        echo "a reclaimed name kept the predecessor's join lock" >&2
+        return 1
+    fi
+}
+
+# The same reclaim on the launch path: a live session must never be
+# describable by its predecessor's sidecar.
+@test "a launch that reclaims a name does not inherit the predecessor's sidecar" {
+    mkdir -p "$HOME/.local/state/sbx/sessions/myproj" "$HOME/.local/state/sbx/join"
+    echo 999999 > "$HOME/.local/state/sbx/join/myproj.pid"
+    echo '{"forked_stores":["/nowhere/ghost-store"],"stale":true}' \
+        > "$HOME/.local/state/sbx/join/myproj.json"
+    ( cd "$PROJ" && script -qec \
+        "$SBX --fs t -- /bin/sh -c 'echo up > /out/up.txt; sleep 5'" \
+        /dev/null >/dev/null 2>&1 ) &
+    local bg=$!
+    # Poll from the instant the name is reclaimed: the pid record is
+    # rewritten under claim.lock immediately after the reclaim, long before
+    # the successor writes its own sidecar.
+    local seen=""
+    for _ in $(seq 1 400); do
+        if [[ -f "$HOME/.local/state/sbx/join/myproj.pid" ]] &&
+           [[ "$(cat "$HOME/.local/state/sbx/join/myproj.pid")" != 999999 ]]; then
+            seen=$(cat "$HOME/.local/state/sbx/join/myproj.json" 2>/dev/null || true)
+            break
+        fi
+        sleep 0.02
+    done
+    wait $bg
+    [ -f "$HOSTDIR/up.txt" ]
+    if [[ "$seen" == *stale* ]]; then
+        echo "a newly claimed session was described by its predecessor's sidecar: $seen" >&2
+        return 1
+    fi
+}
+
+# --- pre-upgrade session directories ---
+
+# Before sessions moved under sessions/, they lived directly at
+# $STATE_DIR/<date>-<random>/ and were never removed — including an fs/
+# subdirectory holding real copy-mount egress. --gc scans only sessions/,
+# so it silently ignores the largest residue an upgrading user has. Report
+# them; never delete them, since fs/ may be the only copy of that egress.
+@test "gc reports pre-upgrade session directories without deleting them" {
+    local old="$HOME/.local/state/sbx/20240102-030405-ab12"
+    mkdir -p "$old/fs"
+    echo egress > "$old/fs/out.txt"
+    run bash -c "cd '$PROJ' && $SBX --gc"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *20240102-030405-ab12* ]]
+    [ -f "$old/fs/out.txt" ]
+}
+
+@test "gc says nothing about pre-upgrade sessions when there are none" {
+    mkdir -p "$HOME/.local/state/sbx/sessions"
+    run bash -c "cd '$PROJ' && $SBX --gc"
+    [ "$status" -eq 0 ]
+    if [[ "$output" == *"pre-upgrade"* ]]; then
+        echo "gc announced pre-upgrade sessions with none present: $output" >&2
+        return 1
+    fi
+}

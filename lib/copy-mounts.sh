@@ -157,8 +157,13 @@ sbx_copy_seed_progress() {
     local src="$1" tmp="$2" label="$3"
     local delay="${SBX_PROGRESS_DELAY:-1}"
 
-    mkdir -p "$tmp"
+    # Existence check first: creating $tmp for a source that does not exist
+    # leaves an empty directory that a caller then treats as a seeded store.
+    # sbx's forked loop skips absent sources before ever calling this, but
+    # this function is the one that would silently manufacture the store,
+    # so it must not do so on its own either.
     [[ -e "$src" ]] || return 0
+    mkdir -p "$tmp"
 
     local cp_pid du_pid du_out total="" start shown=0
     du_out=$(mktemp)

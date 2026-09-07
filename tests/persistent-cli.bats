@@ -260,3 +260,70 @@ EOF
     run_sbx "--fs recfile" "echo changed > /tmp/recfile"
     [ "$(cat "$(latest_archive)/_tmp_recfile/hostfile.txt")" = "changed" ]
 }
+
+# A session killed by SIGKILL, OOM or power loss never runs teardown, so its
+# $STATE_DIR/work/<name>/ tree survives. The next launch from the same
+# directory reclaims the same name and points RECORD_WORK_DIR at that same
+# path — and sbx_copy_seed's `cp -a "$src/." "$tmp/"` MERGES into a
+# non-empty destination rather than replacing it. The ghost files then get
+# hashed into the launch-time baseline, so they read as unchanged: the
+# sandbox sees files the host does not have, and --changes never mentions
+# them. The work tree must be removed before seeding.
+@test "a stale work tree does not leak into the next session of the same name" {
+    local work="$HOME/.local/state/sbx/work/p/_tmp_recmount"
+    mkdir -p "$work"
+    echo ghost > "$work/ghost.txt"
+    run_sbx "--fs rec" "test -f /tmp/recmount/ghost.txt && echo saw > /tmp/recmount/saw.txt || echo clean > /tmp/recmount/clean.txt"
+    [ -f "$(latest_archive)/_tmp_recmount/clean.txt" ]
+    if [ -f "$(latest_archive)/_tmp_recmount/saw.txt" ]; then
+        echo "the sandbox saw a ghost file from a crashed session's work tree" >&2
+        return 1
+    fi
+}
+
+# The other half of the same defect. sbx_manifest_build runs over the
+# merged tree, so a ghost file is hashed into the BASELINE and reads as
+# host state that was always there. Removing it inside the sandbox is then
+# archived as the sandbox deleting a host file that never existed.
+@test "a stale work tree's files are not folded into the next session's baseline" {
+    local work="$HOME/.local/state/sbx/work/p/_tmp_recmount"
+    mkdir -p "$work"
+    echo ghost > "$work/ghost.txt"
+    run_sbx "--fs rec" "rm -f /tmp/recmount/ghost.txt; echo made > /tmp/recmount/new.txt"
+    [ "$(cat "$(latest_archive)/_tmp_recmount/new.txt")" = "made" ]
+    local deleted
+    deleted=$(cat "$(latest_archive)/_tmp_recmount.deleted" 2>/dev/null || true)
+    if [[ "$deleted" == *ghost.txt* ]]; then
+        echo "a ghost file was folded into the baseline and archived as a deletion: $deleted" >&2
+        return 1
+    fi
+}
+
+# A forked mount whose host source does not exist used to create the store
+# as an empty directory anyway, then bind that directory at a destination
+# that wants a FILE — and because the store now exists, the
+# [[ ! -e "$f_store" ]] guard never fires again, so it stayed wrong even
+# after the host file appeared. The trigger is ordinary: `sbx --cli claude`
+# before Claude Code has ever written ~/.claude.json.
+@test "a forked mount whose file source is absent creates no store" {
+    cat > "$PROJ/.sbx/profiles/cli/fkabs.json" <<EOF
+{"description":"test","mounts":[{"source":"$HOSTDIR/absent.txt","dest":"/tmp/fkabsent","perm":"forked"}]}
+EOF
+    run_sbx "--cli fkabs" "true"
+    if [ -e "$FORKED_ROOT/fkabs/$PROJ_SLUG/_tmp_fkabsent" ]; then
+        echo "an absent source left a store behind: $(ls -la "$FORKED_ROOT/fkabs/$PROJ_SLUG/_tmp_fkabsent")" >&2
+        return 1
+    fi
+}
+
+@test "a forked mount whose file source appears later is seeded as a file" {
+    cat > "$PROJ/.sbx/profiles/cli/fkabs.json" <<EOF
+{"description":"test","mounts":[{"source":"$HOSTDIR/absent.txt","dest":"/tmp/fkabsent","perm":"forked"}]}
+EOF
+    run_sbx "--cli fkabs" "true"
+    echo appeared > "$HOSTDIR/absent.txt"
+    run_sbx "--cli fkabs" "test -f /tmp/fkabsent && echo yes >> /tmp/fkabsent"
+    local store="$FORKED_ROOT/fkabs/$PROJ_SLUG/_tmp_fkabsent/absent.txt"
+    [ -f "$store" ]
+    [ "$(cat "$store")" = "$(printf 'appeared\nyes')" ]
+}

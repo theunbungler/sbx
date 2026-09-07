@@ -286,6 +286,30 @@ while [[ $# -gt 0 ]]; do
                 rm -f "${sc:?}"
             done
 
+            # Record-mount working copies. Only teardown removed these, so a
+            # session killed by SIGKILL, OOM or power loss strands one — and
+            # a stranded tree is not merely wasted space: the next session of
+            # the same name seeds INTO it (cp -a merges) and folds its ghost
+            # files into the baseline. Launches clear their own work tree
+            # before seeding, which fixes the corruption going forward; this
+            # sweep is what reclaims what is already on disk. Same liveness
+            # rule and same lock as the sweeps above — a live session's work
+            # tree is bound into a running sandbox.
+            for wdir in "$STATE_DIR"/work/*; do
+                [[ -d "$wdir" ]] || continue
+                wname=$(basename "$wdir")
+                wpid=""
+                wpidf="$STATE_DIR/join/$wname.pid"
+                if [[ -f "$wpidf" ]]; then
+                    read -r wpid < "$wpidf" || true
+                fi
+                if [[ "$wpid" =~ ^[0-9]+$ ]] && kill -0 "$wpid" 2>/dev/null; then
+                    continue
+                fi
+                echo "Removing stranded work tree: $wname"
+                rm -rf "${wdir:?}"
+            done
+
             exec 8>&-
 
             keep=$(sbx_keep_changes)
@@ -309,6 +333,29 @@ while [[ $# -gt 0 ]]; do
             if [[ -n "$forked_report" ]]; then
                 echo "Forked stores (not removed; use --reseed):"
                 echo "$forked_report"
+            fi
+
+            # Sessions predating this layout lived at $STATE_DIR/<date>-<rand>/
+            # rather than under sessions/, and were never removed at all — so
+            # an upgrading user's largest residue is precisely the one the
+            # sweeps above cannot see. Reported, never deleted: those
+            # directories hold an fs/ subdirectory of real copy-mount egress,
+            # and for an old session that is the only copy there has ever
+            # been. Matched on the exact old name shape so nothing else that
+            # may sit under $STATE_DIR is ever named as a session.
+            old_report=""
+            for odir in "$STATE_DIR"/*; do
+                [[ -d "$odir" ]] || continue
+                oname=$(basename "$odir")
+                [[ "$oname" =~ ^[0-9]{8}-[0-9]{6}-[0-9a-f]{4}$ ]] || continue
+                old_report+="  $(du -sh "$odir" 2>/dev/null | cut -f1)  $odir"$'\n'
+            done
+            if [[ -n "$old_report" ]]; then
+                echo "Pre-upgrade session directories (not removed):"
+                printf '%s' "$old_report"
+                echo "  These predate the sessions/ layout. Their fs/ subdirectory holds the"
+                echo "  only copy of that session's copy-mount egress; delete them by hand"
+                echo "  once you have taken what you want from it."
             fi
             exit 0
             ;;
@@ -838,8 +885,23 @@ while ! mkdir "$STATE_DIR/sessions/$SESSION_NAME" 2>/dev/null; do
         read -r stale_pid < "$STATE_DIR/join/$SESSION_NAME.pid" || true
     fi
     if [[ ! "$stale_pid" =~ ^[0-9]+$ ]] || ! kill -0 "$stale_pid" 2>/dev/null; then
+        # Every sidecar, not only the pid — the same set --gc removes, for
+        # the same reason. A stale join/<name>.json outlives its session and
+        # then describes ours: we are live from the pid write below, but do
+        # not write our own sidecar until much later, and in that window a
+        # concurrent --reseed reads the PREDECESSOR's forked_stores. If that
+        # list does not name the store --reseed is targeting, the "live pid
+        # but unknown mounts -> refuse" guard is bypassed and --reseed
+        # rm -rf's a store this launch has already seeded and is about to
+        # --bind, leaving bwrap to fail on a missing source. Judging the
+        # name dead is sufficient grounds: control only reaches here after
+        # kill -0 has failed, and the rm -rf above already takes the whole
+        # session directory including tmux.sock, which --join tests with -S
+        # before it ever opens the sidecar.
         rm -rf "${STATE_DIR:?}/sessions/$SESSION_NAME"
-        rm -f "${STATE_DIR:?}/join/$SESSION_NAME.pid"
+        rm -f "${STATE_DIR:?}/join/$SESSION_NAME.json" \
+              "${STATE_DIR:?}/join/$SESSION_NAME.lock" \
+              "${STATE_DIR:?}/join/$SESSION_NAME.pid"
         continue
     fi
     session_n=$((session_n + 1))
@@ -1306,6 +1368,19 @@ fi
 # write-back at teardown and nothing to diff.
 for fm in "${FORKED_MOUNTS[@]}"; do
     IFS=$'\t' read -r f_prof f_src f_dest <<< "$fm"
+    # An absent source is skipped outright, not seeded into an empty store.
+    # Creating the store here would be permanent damage: the store would
+    # exist, so `[[ ! -e "$f_store" ]]` below never fires again, and the
+    # empty DIRECTORY would be bound at a destination that wants a FILE —
+    # for every launch from now on, including after the host file finally
+    # appears. Under the old `copy` perm this self-healed because the host
+    # was re-read every time; `forked` reads it once, so getting it wrong
+    # once is getting it wrong forever. The trigger is ordinary: `sbx --cli
+    # claude` before Claude Code has ever written ~/.claude.json. Skipping
+    # also makes the mount match what SKIPPED_MOUNTS already told the user.
+    if [[ ! -e "$f_src" ]]; then
+        continue
+    fi
     f_store=$(sbx_forked_store "$f_prof" "$f_dest")
     # Recorded for the join sidecar, which is what tells a later --reseed
     # that this store belongs to a running session.
@@ -1330,6 +1405,20 @@ done
 # host edit made while the session runs cannot be misattributed to the
 # sandbox.
 RECORD_WORK_DIR="$STATE_DIR/work/$SESSION_ID"
+
+# Removed, not merely created. teardown() clears this at the end of a normal
+# session, but a session killed by SIGKILL, OOM or power loss never runs it,
+# and the next launch from the same directory reclaims the same name and so
+# lands on the same path. sbx_copy_seed's `cp -a "$src/." "$tmp/"` MERGES
+# into a non-empty destination rather than replacing it, and the manifest is
+# built afterwards over the merged tree — so a ghost file from the dead
+# session is folded into the BASELINE, reads as unchanged host state, never
+# appears in --changes, and is visible to the sandbox although the host does
+# not have it. That contradicts what `record` promises: a fresh copy from
+# the host source, every launch. This one line is also what covers an exit
+# between here and the EXIT trap installed further down.
+rm -rf "${RECORD_WORK_DIR:?}"
+
 for rm_ in "${RECORD_MOUNTS[@]}"; do
     IFS=$'\t' read -r r_src r_dest <<< "$rm_"
     r_id=$(sbx_copy_mount_id "$r_dest")
