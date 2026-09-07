@@ -296,9 +296,15 @@ EOF
 @test "gc leaves a live session alone" {
     mkdir -p "$HOME/.local/state/sbx/sessions/alive" "$HOME/.local/state/sbx/join"
     echo $$ > "$HOME/.local/state/sbx/join/alive.pid"
+    mkdir -p "$HOME/.local/state/sbx/sessions/dead"
+    echo 999999 > "$HOME/.local/state/sbx/join/dead.pid"
     run bash -c "cd '$PROJ' && $SBX --gc"
     [ "$status" -eq 0 ]
     [ -d "$HOME/.local/state/sbx/sessions/alive" ]
+    if [ -d "$HOME/.local/state/sbx/sessions/dead" ]; then
+        echo "gc collected nothing" >&2
+        return 1
+    fi
 }
 
 # session.json lives in a directory bound rw into the sandbox, so a payload
@@ -309,9 +315,15 @@ EOF
     jq -n --argjson pid 999999 '{id:"liar",cwd:"/nope",pid:$pid}' \
         > "$HOME/.local/state/sbx/sessions/liar/session.json"
     echo $$ > "$HOME/.local/state/sbx/join/liar.pid"
+    mkdir -p "$HOME/.local/state/sbx/sessions/dead"
+    echo 999999 > "$HOME/.local/state/sbx/join/dead.pid"
     run bash -c "cd '$PROJ' && $SBX --gc"
     [ "$status" -eq 0 ]
     [ -d "$HOME/.local/state/sbx/sessions/liar" ]
+    if [ -d "$HOME/.local/state/sbx/sessions/dead" ]; then
+        echo "gc collected nothing" >&2
+        return 1
+    fi
 }
 
 @test "gc removes orphaned join sidecars but leaves a live session's alone" {
@@ -336,9 +348,15 @@ EOF
 @test "gc leaves claim.lock alone" {
     mkdir -p "$HOME/.local/state/sbx"
     : > "$HOME/.local/state/sbx/claim.lock"
+    mkdir -p "$HOME/.local/state/sbx/sessions/dead" "$HOME/.local/state/sbx/join"
+    echo 999999 > "$HOME/.local/state/sbx/join/dead.pid"
     run bash -c "cd '$PROJ' && $SBX --gc"
     [ "$status" -eq 0 ]
     [ -f "$HOME/.local/state/sbx/claim.lock" ]
+    if [ -d "$HOME/.local/state/sbx/sessions/dead" ]; then
+        echo "gc collected nothing" >&2
+        return 1
+    fi
 }
 
 @test "change archives are pruned to the keep limit" {

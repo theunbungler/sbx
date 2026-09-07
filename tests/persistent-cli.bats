@@ -33,6 +33,17 @@ EOF
     cat > "$PROJ/.sbx/profiles/fs/rec.json" <<EOF
 {"description":"test","mounts":[{"source":"$HOSTDIR","dest":"/tmp/recmount","perm":"record"}]}
 EOF
+
+    # File-source (not directory-source) mounts: both perms bind a single
+    # host file, the untested branch in the seeding loops.
+    FORKED_FILE_SRC="$HOSTDIR/hostfile.txt"
+    echo filedata > "$FORKED_FILE_SRC"
+    cat > "$PROJ/.sbx/profiles/cli/fkfile.json" <<EOF
+{"description":"test","mounts":[{"source":"$FORKED_FILE_SRC","dest":"/tmp/fkfile","perm":"forked"}]}
+EOF
+    cat > "$PROJ/.sbx/profiles/fs/recfile.json" <<EOF
+{"description":"test","mounts":[{"source":"$FORKED_FILE_SRC","dest":"/tmp/recfile","perm":"record"}]}
+EOF
 }
 
 teardown() {
@@ -148,12 +159,14 @@ EOF
 
 @test "a file deleted in a forked mount stays deleted" {
     run_sbx "--cli fk" "rm /tmp/fkmount/host.txt"
+    [ -d "$FORKED_ROOT/fk/$PROJ_SLUG/_tmp_fkmount" ]
     run_sbx "--cli fk" "test -f /tmp/fkmount/host.txt && echo back > /tmp/fkmount/back.txt"
     [ ! -f "$FORKED_ROOT/fk/$PROJ_SLUG/_tmp_fkmount/back.txt" ]
 }
 
 @test "a forked mount never modifies the host source" {
     run_sbx "--cli fk" "echo sandbox > /tmp/fkmount/host.txt; echo x > /tmp/fkmount/new.txt"
+    [ "$(cat "$FORKED_ROOT/fk/$PROJ_SLUG/_tmp_fkmount/host.txt")" = "sandbox" ]
     [ "$(cat "$HOSTDIR/host.txt")" = "hostfile" ]
     [ ! -f "$HOSTDIR/new.txt" ]
 }
@@ -180,6 +193,7 @@ EOF
 
 @test "a record mount does not archive an untouched file" {
     run_sbx "--fs rec" "echo made > /tmp/recmount/new.txt"
+    [ "$(cat "$(latest_archive)/_tmp_recmount/new.txt")" = "made" ]
     [ ! -f "$(latest_archive)/_tmp_recmount/host.txt" ]
 }
 
@@ -191,12 +205,14 @@ EOF
 
 @test "a record mount resets to host state on the next launch" {
     run_sbx "--fs rec" "echo made > /tmp/recmount/new.txt"
-    run_sbx "--fs rec" "test -f /tmp/recmount/new.txt && echo leaked > /tmp/recmount/leak.txt"
+    run_sbx "--fs rec" "test -f /tmp/recmount/new.txt && echo leaked > /tmp/recmount/leak.txt || echo absent > /tmp/recmount/gone.txt"
+    [ "$(cat "$(latest_archive)/_tmp_recmount/gone.txt")" = "absent" ]
     [ ! -f "$(latest_archive)/_tmp_recmount/leak.txt" ]
 }
 
 @test "a record mount never modifies the host source" {
     run_sbx "--fs rec" "echo sandbox > /tmp/recmount/host.txt; rm -f /tmp/recmount/host.txt; echo x > /tmp/recmount/new.txt"
+    [ "$(cat "$(latest_archive)/_tmp_recmount/new.txt")" = "x" ]
     [ "$(cat "$HOSTDIR/host.txt")" = "hostfile" ]
     [ ! -f "$HOSTDIR/new.txt" ]
 }
@@ -215,6 +231,10 @@ EOF
         [[ -n "$(find "$HOME/.local/state/sbx/work" -name 'ready.txt' 2>/dev/null)" ]] && break
         sleep 0.25
     done
+    if [[ -z "$(find "$HOME/.local/state/sbx/work" -name 'ready.txt' 2>/dev/null)" ]]; then
+        echo "sandbox never wrote the marker; test cannot be meaningful" >&2
+        return 1
+    fi
     echo "edited-by-host" > "$HOSTDIR/host.txt"
     wait $bg
     [ ! -f "$(latest_archive)/_tmp_recmount/host.txt" ]
@@ -222,5 +242,21 @@ EOF
 
 @test "the work directory is removed at teardown" {
     run_sbx "--fs rec" "echo made > /tmp/recmount/new.txt"
+    [ "$(cat "$(latest_archive)/_tmp_recmount/new.txt")" = "made" ]
     [ -z "$(find "$HOME/.local/state/sbx/work" -mindepth 1 2>/dev/null)" ]
+}
+
+@test "a file-source forked mount is seeded and persists a modification across two launches" {
+    local store="$FORKED_ROOT/fkfile/$PROJ_SLUG/_tmp_fkfile/hostfile.txt"
+    run_sbx "--cli fkfile" "true"
+    [ "$(cat "$store")" = "filedata" ]
+    run_sbx "--cli fkfile" "echo modified > /tmp/fkfile"
+    [ "$(cat "$store")" = "modified" ]
+    run_sbx "--cli fkfile" "true"
+    [ "$(cat "$store")" = "modified" ]
+}
+
+@test "a file-source record mount archives a modification" {
+    run_sbx "--fs recfile" "echo changed > /tmp/recfile"
+    [ "$(cat "$(latest_archive)/_tmp_recfile/hostfile.txt")" = "changed" ]
 }

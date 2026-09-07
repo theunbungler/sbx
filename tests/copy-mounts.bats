@@ -191,3 +191,16 @@ setup() {
     sbx_copy_seed_progress "$WORK/one.txt" "$TMP" "test" 2>/dev/null
     [ "$(cat "$TMP/one.txt")" = "hi" ]
 }
+
+# A tree of many small files, rather than one big file: cp's per-file syscall
+# overhead makes this reliably slower than the SBX_PROGRESS_DELAY=0 threshold
+# even though the total content is only tens of MB, without needing a
+# multi-GB fixture or depending on the filesystem lacking reflink support.
+@test "seed_progress prints the label to a tty stderr" {
+    for i in $(seq 1 20000); do echo "data $i" > "$SRC/f$i.txt"; done
+    local typescript="$WORK/typescript"
+    script -qec "bash -c \"source '$BATS_TEST_DIRNAME/../lib/copy-mounts.sh'; \
+                 SBX_PROGRESS_DELAY=0 sbx_copy_seed_progress '$SRC' '$TMP' bigseed\"" \
+        "$typescript" >/dev/null 2>&1
+    grep -aq "bigseed" "$typescript"
+}
