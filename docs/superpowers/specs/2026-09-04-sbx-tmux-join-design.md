@@ -146,20 +146,48 @@ payload that runs `rm $SESSION_DIR/tmux.sock` or `tmux kill-server` ends the
 loop whenever it likes. Verified — the session tore down with a join mid-write,
 and the join's file never reached `fs/_copy`.
 
-The enforcing half therefore lives on the host. `--join` takes a *shared*
-`flock` on `$STATE_DIR/<id>.joinlock` for its whole life, and `teardown()`
-takes the same lock *exclusively* before running copy-writeback. That path is
-outside `$SESSION_DIR` and behind the `--tmpfs "$STATE_DIR"` mask, so it does
-not exist from inside the sandbox and nothing in there can touch it. The wait
-is bounded (`flock -w 30`) and warns loudly rather than blocking forever, so a
-stale lock cannot wedge a teardown.
+That verification was read at the time as proof that the host needs a lock to
+stop writeback overlapping *that* torn-down join. A later, more precise
+measurement (on the `mount-authority` branch, `tests/join.bats` "writeback
+waits on the host lock when teardown is not gated by the sandbox") shows the
+mechanism is different from what this section originally claimed. Killing the
+waiter's liveness signal is what makes bwrap's PID-1 child exit, and bwrap
+exiting destroys the pid namespace the join's pane lives in — so the join
+loses its process, and stops writing, within milliseconds of the tamper,
+before `launch.sh` ever reaches copy-writeback. Every write the join managed
+before that moment is still copied; none is torn mid-write by a race with
+writeback. So the mid-write loss observed above was real, but its cause was
+namespace teardown ending the join, not writeback running concurrently with
+it — against tampering specifically, the host lock turns out not to be the
+thing preventing the loss.
+
+Where the lock is load-bearing is a case this section did not consider:
+`teardown()`/copy-writeback running as an `EXIT` trap on a fatal signal —
+Ctrl-C on the launching terminal, a CI timeout — while `session.sh`, the tmux
+server, the payload and any join are all still alive and behaving normally.
+`--die-with-parent` only kills bwrap once `launch.sh` has already exited, i.e.
+after that trap has already run, so the PID-1 waiter is not on this exit path
+at all and cannot order anything here. This is the case the flock actually
+exists for.
+
+The enforcing half therefore lives on the host regardless of which case
+motivates it. `--join` takes a *shared* `flock` on `$STATE_DIR/<id>.joinlock`
+for its whole life, and `teardown()` takes the same lock *exclusively* before
+running copy-writeback. That path is outside `$SESSION_DIR` and behind the
+`--tmpfs "$STATE_DIR"` mask, so it does not exist from inside the sandbox and
+nothing in there can touch it. The wait is bounded (`flock -w 30`) and warns
+loudly rather than blocking forever, so a stale lock cannot wedge a teardown.
 
 What that does and does not promise: writeback never *overlaps* a live join,
-whatever the sandbox does to the socket. It cannot keep a hostile payload from
-ending its own sandbox and taking a live join down with it — bwrap's child is
-PID 1 of the namespace, and nothing on the host can stop it exiting. The
-property is "writeback and a join never run at the same time", not "a join
-cannot be killed".
+whatever the sandbox does to the socket or whatever signal `sbx` receives. It
+cannot keep a hostile payload from ending its own sandbox and taking a live
+join down with it — bwrap's child is PID 1 of the namespace, and nothing on
+the host can stop it exiting — but, per the measurement above, that path
+already stops the join's writes before writeback would start, with or without
+the lock. The property the lock buys is "writeback and a join never run at
+the same time", not "a join cannot be killed", and the case where that
+property is doing real work is a signalled teardown of a live sandbox, not a
+tampering payload.
 
 Accepted consequence: the launching terminal is occupied for the session's
 whole life. Detaching returns to the waiter, not to a shell prompt. A

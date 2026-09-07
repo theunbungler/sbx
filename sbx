@@ -428,11 +428,20 @@ while [[ $# -gt 0 ]]; do
             JOIN_WD=$(jq -r '.workdir' "$JOIN_META")
             # Held for the whole life of the join, and released by the kernel
             # when this process finally exits. teardown() takes the same lock
-            # exclusively before archiving record-mount changes, which is
-            # what makes "the archive never overlaps a live join" actually
-            # true: the in-sandbox wait loop cannot guarantee it on its own,
-            # because the payload can delete the socket or run
-            # `tmux kill-server`. The fd survives the exec below on purpose.
+            # exclusively before archiving record-mount changes, and that
+            # pairing is what protects a teardown that runs while the
+            # sandbox is still fully alive: teardown() is an EXIT trap, and
+            # a SIGTERM to sbx (Ctrl-C on the launching terminal, a CI
+            # timeout) fires it before bwrap has any reason to exit, so the
+            # payload, the tmux server and this join can all still be
+            # writing when the archive would otherwise start. The
+            # in-sandbox PID-1 waiter (see session.sh's tmux conf and the
+            # comment above the session script) is not in that exit path at
+            # all — it only runs teardown once bwrap itself has already
+            # returned — so it cannot cover for this lock; see
+            # tests/join.bats "writeback waits on the host lock when
+            # teardown is not gated by the sandbox". The fd survives the
+            # exec below on purpose.
             JOIN_LOCK="$STATE_DIR/join/$JOIN_SESSION.lock"
             if exec 9>>"$JOIN_LOCK"; then
                 flock -s 9 || echo "Warning: could not lock $JOIN_LOCK; teardown may not wait for this join." >&2
@@ -1816,13 +1825,23 @@ teardown() {
 
     echo "Tearing down session $SESSION_ID..."
 
-    # The in-sandbox wait loop is not sufficient to keep writeback off a
-    # live join: its liveness test is "can a client connect to this socket",
-    # and both the socket and the server are under the payload's control
-    # (`rm tmux.sock`, `tmux kill-server`). This lock is on the host side and
-    # on a path the sandbox cannot see (see the --join branch), so it holds
-    # regardless of what happens inside. Bounded, never an unbounded block:
-    # a stale lock must not be able to hang teardown forever.
+    # This is the lock that actually keeps writeback off a live join. The
+    # case it's for is teardown running as an EXIT trap on a fatal signal —
+    # Ctrl-C on the launching terminal, a CI timeout killing sbx — while the
+    # sandbox is still fully up: bwrap only dies with its parent once sbx
+    # has already exited, i.e. after this trap has run, so the in-sandbox
+    # PID-1 waiter (see session.sh) plays no part in that path and cannot
+    # order anything here. The tampering case the waiter genuinely is
+    # vulnerable to (`rm tmux.sock`, `tmux kill-server`) turns out not to
+    # need this lock at all: killing the waiter is what makes bwrap return,
+    # and bwrap returning tears down the pid namespace that the join's pane
+    # lives in, so the join has nothing left to write with by the time
+    # teardown runs — measured in tests/join.bats "writeback waits on the
+    # host lock when teardown is not gated by the sandbox". This lock is on
+    # the host side and on a path the sandbox cannot see (see the --join
+    # branch), so it holds regardless of what happens inside. Bounded,
+    # never an unbounded block: a stale lock must not be able to hang
+    # teardown forever.
     JOIN_LOCK="$STATE_DIR/join/$SESSION_ID.lock"
     if exec 9>>"$JOIN_LOCK"; then
         if ! flock -w 30 -x 9; then
@@ -2101,12 +2120,18 @@ EOF
 # or join, whichever ends last — has exited. Only then does bwrap return and
 # launch.sh proceed to teardown and the record-mount change archive. Note
 # what this does and does not promise: it keeps the sandbox alive for joins
-# the payload has finished outliving, but it is not itself a guarantee that
-# the archive never overlaps a live join. Its liveness test is socket
+# the payload has finished outliving, but its liveness test is socket
 # connectivity, and the payload can delete the socket or run
-# `tmux kill-server` — it can end its own sandbox
-# whenever it likes, taking any live join with it. The host-side flock in
-# teardown() is what makes the no-overlap property true.
+# `tmux kill-server` to end its own sandbox whenever it likes. That does not
+# in fact let a live join get missed by the archive: killing this waiter is
+# what makes bwrap return, and bwrap returning destroys the pid namespace
+# the join's pane runs in, so the join has no process left to write with —
+# measured in tests/join.bats "writeback waits on the host lock when
+# teardown is not gated by the sandbox". The overlap this waiter genuinely
+# cannot prevent is teardown running as an EXIT trap on a signal (Ctrl-C,
+# a CI timeout) while this script and the whole sandbox are still alive and
+# running normally — a path this waiter is never on, since bwrap hasn't
+# returned yet. The host-side flock in teardown() is what closes that gap.
 #
 # No `set -e`: attach is expected to fail when the payload is short-lived
 # enough to have exited before we get here, and that is not an error. A
