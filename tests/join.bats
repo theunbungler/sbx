@@ -30,9 +30,11 @@ teardown() {
 
 # Launch a sandbox in the background and wait for its tmux socket to
 # appear. $1 = sbx args, $2 = payload shell command. A tmux client needs a
-# pty, so `script -qec` supplies one.
+# pty, so `script -qec` supplies one. sbx's own output is kept (rather than
+# discarded) so a test can watch for a teardown that has begun; it is a pty
+# capture, so grep it for markers, never diff it.
 start_bg_sbx() {
-    ( cd "$PROJ" && script -qec "$SBX $1 -- /bin/sh -c '$2'" /dev/null >/dev/null 2>&1 ) &
+    ( cd "$PROJ" && script -qec "$SBX $1 -- /bin/sh -c '$2'" /dev/null >"$ROOT/launch.log" 2>&1 ) &
     BG_PID=$!
     local sock
     for _ in $(seq 100); do
@@ -54,6 +56,20 @@ join_sbx() {
 
 # A payload that parks until the test releases it.
 PARK='while [ ! -f /out/stop ]; do sleep 0.2; done'
+
+# Wait for $1 to exit, but never longer than $2 seconds: SIGTERM it and
+# reap it if it overruns. A bare `wait` would hang the whole suite on a
+# process the sandbox's own teardown was supposed to have taken with it,
+# and a process left running poisons every later test in this file.
+reap_bounded() {   # <pid> <seconds>
+    local i
+    for ((i = 0; i < $2 * 10; i++)); do
+        kill -0 "$1" 2>/dev/null || break
+        sleep 0.1
+    done
+    kill -TERM "$1" 2>/dev/null || true
+    wait "$1" 2>/dev/null || true
+}
 
 @test "a join runs inside the payload's namespaces" {
     start_bg_sbx "--fs caps" "readlink /proc/self/ns/pid > /out/payload.ns; $PARK"
@@ -203,6 +219,98 @@ EOF
     [ -f "$HOSTDIR/join-done" ]
     local archived
     archived=$(find "$HOME/.local/state/sbx/changes" -path "*-$BG_SESSION/_copy/late.txt" 2>/dev/null | head -n1)
+    [ "$(cat "$archived")" = "late" ]
+}
+
+@test "writeback waits on the host lock when teardown is not gated by the sandbox" {
+    # The test above is satisfied by EITHER mechanism that orders writeback
+    # after a join: the in-sandbox PID-1 waiter, or teardown()'s host-side
+    # flock. It therefore cannot tell them apart, and the flock can be
+    # deleted outright with that test still green. This one separates them.
+    #
+    # The separation is not done by having the payload destroy the waiter's
+    # liveness signal (`tmux kill-server`, `rm tmux.sock`). That looks like
+    # the right lever and is not: the waiter exiting is exactly what makes
+    # bwrap return, and bwrap returning destroys the pid namespace, which
+    # kills the join's pane. A join whose signal-destroying payload has gone
+    # cannot write AFTER teardown starts, because it cannot run at all —
+    # measured on this branch, the pane's last write lands before bwrap
+    # returns whichever of those two the payload does. So no ordering of the
+    # archive can be violated, with or without the lock.
+    #
+    # What does reach the lock is a teardown that runs while the sandbox is
+    # still up. teardown() is an EXIT trap, bash runs EXIT traps for a fatal
+    # signal, and bwrap only dies with its parent once that parent is
+    # actually gone — so a SIGTERM to sbx (a Ctrl-C on the launching
+    # terminal, a CI timeout) starts the archive with the payload, the tmux
+    # server and the join all still alive and still writing. The PID-1
+    # waiter has no say here: it is not involved in this exit path at all.
+    # Only the flock holds the archive back, and the late write below lands
+    # in the archive if and only if it does.
+    cat > "$PROJ/.sbx/profiles/fs/cp.json" <<EOF
+{"description":"test","mounts":[
+  {"source":"$HOSTDIR","dest":"/out","perm":"rw"},
+  {"source":"$ROOT/src","dest":"/copy","perm":"record"}
+]}
+EOF
+    mkdir -p "$ROOT/src"
+
+    start_bg_sbx "--fs cp" "$PARK"
+
+    ( cd "$PROJ" && script -qec "$SBX --join $BG_SESSION -- /bin/sh -c 'while [ ! -f /out/join-go ]; do sleep 0.2; done; echo late > /copy/late.txt; echo done > /out/join-done'" /dev/null >/dev/null 2>&1 ) &
+    local join_pid=$!
+
+    # The join must hold its shared lock before teardown asks for the
+    # exclusive one, or the test proves nothing. Explicit flag, not a
+    # fall-through: a loop that simply runs out must fail here rather than
+    # leave the assertions below to pass vacuously.
+    local joined=""
+    for _ in $(seq 100); do
+        if [[ "$(tmux -S "$BG_SDIR/tmux.sock" list-sessions 2>/dev/null | wc -l)" -ge 2 ]]; then
+            joined=1
+            break
+        fi
+        sleep 0.1
+    done
+    [ -n "$joined" ]
+
+    # sbx records its own pid for the liveness scan; signalling that is what
+    # runs teardown() out from under a live sandbox. Checked before use: a
+    # kill aimed at a stale or malformed pid would be a test that terminates
+    # something else on the machine.
+    local sbx_pid
+    sbx_pid=$(cat "$HOME/.local/state/sbx/join/$BG_SESSION.pid")
+    [[ "$sbx_pid" =~ ^[0-9]+$ ]]
+    kill -0 "$sbx_pid"
+    kill -TERM "$sbx_pid"
+
+    # Release the join only once teardown has actually begun. Without this
+    # the late write could land before the archive for ordinary reasons and
+    # the lock would never be tested.
+    local tearing=""
+    for _ in $(seq 200); do
+        if grep -q "Tearing down session" "$ROOT/launch.log" 2>/dev/null; then
+            tearing=1
+            break
+        fi
+        sleep 0.1
+    done
+    [ -n "$tearing" ]
+
+    touch "$HOSTDIR/join-go"
+    # tmux kills a pane whose server loses its socket, and teardown removes
+    # the session directory, so an unlocked teardown can leave this join
+    # dead rather than merely unarchived: bound both waits.
+    reap_bounded "$join_pid" 40
+    reap_bounded "$BG_PID" 40
+    BG_PID=""
+
+    # The join really did get to run its late write — distinguishes "the
+    # archive missed it" from "it never happened".
+    [ -f "$HOSTDIR/join-done" ]
+    local archived
+    archived=$(find "$HOME/.local/state/sbx/changes" -path "*-$BG_SESSION/_copy/late.txt" 2>/dev/null | head -n1)
+    [ -n "$archived" ]
     [ "$(cat "$archived")" = "late" ]
 }
 
