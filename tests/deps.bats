@@ -83,3 +83,77 @@ os_release() {   # <file> <ID> [<ID_LIKE>]
     [ "${lines[1]}" = "debian: sudo apt install bubblewrap" ]
     [ "${lines[2]}" = "fedora: sudo dnf install bubblewrap" ]
 }
+
+fake_bwrap() {   # <exit-status> [<stderr>]
+    mkdir -p "$FIX/bin"
+    printf '#!/bin/sh\necho "%s" >&2\nexit %s\n' "${2:-}" "$1" > "$FIX/bin/bwrap"
+    chmod +x "$FIX/bin/bwrap"
+}
+
+fake_sysctl() {   # <relative path under /proc/sys> <value>
+    mkdir -p "$FIX/sys/$(dirname "$1")"
+    echo "$2" > "$FIX/sys/$1"
+}
+
+@test "userns check passes when bwrap succeeds" {
+    fake_bwrap 0
+    PATH="$FIX/bin:$PATH" run sbx_deps_userns_check
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+@test "userns check blames AppArmor when Ubuntu's restriction is on" {
+    fake_bwrap 1 "bwrap: setting up uid map: Permission denied"
+    fake_sysctl kernel/apparmor_restrict_unprivileged_userns 1
+    PATH="$FIX/bin:$PATH" SBX_PROC_SYS="$FIX/sys" run sbx_deps_userns_check
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"AppArmor"* ]]
+    [[ "$output" == *"userns,"* ]]
+    [[ "$output" == *"apparmor_parser -r"* ]]
+}
+
+@test "userns check blames unprivileged_userns_clone when it is 0" {
+    fake_bwrap 1 "bwrap: No permissions to create new namespace"
+    fake_sysctl kernel/apparmor_restrict_unprivileged_userns 0
+    fake_sysctl kernel/unprivileged_userns_clone 0
+    PATH="$FIX/bin:$PATH" SBX_PROC_SYS="$FIX/sys" run sbx_deps_userns_check
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"kernel.unprivileged_userns_clone=1"* ]]
+}
+
+@test "userns check blames max_user_namespaces when it is 0" {
+    fake_bwrap 1 "bwrap: No space left on device"
+    fake_sysctl user/max_user_namespaces 0
+    PATH="$FIX/bin:$PATH" SBX_PROC_SYS="$FIX/sys" run sbx_deps_userns_check
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"user.max_user_namespaces"* ]]
+}
+
+@test "userns check with no known cause shows bwrap's own message" {
+    fake_bwrap 1 "bwrap: something unexpected"
+    mkdir -p "$FIX/sys"
+    PATH="$FIX/bin:$PATH" SBX_PROC_SYS="$FIX/sys" run sbx_deps_userns_check
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"bwrap: something unexpected"* ]]
+}
+
+@test "subids ok when the user has both ranges" {
+    printf '%s:100000:65536\n' "$(id -un)" > "$FIX/subuid"
+    printf '%s:100000:65536\n' "$(id -u)"  > "$FIX/subgid"
+    SBX_SUBUID="$FIX/subuid" SBX_SUBGID="$FIX/subgid" run sbx_deps_subids_ok
+    [ "$status" -eq 0 ]
+}
+
+@test "subids not ok when one file lacks the user" {
+    printf '%s:100000:65536\n' "$(id -un)" > "$FIX/subuid"
+    printf 'someoneelse:100000:65536\n'   > "$FIX/subgid"
+    SBX_SUBUID="$FIX/subuid" SBX_SUBGID="$FIX/subgid" run sbx_deps_subids_ok
+    [ "$status" -eq 1 ]
+}
+
+@test "subids not ok when a name merely starts with the user's" {
+    printf '%sx:100000:65536\n' "$(id -un)" > "$FIX/subuid"
+    cp "$FIX/subuid" "$FIX/subgid"
+    SBX_SUBUID="$FIX/subuid" SBX_SUBGID="$FIX/subgid" run sbx_deps_subids_ok
+    [ "$status" -eq 1 ]
+}

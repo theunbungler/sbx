@@ -119,3 +119,78 @@ sbx_deps_install_hint() {
             ;;
     esac
 }
+
+# Read one sysctl value, or nothing if the knob does not exist on this
+# kernel (unprivileged_userns_clone is a Debian/Arch patch, the AppArmor
+# knob is Ubuntu's).
+sbx_deps_sysctl() {
+    local v=""
+    read -r v < "${SBX_PROC_SYS:-/proc/sys}/$1" 2>/dev/null || true
+    echo "$v"
+}
+
+sbx_deps_userns_explain() {
+    local bwrap_err="$1" bw
+    if [[ "$(sbx_deps_sysctl kernel/apparmor_restrict_unprivileged_userns)" == "1" ]]; then
+        bw=$(command -v bwrap || echo /usr/bin/bwrap)
+        cat <<EOF
+Cause: AppArmor restricts unprivileged user namespaces
+  (kernel.apparmor_restrict_unprivileged_userns = 1, the Ubuntu 24.04+ default).
+Fix: allow bwrap to create them. As root, create /etc/apparmor.d/sbx-bwrap:
+
+  abi <abi/4.0>,
+  include <tunables/global>
+
+  profile sbx-bwrap $bw flags=(unconfined) {
+    userns,
+  }
+
+then load it:  sudo apparmor_parser -r /etc/apparmor.d/sbx-bwrap
+EOF
+        return 0
+    fi
+    if [[ "$(sbx_deps_sysctl kernel/unprivileged_userns_clone)" == "0" ]]; then
+        cat <<EOF
+Cause: the kernel disallows unprivileged user namespaces
+  (kernel.unprivileged_userns_clone = 0).
+Fix:  sudo sysctl -w kernel.unprivileged_userns_clone=1
+  To keep it across reboots:
+  echo 'kernel.unprivileged_userns_clone = 1' | sudo tee /etc/sysctl.d/90-sbx-userns.conf
+EOF
+        return 0
+    fi
+    if [[ "$(sbx_deps_sysctl user/max_user_namespaces)" == "0" ]]; then
+        cat <<EOF
+Cause: user namespaces are capped at zero (user.max_user_namespaces = 0).
+Fix:  sudo sysctl -w user.max_user_namespaces=10000
+  To keep it across reboots:
+  echo 'user.max_user_namespaces = 10000' | sudo tee /etc/sysctl.d/90-sbx-userns.conf
+EOF
+        return 0
+    fi
+    echo "Cause: not one sbx recognises. bwrap reported:"
+    echo "  $bwrap_err"
+}
+
+sbx_deps_userns_check() {
+    local err
+    if err=$(bwrap --unshare-user --ro-bind / / true 2>&1 >/dev/null); then
+        return 0
+    fi
+    echo "Error: bwrap cannot create an unprivileged user namespace, which every sbx session needs."
+    sbx_deps_userns_explain "$err"
+    return 1
+}
+
+# userns: full maps the user's subordinate range through newuidmap, which
+# refuses outright without an entry. Entries may name the user or the UID.
+sbx_deps_subids_ok() {
+    local user uid f
+    user=$(id -un)
+    uid=$(id -u)
+    for f in "${SBX_SUBUID:-/etc/subuid}" "${SBX_SUBGID:-/etc/subgid}"; do
+        awk -F: -v u="$user" -v i="$uid" '$1 == u || $1 == i { found = 1 } END { exit !found }' "$f" 2>/dev/null \
+            || return 1
+    done
+    return 0
+}
