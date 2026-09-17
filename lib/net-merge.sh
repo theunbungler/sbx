@@ -115,21 +115,30 @@ sbx_net_merge() {   # <net profile path>...
 
     mapfile -t upstreams < <(printf '%s\n' "${upstreams[@]}" | sort -u)
 
+    # Each row below is built by jq itself (--arg fully escapes the key and
+    # values as JSON), never assembled by hand with a text delimiter. A
+    # delimiter split apart later — like the tab this used to join columns
+    # with — would corrupt any domain or CIDR key that happens to contain
+    # that same character. jq accepts a bare stream of JSON values with no
+    # separator required between them, so the rows can simply be
+    # concatenated and slurped.
     {
         for k in "${!domain_ports[@]}"; do
-            printf 'd\t%s\t%s\t%s\n' "$k" "${domain_ports[$k]}" "${domain_upstream[$k]}"
+            jq -cn --arg key "$k" --arg ports "${domain_ports[$k]}" --arg upstream "${domain_upstream[$k]}" \
+                '{type: "d", key: $key, ports: $ports, upstream: $upstream}'
         done
         for k in "${!cidr_ports[@]}"; do
-            printf 'c\t%s\t%s\n' "$k" "${cidr_ports[$k]}"
+            jq -cn --arg key "$k" --arg ports "${cidr_ports[$k]}" \
+                '{type: "c", key: $key, ports: $ports}'
         done
-    } | jq -S -R -s \
+    } | jq -S -s \
         --argjson allow_all "$allow_all" \
         --arg allow_all_ports "$allow_all_ports" \
         --arg test_domain "$test_domain" \
-        '(split("\n") | map(select(length > 0) | split("\t"))) as $rows
+        '. as $rows
          | { upstreams: $ARGS.positional,
-             domains: ([$rows[] | select(.[0] == "d") | {key: .[1], value: {ports: .[2], upstream: .[3]}}] | from_entries),
-             cidrs: ([$rows[] | select(.[0] == "c") | {key: .[1], value: .[2]}] | from_entries),
+             domains: ([$rows[] | select(.type == "d") | {key: .key, value: {ports: .ports, upstream: .upstream}}] | from_entries),
+             cidrs: ([$rows[] | select(.type == "c") | {key: .key, value: .ports}] | from_entries),
              allow_all: $allow_all,
              allow_all_ports: $allow_all_ports,
              test_domain: $test_domain }' \

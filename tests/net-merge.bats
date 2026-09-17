@@ -68,3 +68,16 @@ profile() {   # <name> <json>
     run sbx_net_merge "$D/wild.json" "$D/two.json"
     [ "$(jq -r .test_domain <<< "$output")" = "first.example" ]
 }
+
+# lib/profile-check.sh would reject an allow entry containing a literal tab
+# long before it reached sbx_net_merge. But this function is sourced and
+# tested directly rather than only through a validated caller, so it must
+# not assume its input already passed that check.
+@test "a domain containing a literal tab is not split across fields" {
+    profile tabby '{"allow":["a\tb.example"],"ports":[22]}'
+    run sbx_net_merge "$D/tabby.json"
+    [ "$status" -eq 0 ]
+    [ "$(jq -c '.domains | keys' <<< "$output")" = '["a\tb.example"]' ]
+    [ "$(jq -r '.domains["a\tb.example"].ports' <<< "$output")" = "22" ]
+    [ "$(jq -r '.domains["a\tb.example"].upstream' <<< "$output")" = "1.1.1.1" ]
+}
