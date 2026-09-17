@@ -68,7 +68,7 @@ the error alone. On Ubuntu 24.04 and later this is blocked by AppArmor by
 default; the doctor prints the profile that allows it.
 
 A launch runs the same checks for just the groups it needs, and stops
-before creating anything.
+before building a session.
 
 ## Usage
 

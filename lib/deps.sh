@@ -4,8 +4,10 @@
 #
 # Sourced by sbx and directly by tests/. Defines functions and one table
 # only — no side effects at source time, no dependency on sbx globals.
-# Uses bash builtins plus awk and nothing else: this file is what reports
-# that the rest of the toolchain is missing.
+# Contract: bash builtins plus awk and id — this file is what reports that
+# the rest of the toolchain is missing. The userns diagnosis path
+# (sbx_deps_userns_explain and its helpers) additionally uses realpath and
+# stat, both core tools, and runs bwrap itself as the probe.
 
 # tool       group   arch        debian        fedora
 SBX_DEPS=(
@@ -32,6 +34,7 @@ SBX_DEPS=(
 # the same either way.
 sbx_deps_family() {
     local file="${SBX_OS_RELEASE:-/etc/os-release}" key val id="" like="" word
+    local -a words
     if [[ -r "$file" ]]; then
         while IFS='=' read -r key val || [[ -n "$key" ]]; do
             val="${val#[\"\']}"
@@ -42,8 +45,8 @@ sbx_deps_family() {
             esac
         done < "$file"
     fi
-    # shellcheck disable=SC2086  # ID_LIKE is a space-separated list
-    for word in $id $like; do
+    read -ra words <<< "$id $like"
+    for word in "${words[@]}"; do
         case "$word" in
             arch|manjaro|endeavouros|garuda|artix)           echo arch;   return 0 ;;
             debian|ubuntu|linuxmint|pop|raspbian|kali)       echo debian; return 0 ;;
@@ -129,23 +132,76 @@ sbx_deps_sysctl() {
     echo "$v"
 }
 
+# Resolve the bwrap path used ONLY by the AppArmor explain text below (never
+# by the probe itself). SBX_BWRAP_PATH overrides for tests; otherwise resolve
+# `command -v bwrap` through realpath so a symlink or a PATH-shadowing copy
+# (e.g. from a project .envrc) doesn't get named in a profile meant to be
+# installed as root. Falls back to /usr/bin/bwrap if realpath is unavailable.
+sbx_deps_bwrap_path() {
+    if [[ -n "${SBX_BWRAP_PATH:-}" ]]; then
+        echo "$SBX_BWRAP_PATH"
+        return 0
+    fi
+    local raw
+    raw=$(command -v bwrap || echo /usr/bin/bwrap)
+    if command -v realpath >/dev/null 2>&1; then
+        realpath "$raw" 2>/dev/null || echo "$raw"
+    else
+        echo /usr/bin/bwrap
+    fi
+}
+
+# True if $1 is owned by root and lives under /usr/ or /bin/ — the bar for
+# naming it in an AppArmor profile that will be installed as root. `[[ -O ]]`
+# is the wrong check (it tests the invoking user, not root); use `stat`
+# instead, and treat an unreadable/unavailable `stat` as untrusted.
+sbx_deps_bwrap_trusted() {
+    local path="$1" owner
+    command -v stat >/dev/null 2>&1 || return 1
+    owner=$(stat -c %u "$path" 2>/dev/null) || return 1
+    [[ "$owner" == "0" ]] || return 1
+    [[ "$path" == /usr/* || "$path" == /bin/* ]] || return 1
+    return 0
+}
+
 sbx_deps_userns_explain() {
-    local bwrap_err="$1" bw
+    local bwrap_err="$1" bw extra_dir
     if [[ "$(sbx_deps_sysctl kernel/apparmor_restrict_unprivileged_userns)" == "1" ]]; then
-        bw=$(command -v bwrap || echo /usr/bin/bwrap)
+        bw=$(sbx_deps_bwrap_path)
         printf '%s\n' \
             "Cause: AppArmor restricts unprivileged user namespaces" \
-            "  (kernel.apparmor_restrict_unprivileged_userns = 1, the Ubuntu 24.04+ default)." \
-            "Fix: allow bwrap to create them. As root, create /etc/apparmor.d/sbx-bwrap:" \
-            "" \
-            "  abi <abi/4.0>," \
-            "  include <tunables/global>" \
-            "" \
-            "  profile sbx-bwrap $bw flags=(unconfined) {" \
-            "    userns," \
-            "  }" \
-            "" \
-            "then load it:  sudo apparmor_parser -r /etc/apparmor.d/sbx-bwrap"
+            "  (kernel.apparmor_restrict_unprivileged_userns = 1, the Ubuntu 24.04+ default)."
+        if ! sbx_deps_bwrap_trusted "$bw"; then
+            printf '%s\n' \
+                "Warning: bwrap resolves to \"$bw\", which is not a root-owned system binary." \
+                "  sbx will not suggest an AppArmor exemption for it." \
+                "bwrap reported: $bwrap_err"
+            return 0
+        fi
+        extra_dir="${SBX_APPARMOR_EXTRA:-/usr/share/apparmor/extra-profiles}"
+        if [[ -e "$extra_dir/bwrap-userns-restrict" ]]; then
+            printf '%s\n' \
+                "Fix: apply Ubuntu's own bwrap-userns-restrict profile. As root:" \
+                "" \
+                "  sudo install -m 644 $extra_dir/bwrap-userns-restrict /etc/apparmor.d/" \
+                "  sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict"
+        else
+            printf '%s\n' \
+                "Note: this lets any local user create user namespaces through bwrap, which is what Ubuntu's restriction exists to limit." \
+                "Fix: allow bwrap to create them. As root, create /etc/apparmor.d/sbx-bwrap:" \
+                "" \
+                "  abi <abi/4.0>," \
+                "  include <tunables/global>" \
+                "" \
+                "  profile sbx-bwrap $bw flags=(unconfined) {" \
+                "    userns," \
+                "  }" \
+                "" \
+                "then load it:  sudo apparmor_parser -r /etc/apparmor.d/sbx-bwrap"
+        fi
+        printf '%s\n' \
+            "If --net sessions still fail, pasta may need the same allowance (not yet verified on Ubuntu)." \
+            "bwrap reported: $bwrap_err"
         return 0
     fi
     if [[ "$(sbx_deps_sysctl kernel/unprivileged_userns_clone)" == "0" ]]; then
@@ -154,7 +210,8 @@ sbx_deps_userns_explain() {
             "  (kernel.unprivileged_userns_clone = 0)." \
             "Fix:  sudo sysctl -w kernel.unprivileged_userns_clone=1" \
             "  To keep it across reboots:" \
-            "  echo 'kernel.unprivileged_userns_clone = 1' | sudo tee /etc/sysctl.d/90-sbx-userns.conf"
+            "  echo 'kernel.unprivileged_userns_clone = 1' | sudo tee /etc/sysctl.d/90-sbx-userns-clone.conf" \
+            "bwrap reported: $bwrap_err"
         return 0
     fi
     if [[ "$(sbx_deps_sysctl user/max_user_namespaces)" == "0" ]]; then
@@ -162,7 +219,8 @@ sbx_deps_userns_explain() {
             "Cause: user namespaces are capped at zero (user.max_user_namespaces = 0)." \
             "Fix:  sudo sysctl -w user.max_user_namespaces=10000" \
             "  To keep it across reboots:" \
-            "  echo 'user.max_user_namespaces = 10000' | sudo tee /etc/sysctl.d/90-sbx-userns.conf"
+            "  echo 'user.max_user_namespaces = 10000' | sudo tee /etc/sysctl.d/90-sbx-max-userns.conf" \
+            "bwrap reported: $bwrap_err"
         return 0
     fi
     echo "Cause: not one sbx recognises. bwrap reported:"
@@ -299,6 +357,7 @@ sbx_deps_doctor() {
                 if [[ "$subids" == "false" ]]; then
                     echo "         ✗ no subordinate UID/GID range for $user (needed by \"userns\": \"full\")"
                     echo "           sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $user"
+                    echo "           (choose a range not already used by another user in /etc/subuid)"
                 fi
                 ;;
         esac

@@ -105,11 +105,43 @@ fake_sysctl() {   # <relative path under /proc/sys> <value>
 @test "userns check blames AppArmor when Ubuntu's restriction is on" {
     fake_bwrap 1 "bwrap: setting up uid map: Permission denied"
     fake_sysctl kernel/apparmor_restrict_unprivileged_userns 1
-    PATH="$FIX/bin:$PATH" SBX_PROC_SYS="$FIX/sys" run sbx_deps_userns_check
+    PATH="$FIX/bin:$PATH" SBX_PROC_SYS="$FIX/sys" SBX_BWRAP_PATH=/usr/bin/bwrap \
+        SBX_APPARMOR_EXTRA="$FIX/no-such-dir" run sbx_deps_userns_check
     [ "$status" -eq 1 ]
     [[ "$output" == *"AppArmor"* ]]
     [[ "$output" == *"userns,"* ]]
     [[ "$output" == *"apparmor_parser -r"* ]]
+}
+
+@test "userns check warns instead of naming a non-root-owned bwrap in the AppArmor profile" {
+    fake_bwrap 1 "bwrap: setting up uid map: Permission denied"
+    fake_sysctl kernel/apparmor_restrict_unprivileged_userns 1
+    PATH="$FIX/bin:$PATH" SBX_PROC_SYS="$FIX/sys" run sbx_deps_userns_check
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"not a root-owned system binary"* ]]
+    if [[ "$output" == *"profile sbx-bwrap"* ]]; then return 1; fi
+}
+
+@test "userns check recommends bwrap-userns-restrict when the extra profile exists" {
+    fake_bwrap 1 "bwrap: setting up uid map: Permission denied"
+    fake_sysctl kernel/apparmor_restrict_unprivileged_userns 1
+    mkdir -p "$FIX/extra-profiles"
+    : > "$FIX/extra-profiles/bwrap-userns-restrict"
+    PATH="$FIX/bin:$PATH" SBX_PROC_SYS="$FIX/sys" SBX_BWRAP_PATH=/usr/bin/bwrap \
+        SBX_APPARMOR_EXTRA="$FIX/extra-profiles" run sbx_deps_userns_check
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"bwrap-userns-restrict"* ]]
+    [[ "$output" == *"apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict"* ]]
+}
+
+@test "userns check warns what the fallback AppArmor profile weakens when the extra profile is absent" {
+    fake_bwrap 1 "bwrap: setting up uid map: Permission denied"
+    fake_sysctl kernel/apparmor_restrict_unprivileged_userns 1
+    PATH="$FIX/bin:$PATH" SBX_PROC_SYS="$FIX/sys" SBX_BWRAP_PATH=/usr/bin/bwrap \
+        SBX_APPARMOR_EXTRA="$FIX/no-such-dir" run sbx_deps_userns_check
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"any local user"* ]]
+    [[ "$output" == *"pasta may need the same allowance"* ]]
 }
 
 @test "userns check blames unprivileged_userns_clone when it is 0" {
@@ -119,6 +151,7 @@ fake_sysctl() {   # <relative path under /proc/sys> <value>
     PATH="$FIX/bin:$PATH" SBX_PROC_SYS="$FIX/sys" run sbx_deps_userns_check
     [ "$status" -eq 1 ]
     [[ "$output" == *"kernel.unprivileged_userns_clone=1"* ]]
+    [[ "$output" == *"bwrap reported: bwrap: No permissions to create new namespace"* ]]
 }
 
 @test "userns check blames max_user_namespaces when it is 0" {

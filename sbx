@@ -221,6 +221,10 @@ ASSUME_YES=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --doctor)
+            if [[ -n "${2:-}" && "${2:-}" != "--json" ]]; then
+                echo "Error: --doctor takes only --json." >&2
+                exit 2
+            fi
             doctor_rc=0
             sbx_deps_doctor "${2:-}" || doctor_rc=$?
             exit "$doctor_rc"
@@ -732,7 +736,9 @@ fi
 # --- Dependency preflight: optional groups ---
 # Chosen from what the flags and the feature scan above turned on.
 DEP_GROUPS=()
-[[ ${#NET_PROFILES[@]} -gt 0 ]] && DEP_GROUPS+=(net)
+if [[ ${#NET_PROFILES[@]} -gt 0 || ${#HOST_PORTS_TCP[@]} -gt 0 || ${#HOST_PORTS_UDP[@]} -gt 0 ]]; then
+    DEP_GROUPS+=(net)
+fi
 [[ "$GUI_FLAG" == "true" ]] && DEP_GROUPS+=(gui)
 if [[ "$USERNS_FULL" == "true" || "$CAPS_KEEP" == "true" || "$DOCKER_API" == "true" ]]; then
     DEP_GROUPS+=(podman)
@@ -743,6 +749,7 @@ fi
 if [[ "$USERNS_FULL" == "true" ]] && ! sbx_deps_subids_ok; then
     echo "Error: profile '$USERNS_PROFILE' sets \"userns\": \"full\", which needs a subordinate UID and GID range for $(id -un)." >&2
     echo "  Add one:  sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $(id -un)" >&2
+    echo "  (choose a range not already used by another user in /etc/subuid)" >&2
     exit 1
 fi
 

@@ -71,6 +71,20 @@ no_session_built() {
     no_session_built
 }
 
+@test "--doctor rejects an argument other than --json" {
+    run_sbx arch --doctor junk
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"--doctor takes only --json"* ]]
+}
+
+@test "missing pasta with --host-port alone stops with the arch command" {
+    rm "$ROOT/bin/pasta"
+    run_sbx arch --host-port 8080 -- /bin/true
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"sudo pacman -S passt"* ]]
+    no_session_built
+}
+
 @test "missing xpra with --gui stops before a display is built" {
     rm "$ROOT/bin/xpra"
     run_sbx arch --gui -- /bin/true
