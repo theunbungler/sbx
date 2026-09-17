@@ -188,3 +188,75 @@ fake_sysctl() {   # <relative path under /proc/sys> <value>
     [ "$status" -eq 1 ]
     [[ "$output" == *"unprivileged user namespace"* ]]
 }
+
+doctor_bin() {   # <tool to omit>...: a PATH holding every table tool except those named
+    mkdir -p "$FIX/bin"
+    local tool skip
+    while IFS= read -r tool; do
+        for skip in "$@"; do [[ "$tool" == "$skip" ]] && continue 2; done
+        ln -sf "$(command -v "$tool")" "$FIX/bin/$tool"
+    done < <(sbx_deps_tools core net gui podman)
+    # id and awk are used by the subid check
+    ln -sf "$(command -v id)" "$FIX/bin/id"
+    ln -sf "$(command -v awk)" "$FIX/bin/awk"
+}
+
+@test "doctor: all present exits 0 and reports each group" {
+    doctor_bin bwrap
+    fake_bwrap 0
+    os_release "$FIX/os" manjaro arch
+    PATH="$FIX/bin" SBX_OS_RELEASE="$FIX/os" run sbx_deps_doctor
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"distro family: arch"* ]]
+    [[ "$output" == *"✓ unprivileged user namespaces"* ]]
+    if [[ "$output" == *"Install missing packages"* ]]; then return 1; fi
+}
+
+@test "doctor: a missing optional tool is reported but exits 0" {
+    doctor_bin bwrap pasta
+    fake_bwrap 0
+    os_release "$FIX/os" fedora
+    PATH="$FIX/bin" SBX_OS_RELEASE="$FIX/os" run sbx_deps_doctor
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"✗ missing: pasta"* ]]
+    [[ "$output" == *"sudo dnf install passt"* ]]
+}
+
+@test "doctor: a missing core tool exits 1" {
+    doctor_bin bwrap jq
+    fake_bwrap 0
+    PATH="$FIX/bin" run sbx_deps_doctor
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"✗ missing: jq"* ]]
+}
+
+@test "doctor: missing bwrap marks userns unknown" {
+    doctor_bin bwrap
+    PATH="$FIX/bin" run sbx_deps_doctor
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"? unprivileged user namespaces (needs bwrap)"* ]]
+}
+
+@test "doctor: a failing probe exits 1 and includes the diagnosis" {
+    doctor_bin bwrap
+    fake_bwrap 1 "bwrap: nope"
+    fake_sysctl kernel/unprivileged_userns_clone 0
+    PATH="$FIX/bin" SBX_PROC_SYS="$FIX/sys" run sbx_deps_doctor
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"kernel.unprivileged_userns_clone=1"* ]]
+}
+
+@test "doctor --json is parseable and matches the text report" {
+    doctor_bin bwrap pasta
+    fake_bwrap 0
+    os_release "$FIX/os" ubuntu debian
+    : > "$FIX/subuid"; : > "$FIX/subgid"
+    PATH="$FIX/bin" SBX_OS_RELEASE="$FIX/os" SBX_SUBUID="$FIX/subuid" SBX_SUBGID="$FIX/subgid" \
+        run sbx_deps_doctor --json
+    [ "$status" -eq 0 ]
+    [ "$(jq -r .family <<< "$output")" = "debian" ]
+    [ "$(jq -c .groups.net <<< "$output")" = '["pasta"]' ]
+    [ "$(jq -r .userns <<< "$output")" = "true" ]
+    [ "$(jq -r .subids <<< "$output")" = "false" ]
+    [ "$(jq -r '.install[0]' <<< "$output")" = "sudo apt install passt" ]
+}

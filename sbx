@@ -82,6 +82,7 @@ Usage: $(basename "$0") [options] [command]
 Options:
   --list-profiles        Show available profiles
   --list-sessions        Show active sessions
+  --doctor [--json]      Check dependencies and host setup, with install commands
   --changes [<id>]       Show what a record mount changed (default: latest)
   --join <session>       Open a new shell inside a running session
                          (--join <session> -- <cmd> runs <cmd> instead)
@@ -219,6 +220,11 @@ ASSUME_YES=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --doctor)
+            doctor_rc=0
+            sbx_deps_doctor "${2:-}" || doctor_rc=$?
+            exit "$doctor_rc"
+            ;;
         --list-profiles)
             list_profiles
             exit 0

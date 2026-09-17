@@ -54,6 +54,22 @@ What that buys you, in a session without `"caps": "keep"`:
   allowed IP is reachable on any port. Narrowing to 443 would break `git push`
   over SSH to `github.com`.
 
+## Checking your setup
+
+Run `./sbx --doctor` first. It groups dependencies by what needs them —
+`core` (every session), `net` (`--net`), `gui` (`--gui`) and `podman`
+(`userns`, `caps` or `docker_api` profiles) — and prints one install
+command for everything missing, for Arch, Debian/Ubuntu or Fedora
+families.
+
+It also checks that bwrap can actually create an unprivileged user
+namespace, which is the setup failure that is hardest to recognise from
+the error alone. On Ubuntu 24.04 and later this is blocked by AppArmor by
+default; the doctor prints the profile that allows it.
+
+A launch runs the same checks for just the groups it needs, and stops
+before creating anything.
+
 ## Usage
 
 To see all available commands and options, run:
@@ -66,6 +82,7 @@ To see all available commands and options, run:
 
 | Command | Description |
 |---------|-------------|
+| `--doctor [--json]` | Check that required tools are installed and that unprivileged user namespaces work. Prints the install command for your distro. Exits non-zero only if something every session needs is missing. |
 | `--list-profiles` | Show all available CLI, FS, and NET profiles. |
 | `--list-sessions` | List all currently active sandbox sessions. |
 | `--join <session>` | Open a new shell inside a running sandbox session, with its own terminal. Append `-- <cmd>` to run a command instead. |

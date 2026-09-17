@@ -133,39 +133,36 @@ sbx_deps_userns_explain() {
     local bwrap_err="$1" bw
     if [[ "$(sbx_deps_sysctl kernel/apparmor_restrict_unprivileged_userns)" == "1" ]]; then
         bw=$(command -v bwrap || echo /usr/bin/bwrap)
-        cat <<EOF
-Cause: AppArmor restricts unprivileged user namespaces
-  (kernel.apparmor_restrict_unprivileged_userns = 1, the Ubuntu 24.04+ default).
-Fix: allow bwrap to create them. As root, create /etc/apparmor.d/sbx-bwrap:
-
-  abi <abi/4.0>,
-  include <tunables/global>
-
-  profile sbx-bwrap $bw flags=(unconfined) {
-    userns,
-  }
-
-then load it:  sudo apparmor_parser -r /etc/apparmor.d/sbx-bwrap
-EOF
+        printf '%s\n' \
+            "Cause: AppArmor restricts unprivileged user namespaces" \
+            "  (kernel.apparmor_restrict_unprivileged_userns = 1, the Ubuntu 24.04+ default)." \
+            "Fix: allow bwrap to create them. As root, create /etc/apparmor.d/sbx-bwrap:" \
+            "" \
+            "  abi <abi/4.0>," \
+            "  include <tunables/global>" \
+            "" \
+            "  profile sbx-bwrap $bw flags=(unconfined) {" \
+            "    userns," \
+            "  }" \
+            "" \
+            "then load it:  sudo apparmor_parser -r /etc/apparmor.d/sbx-bwrap"
         return 0
     fi
     if [[ "$(sbx_deps_sysctl kernel/unprivileged_userns_clone)" == "0" ]]; then
-        cat <<EOF
-Cause: the kernel disallows unprivileged user namespaces
-  (kernel.unprivileged_userns_clone = 0).
-Fix:  sudo sysctl -w kernel.unprivileged_userns_clone=1
-  To keep it across reboots:
-  echo 'kernel.unprivileged_userns_clone = 1' | sudo tee /etc/sysctl.d/90-sbx-userns.conf
-EOF
+        printf '%s\n' \
+            "Cause: the kernel disallows unprivileged user namespaces" \
+            "  (kernel.unprivileged_userns_clone = 0)." \
+            "Fix:  sudo sysctl -w kernel.unprivileged_userns_clone=1" \
+            "  To keep it across reboots:" \
+            "  echo 'kernel.unprivileged_userns_clone = 1' | sudo tee /etc/sysctl.d/90-sbx-userns.conf"
         return 0
     fi
     if [[ "$(sbx_deps_sysctl user/max_user_namespaces)" == "0" ]]; then
-        cat <<EOF
-Cause: user namespaces are capped at zero (user.max_user_namespaces = 0).
-Fix:  sudo sysctl -w user.max_user_namespaces=10000
-  To keep it across reboots:
-  echo 'user.max_user_namespaces = 10000' | sudo tee /etc/sysctl.d/90-sbx-userns.conf
-EOF
+        printf '%s\n' \
+            "Cause: user namespaces are capped at zero (user.max_user_namespaces = 0)." \
+            "Fix:  sudo sysctl -w user.max_user_namespaces=10000" \
+            "  To keep it across reboots:" \
+            "  echo 'user.max_user_namespaces = 10000' | sudo tee /etc/sysctl.d/90-sbx-userns.conf"
         return 0
     fi
     echo "Cause: not one sbx recognises. bwrap reported:"
@@ -217,4 +214,101 @@ sbx_deps_require() {
         sbx_deps_userns_check >&2 || return 1
     fi
     return 0
+}
+
+sbx_deps_json_list() {
+    local first=1 x
+    printf '['
+    for x in "$@"; do
+        [[ $first -eq 1 ]] || printf ','
+        printf '"%s"' "$x"
+        first=0
+    done
+    printf ']'
+}
+
+sbx_deps_doctor() {
+    local json=false
+    [[ "${1:-}" == "--json" ]] && json=true
+
+    local family group rc=0 userns=null userns_msg="" subids=false user line
+    local -a missing tools all_missing=() hint=()
+    local -A group_missing=()
+
+    family=$(sbx_deps_family)
+    user=$(id -un)
+    for group in core net gui podman; do
+        mapfile -t missing < <(sbx_deps_missing "$group")
+        group_missing[$group]="${missing[*]}"
+        all_missing+=("${missing[@]}")
+    done
+    if [[ -n "${group_missing[core]}" ]]; then
+        rc=1
+    fi
+    if command -v bwrap >/dev/null 2>&1; then
+        if userns_msg=$(sbx_deps_userns_check); then
+            userns=true
+        else
+            userns=false
+            rc=1
+        fi
+    fi
+    if sbx_deps_subids_ok; then
+        subids=true
+    fi
+    if [[ ${#all_missing[@]} -gt 0 ]]; then
+        mapfile -t hint < <(sbx_deps_install_hint "$family" "${all_missing[@]}")
+    fi
+
+    if $json; then
+        printf '{"family":"%s","ok":%s,"groups":{' "$family" "$([[ $rc -eq 0 ]] && echo true || echo false)"
+        local first=1
+        for group in core net gui podman; do
+            [[ $first -eq 1 ]] || printf ','
+            # shellcheck disable=SC2086  # the stored list is space-separated
+            printf '"%s":%s' "$group" "$(sbx_deps_json_list ${group_missing[$group]})"
+            first=0
+        done
+        printf '},"userns":%s,"subids":%s,"install":%s}\n' "$userns" "$subids" "$(sbx_deps_json_list "${hint[@]}")"
+        return $rc
+    fi
+
+    echo "sbx doctor — distro family: $family"
+    echo
+    for group in core net gui podman; do
+        if [[ -z "${group_missing[$group]}" ]]; then
+            mapfile -t tools < <(sbx_deps_tools "$group")
+            printf '%-8s ✓ %s\n' "$group" "${tools[*]}"
+        else
+            printf '%-8s ✗ missing: %s\n' "$group" "${group_missing[$group]}"
+        fi
+        case "$group" in
+            core)
+                case "$userns" in
+                    true)  echo "         ✓ unprivileged user namespaces" ;;
+                    null)  echo "         ? unprivileged user namespaces (needs bwrap)" ;;
+                    false)
+                        echo "         ✗ unprivileged user namespaces"
+                        while IFS= read -r line; do
+                            echo "           $line"
+                        done <<< "$userns_msg"
+                        ;;
+                esac
+                ;;
+            podman)
+                if [[ "$subids" == "false" ]]; then
+                    echo "         ✗ no subordinate UID/GID range for $user (needed by \"userns\": \"full\")"
+                    echo "           sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $user"
+                fi
+                ;;
+        esac
+    done
+    if [[ ${#hint[@]} -gt 0 ]]; then
+        echo
+        echo "Install missing packages:"
+        for line in "${hint[@]}"; do
+            echo "  $line"
+        done
+    fi
+    return $rc
 }
