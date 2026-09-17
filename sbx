@@ -10,6 +10,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # shellcheck source=lib/copy-mounts.sh
 source "$SCRIPT_DIR/lib/copy-mounts.sh"
+# shellcheck source=lib/deps.sh
+source "$SCRIPT_DIR/lib/deps.sh"
 
 GUI_MODE=false
 XPRA_DISPLAY=""
@@ -446,8 +448,8 @@ while [[ $# -gt 0 ]]; do
                 echo "Error: Session '$JOIN_SESSION' not found or no socket available." >&2
                 exit 1
             fi
-            # Inline check, not require_tools: that function is defined
-            # further down and does not exist yet during argument parsing.
+            # Inline check, not sbx_deps_require: --join needs only tmux,
+            # and the preflight runs later, after argument parsing.
             if ! command -v tmux >/dev/null 2>&1; then
                 echo "Error: sbx requires tmux, which is not on PATH." >&2
                 exit 1
@@ -653,44 +655,19 @@ confirm_project_profile() {
     fi
 }
 
+# --- Dependency preflight: core ---
+# Everything below this point may exec a core tool — the confirmation uses
+# realpath and the feature scan uses jq — so the core group is checked
+# first, along with whether bwrap can create a user namespace at all.
+# bwrap used to be discovered only when launch.sh tried to exec it, which
+# reported nothing but "bwrap: not found" after a session directory, an
+# xpra display and a pasta namespace had already been built.
+sbx_deps_require core || exit 1
+
 for profile in "${FS_PROFILES[@]}" "$CLI_PROFILE" "${NET_PROFILES[@]}"; do
     [[ -z "$profile" ]] && continue
     confirm_project_profile "$profile"
 done
-
-# Same reasoning for the rest of the toolchain. bwrap in particular used to
-# be discovered only when the generated launch.sh tried to exec it, which
-# reported nothing but "bwrap: not found" and exit 127 — after a session
-# directory, an xpra display and a pasta namespace had already been built.
-# The --net tools are checked only when a net profile is in play.
-require_tools() {
-    local missing=() tool
-    for tool in "$@"; do
-        command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
-    done
-    [[ ${#missing[@]} -eq 0 ]] && return 0
-
-    echo "Error: sbx requires ${missing[*]}, which $([[ ${#missing[@]} -eq 1 ]] && echo "is" || echo "are") not on PATH." >&2
-    for tool in "${missing[@]}"; do
-        case "$tool" in
-            bwrap)    echo "  bwrap    — Debian/Ubuntu: apt install bubblewrap   Arch: pacman -S bubblewrap" >&2 ;;
-            pasta)    echo "  pasta    — Debian/Ubuntu: apt install passt        Arch: pacman -S passt" >&2 ;;
-            nft)      echo "  nft      — Debian/Ubuntu: apt install nftables     Arch: pacman -S nftables" >&2 ;;
-            dnsmasq)  echo "  dnsmasq  — Debian/Ubuntu: apt install dnsmasq      Arch: pacman -S dnsmasq" >&2 ;;
-            jq)       echo "  jq       — Debian/Ubuntu: apt install jq           Arch: pacman -S jq" >&2 ;;
-            envsubst) echo "  envsubst — Debian/Ubuntu: apt install gettext-base Arch: pacman -S gettext" >&2 ;;
-            setpriv)  echo "  setpriv  — Debian/Ubuntu: apt install util-linux   Arch: pacman -S util-linux" >&2 ;;
-            flock)    echo "  flock    — Debian/Ubuntu: apt install util-linux   Arch: pacman -S util-linux" >&2 ;;
-            tmux)     echo "  tmux     — Debian/Ubuntu: apt install tmux        Arch: pacman -S tmux" >&2 ;;
-        esac
-    done
-    exit 1
-}
-
-require_tools bwrap tmux jq envsubst setpriv flock
-if [[ ${#NET_PROFILES[@]} -gt 0 ]]; then
-    require_tools pasta nft dnsmasq
-fi
 
 # --- Profile feature-field scan (phase 2 virt) ---
 # Optional fields honored in any applied fs/cli profile:
@@ -743,6 +720,23 @@ done
 
 if [[ "$USERNS_FULL" == "true" && ${#NET_PROFILES[@]} -eq 0 ]]; then
     echo "Error: profile '$USERNS_PROFILE' sets \"userns\": \"full\", which requires networking. Add --net <profile>." >&2
+    exit 1
+fi
+
+# --- Dependency preflight: optional groups ---
+# Chosen from what the flags and the feature scan above turned on.
+DEP_GROUPS=()
+[[ ${#NET_PROFILES[@]} -gt 0 ]] && DEP_GROUPS+=(net)
+[[ "$GUI_FLAG" == "true" ]] && DEP_GROUPS+=(gui)
+if [[ "$USERNS_FULL" == "true" || "$CAPS_KEEP" == "true" || "$DOCKER_API" == "true" ]]; then
+    DEP_GROUPS+=(podman)
+fi
+if [[ ${#DEP_GROUPS[@]} -gt 0 ]]; then
+    sbx_deps_require "${DEP_GROUPS[@]}" || exit 1
+fi
+if [[ "$USERNS_FULL" == "true" ]] && ! sbx_deps_subids_ok; then
+    echo "Error: profile '$USERNS_PROFILE' sets \"userns\": \"full\", which needs a subordinate UID and GID range for $(id -un)." >&2
+    echo "  Add one:  sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $(id -un)" >&2
     exit 1
 fi
 
@@ -1805,11 +1799,6 @@ EOF
 
 # GUI Setup (xpra virtual display)
 if [[ "$GUI_FLAG" == "true" ]]; then
-    if ! command -v xpra >/dev/null 2>&1; then
-        echo "Error: xpra is not installed. Cannot use --gui mode." >&2
-        exit 1
-    fi
-
     # Find a free X11 display slot
     DISPLAY_NUM=100
     while [[ -S "/tmp/.X11-unix/X$DISPLAY_NUM" ]]; do

@@ -157,3 +157,34 @@ fake_sysctl() {   # <relative path under /proc/sys> <value>
     SBX_SUBUID="$FIX/subuid" SBX_SUBGID="$FIX/subgid" run sbx_deps_subids_ok
     [ "$status" -eq 1 ]
 }
+
+@test "require passes silently when nothing is missing" {
+    fake_bwrap 0
+    PATH="$FIX/bin:$PATH" run sbx_deps_require core net
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+@test "require names missing tools and the distro's command" {
+    os_release "$FIX/os" ubuntu debian
+    mkdir -p "$FIX/bin"
+    PATH="$FIX/bin" SBX_OS_RELEASE="$FIX/os" run sbx_deps_require net
+    [ "$status" -eq 1 ]
+    [[ "${lines[0]}" == "Error: sbx requires pasta nft dnsmasq, which are not on PATH." ]]
+    [[ "$output" == *"sudo apt install passt nftables dnsmasq"* ]]
+    if [[ "$output" == *pacman* ]]; then return 1; fi
+}
+
+@test "require skips the userns probe for optional groups" {
+    fake_bwrap 1 "should not run"
+    PATH="$FIX/bin:$PATH" run sbx_deps_require net
+    [ "$status" -eq 0 ]
+}
+
+@test "require runs the userns probe with core" {
+    fake_bwrap 1 "bwrap: nope"
+    mkdir -p "$FIX/sys"
+    PATH="$FIX/bin:$PATH" SBX_PROC_SYS="$FIX/sys" run sbx_deps_require core
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"unprivileged user namespace"* ]]
+}

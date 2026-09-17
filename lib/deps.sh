@@ -194,3 +194,27 @@ sbx_deps_subids_ok() {
     done
     return 0
 }
+
+sbx_deps_require() {
+    local -a missing
+    local line
+    mapfile -t missing < <(sbx_deps_missing "$@")
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        {
+            if [[ ${#missing[@]} -eq 1 ]]; then
+                echo "Error: sbx requires ${missing[0]}, which is not on PATH."
+            else
+                echo "Error: sbx requires ${missing[*]}, which are not on PATH."
+            fi
+            echo "  Install with:"
+            while IFS= read -r line; do
+                echo "    $line"
+            done < <(sbx_deps_install_hint "$(sbx_deps_family)" "${missing[@]}")
+        } >&2
+        return 1
+    fi
+    if [[ " $* " == *" core "* ]]; then
+        sbx_deps_userns_check >&2 || return 1
+    fi
+    return 0
+}
