@@ -12,6 +12,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/copy-mounts.sh"
 # shellcheck source=lib/deps.sh
 source "$SCRIPT_DIR/lib/deps.sh"
+# shellcheck source=lib/profiles.sh
+source "$SCRIPT_DIR/lib/profiles.sh"
 
 GUI_MODE=false
 XPRA_DISPLAY=""
@@ -109,74 +111,12 @@ Profiles are searched in:
 EOF
 }
 
-resolve_profile() {
-    local type="$1"
-    local name="$2"
-
-    # If it's a direct path to a file, use it
-    if [[ -f "$name" ]]; then
-        realpath "$name"
-        return 0
-    fi
-    if [[ -f "$name.json" ]]; then
-        realpath "$name.json"
-        return 0
-    fi
-
-    # Strip the type prefix if it was included (e.g., "cli/dev" -> "dev")
-    if [[ "$name" == "$type/"* ]]; then
-        name="${name#$type/}"
-    fi
-
-    local paths=(
-        "./.sbx/profiles/$type/$name.json"
-        "$CONFIG_DIR/profiles/$type/$name.json"
-        "$SCRIPT_DIR/profiles/$type/$name.json"
-    )
-
-    for p in "${paths[@]}"; do
-        if [[ -f "$p" ]]; then
-            echo "$p"
-            return 0
-        fi
-    done
-
-    echo "Error: Profile '$name' of type '$type' not found." >&2
-    exit 1
+resolve_profile() {   # <type> <name>
+    sbx_profile_resolve "$1" "$2" "$CONFIG_DIR" "$SCRIPT_DIR/profiles"
 }
 
 list_profiles() {
-    local types=("cli" "fs" "net")
-    local sources=(
-        "Project:./.sbx/profiles"
-        "User:$CONFIG_DIR/profiles"
-        "Global:$SCRIPT_DIR/profiles"
-    )
-
-    echo "Available Profiles:"
-    for type in "${types[@]}"; do
-        echo ""
-        echo "${type^^} Profiles:"
-        local found=0
-        for src in "${sources[@]}"; do
-            local label="${src%%:*}"
-            local path="${src#*:}"
-            if [[ -d "$path/$type" ]]; then
-                # Use a temporary variable to capture find output to avoid empty lines
-                local files
-                files=$(find "$path/$type" -name "*.json" | sed "s|$path/$type/||" | sed 's/\.json$//' | sort)
-                if [[ -n "$files" ]]; then
-                    while IFS= read -r profile; do
-                        echo "  $profile ($label)"
-                        found=1
-                    done <<< "$files"
-                fi
-            fi
-        done
-        if [[ $found -eq 0 ]]; then
-            echo "  (none)"
-        fi
-    done
+    sbx_profile_list "$CONFIG_DIR" "$SCRIPT_DIR/profiles"
 }
 
 # Main Argument Parsing
@@ -609,10 +549,7 @@ fi
 # True when a resolved profile path lies inside the launch directory's
 # .sbx tree — i.e. it was supplied by the project rather than by the user.
 profile_is_project() {
-    local abs proj
-    abs=$(realpath -m "$1")
-    proj=$(realpath -m "$PWD/.sbx")
-    [[ "$abs" == "$proj/"* ]]
+    [[ "$(sbx_profile_origin "$1" "$PWD" "$CONFIG_DIR" "$SCRIPT_DIR/profiles")" == "project" ]]
 }
 
 # A version-controlled project directory is untrusted input: it can ship
