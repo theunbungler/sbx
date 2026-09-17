@@ -15,7 +15,7 @@ sbx_resolve_strings() {   # <string>... -> JSON array
         echo '[]'
         return 0
     fi
-    jq -cn '$ARGS.positional' --args "$@"
+    jq -cn '$ARGS.positional' --args -- "$@"
 }
 
 sbx_resolve_objects() {   # <json object>... -> JSON array
@@ -57,6 +57,34 @@ sbx_resolve() {
     for p in "${net[@]}"; do types+=(net); paths+=("$p"); done
 
     local -a profiles=() errors=() warnings=() confirm=()
+
+    # --host-port flags are user-typed, so validate each one the same way
+    # sbx's add_host_port does, before it can reach a bucketing loop that
+    # assumes a well-formed spec: an out-of-range/non-numeric port or an
+    # unknown protocol becomes a plan error instead of a bad bucket or a
+    # jq crash on tonumber. Profile-supplied host_ports need no matching
+    # check here: sbx_profile_check's schema already rejects any entry
+    # that isn't a well-formed "N" or "N/tcp"|"N/udp" with N 1-65535, and
+    # that rejection lands in $errors before the bucketing loop ever runs
+    # (it is gated by the same "errors is empty" check below).
+    local -a valid_flag_ports=()
+    local fp fport fproto
+    for fp in "${flag_ports[@]}"; do
+        fport="${fp%%/*}"
+        fproto=tcp
+        if [[ "$fp" == */* ]]; then
+            fproto="${fp#*/}"
+        fi
+        fproto="${fproto,,}"
+        if [[ "$fport" =~ ^[0-9]+$ ]] && (( fport >= 1 && fport <= 65535 )) &&
+           [[ "$fproto" == "tcp" || "$fproto" == "udp" ]]; then
+            valid_flag_ports+=("$fp")
+        else
+            errors+=("--host-port expects <port>[/tcp|/udp] with a port 1-65535, got '$fp'")
+        fi
+    done
+    flag_ports=("${valid_flag_ports[@]}")
+
     local type origin name level msg
     for i in "${!paths[@]}"; do
         type="${types[$i]}"

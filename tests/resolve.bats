@@ -166,6 +166,30 @@ r() { jq -r "$1" <<< "$PLAN"; }
     [ "$(q .deps)" = '["core","gui"]' ]
 }
 
+@test "an out-of-range --host-port is a plan error, not a silent accept" {
+    resolve --host-port 99999/tcp
+    [ "$(q .host_ports)" = '{"tcp":[],"udp":[]}' ]
+    [[ "$(r '.errors[]')" == *"--host-port expects <port>[/tcp|/udp] with a port 1-65535, got '99999/tcp'"* ]]
+}
+
+@test "an unknown --host-port protocol is a plan error, not silently dropped" {
+    resolve --host-port 8080/xyz
+    [ "$(q .host_ports)" = '{"tcp":[],"udp":[]}' ]
+    [[ "$(r '.errors[]')" == *"--host-port expects <port>[/tcp|/udp] with a port 1-65535, got '8080/xyz'"* ]]
+}
+
+@test "a non-numeric --host-port is a plan error instead of a jq crash" {
+    resolve --host-port abc
+    [ "$(q .host_ports)" = '{"tcp":[],"udp":[]}' ]
+    [[ "$(r '.errors[]')" == *"--host-port expects <port>[/tcp|/udp] with a port 1-65535, got 'abc'"* ]]
+}
+
+@test "a valid --host-port still lands in its bucket" {
+    resolve --host-port 8080/udp
+    [ "$(q .host_ports)" = '{"tcp":[],"udp":[8080]}' ]
+    [ "$(q .errors)" = '[]' ]
+}
+
 @test "workingDirectory surfaces as a warning" {
     local fs
     fs=$(user fs w '{"workingDirectory":"/src"}')
