@@ -294,6 +294,27 @@ A profile that still carries `workingDirectory` is not honored; sbx warns and na
 3. Create a JSON file at `<location>/<type>/<name>.json`.
 4. Verify it appears with `./sbx --list-profiles`.
 
+### Profile validation
+
+Every profile a launch uses is checked before anything is built, and every
+problem is reported at once:
+
+    ~/.config/sbx/profiles/net/api.json: .ports[1]: expected a port 1-65535 or "*", got "https"
+
+**Errors stop the launch.** Invalid JSON; a field that is not in the schema
+for the profile's type (there is no comment syntax — a misspelt field would
+otherwise be silently ignored); a wrong type or value (`perm`, `caps`,
+`userns`, `docker_api`, `ports`, `host_ports`, `allow`, `passthrough`
+names, `env` values); and, in a project profile, `caps`, `userns`,
+`docker_api` or `host_ports`. An `allow` entry that starts with a digit is
+read as an address, so a hostname like `1password.com` is rejected rather
+than silently treated as a malformed CIDR.
+
+**Warnings are printed and the launch continues:** a `workingDirectory`
+field, a `dns` value that is not a bare IPv4 address (1.1.1.1 is used), a
+mount whose source does not exist on this host (the mount is skipped), and
+a `*.` wildcard in `allow`.
+
 ## Forked and Record Mounts
 
 `forked` and `record` mounts both isolate the sandbox from the host — the original host directory is never modified by either — but they disagree about who owns the data afterward.

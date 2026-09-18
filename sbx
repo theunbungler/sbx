@@ -14,6 +14,12 @@ source "$SCRIPT_DIR/lib/copy-mounts.sh"
 source "$SCRIPT_DIR/lib/deps.sh"
 # shellcheck source=lib/profiles.sh
 source "$SCRIPT_DIR/lib/profiles.sh"
+# shellcheck source=lib/profile-check.sh
+source "$SCRIPT_DIR/lib/profile-check.sh"
+# shellcheck source=lib/net-merge.sh
+source "$SCRIPT_DIR/lib/net-merge.sh"
+# shellcheck source=lib/resolve.sh
+source "$SCRIPT_DIR/lib/resolve.sh"
 
 GUI_MODE=false
 XPRA_DISPLAY=""
@@ -611,75 +617,67 @@ confirm_project_profile() {
 # xpra display and a pasta namespace had already been built.
 sbx_deps_require core || exit 1
 
+# --- Resolve ---
+# Every decision about profiles is made here, from the flags and the profile
+# files, without touching the disk (see lib/resolve.sh). Everything after
+# this point reads the plan, never a profile file.
+RESOLVE_ARGS=(--launch-dir "$PWD" --config-dir "$CONFIG_DIR" --global-dir "$SCRIPT_DIR/profiles")
+for profile in "${FS_PROFILES[@]}"; do
+    RESOLVE_ARGS+=(--fs "$profile")
+done
+if [[ -n "$CLI_PROFILE" ]]; then
+    RESOLVE_ARGS+=(--cli "$CLI_PROFILE")
+fi
+for profile in "${NET_PROFILES[@]}"; do
+    RESOLVE_ARGS+=(--net "$profile")
+done
+for port in "${HOST_PORTS_TCP[@]}"; do
+    RESOLVE_ARGS+=(--host-port "$port/tcp")
+done
+for port in "${HOST_PORTS_UDP[@]}"; do
+    RESOLVE_ARGS+=(--host-port "$port/udp")
+done
+if [[ -n "$WORKDIR" ]]; then
+    RESOLVE_ARGS+=(--wd "$WORKDIR")
+fi
+if [[ "$GUI_FLAG" == "true" ]]; then
+    RESOLVE_ARGS+=(--gui)
+fi
+PLAN=$(sbx_resolve "${RESOLVE_ARGS[@]}")
+
+plan_get() {
+    jq -r "$1" <<< "$PLAN"
+}
+
+while IFS= read -r msg; do
+    if [[ -n "$msg" ]]; then
+        echo "Warning: $msg" >&2
+    fi
+done < <(plan_get '.warnings[]')
+
+if [[ "$(plan_get '.errors | length')" != "0" ]]; then
+    while IFS= read -r msg; do
+        echo "Error: $msg" >&2
+    done < <(plan_get '.errors[]')
+    exit 1
+fi
+
 for profile in "${FS_PROFILES[@]}" "$CLI_PROFILE" "${NET_PROFILES[@]}"; do
     [[ -z "$profile" ]] && continue
     confirm_project_profile "$profile"
 done
 
-# --- Profile feature-field scan (phase 2 virt) ---
-# Optional fields honored in any applied fs/cli profile:
-#   "userns": "full"    -> run the whole session inside an outer user
-#                          namespace carrying the user's full subordinate-
-#                          UID range (multi-UID podman). Requires --net.
-#                          Implies "caps": "keep".
-#   "caps": "keep"      -> retain capabilities inside the sandbox. Needed
-#                          for nested user namespaces (podman), and it
-#                          costs the ro-mount and firewall guarantees.
-#   "docker_api": true  -> start a podman docker-API socket for the session.
-#
-# None of these are honored from a project-supplied profile: a repository
-# must never be able to talk its way back to the pre-hardening boundary,
-# with or without the interactive confirmation added elsewhere.
-USERNS_FULL=false
-DOCKER_API=false
-USERNS_PROFILE=""
-CAPS_PROFILE=""
-for profile in "${FS_PROFILES[@]}" "$CLI_PROFILE"; do
-    [[ -z "$profile" ]] && continue
-
-    p_userns=$(jq -r '.userns // empty' "$profile")
-    p_caps=$(jq -r '.caps // empty' "$profile")
-    p_docker=$(jq -r '.docker_api // false' "$profile")
-
-    if profile_is_project "$profile"; then
-        if [[ -n "$p_userns" || -n "$p_caps" || "$p_docker" == "true" ]]; then
-            echo "Error: project profile '$profile' may not set 'userns', 'caps' or 'docker_api'." >&2
-            echo "  Move it to $CONFIG_DIR/profiles/ if you intend to grant it." >&2
-            exit 1
-        fi
-        continue
-    fi
-
-    if [[ "$p_userns" == "full" ]]; then
-        USERNS_FULL=true
-        USERNS_PROFILE="$profile"
-        CAPS_KEEP=true
-        CAPS_PROFILE="$profile"
-    fi
-    if [[ "$p_caps" == "keep" ]]; then
-        CAPS_KEEP=true
-        CAPS_PROFILE="$profile"
-    fi
-    if [[ "$p_docker" == "true" ]]; then
-        DOCKER_API=true
-    fi
-done
-
-if [[ "$USERNS_FULL" == "true" && ${#NET_PROFILES[@]} -eq 0 ]]; then
-    echo "Error: profile '$USERNS_PROFILE' sets \"userns\": \"full\", which requires networking. Add --net <profile>." >&2
-    exit 1
-fi
+USERNS_FULL=$(plan_get '.security.userns_full')
+USERNS_PROFILE=$(plan_get '.security.userns_profile')
+CAPS_KEEP=$(plan_get '.security.caps_keep')
+CAPS_PROFILE=$(plan_get '.security.caps_profile')
+DOCKER_API=$(plan_get '.security.docker_api')
+mapfile -t HOST_PORTS_TCP < <(plan_get '.host_ports.tcp[]')
+mapfile -t HOST_PORTS_UDP < <(plan_get '.host_ports.udp[]')
+SBX_NETNS=$(plan_get '.netns')
 
 # --- Dependency preflight: optional groups ---
-# Chosen from what the flags and the feature scan above turned on.
-DEP_GROUPS=()
-if [[ ${#NET_PROFILES[@]} -gt 0 || ${#HOST_PORTS_TCP[@]} -gt 0 || ${#HOST_PORTS_UDP[@]} -gt 0 ]]; then
-    DEP_GROUPS+=(net)
-fi
-[[ "$GUI_FLAG" == "true" ]] && DEP_GROUPS+=(gui)
-if [[ "$USERNS_FULL" == "true" || "$CAPS_KEEP" == "true" || "$DOCKER_API" == "true" ]]; then
-    DEP_GROUPS+=(podman)
-fi
+mapfile -t DEP_GROUPS < <(plan_get '.deps[] | select(. != "core")')
 if [[ ${#DEP_GROUPS[@]} -gt 0 ]]; then
     sbx_deps_require "${DEP_GROUPS[@]}" || exit 1
 fi
@@ -688,54 +686,6 @@ if [[ "$USERNS_FULL" == "true" ]] && ! sbx_deps_subids_ok; then
     echo "  Add one:  sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $(id -un)" >&2
     echo "  (choose a range not already used by another user in /etc/subuid)" >&2
     exit 1
-fi
-
-# --- Host-service access ---
-# Ports named here are forwarded by pasta from the host's loopback into the
-# sandbox's loopback at the same number, so a host service on 127.0.0.1:8080
-# answers at 127.0.0.1:8080 inside. Ports NOT named are not forwarded.
-#
-# This has to be explicit. pasta's default is -T auto, which forwards every
-# port bound on the host — including ports bound after the session starts,
-# and ports bound by other users — so an --net sandbox could reach every
-# host-local service without a single rule naming it. sbx passes an explicit
-# list (or "none") instead, which is what makes host access an allow-list
-# rather than an accident. It is also what stops a host service on :53 from
-# taking the port this session's dnsmasq needs.
-#
-# Not honored from a project profile, for the same reason userns/caps/
-# docker_api are not: a cloned repository must not be able to open a path
-# from its sandbox to a service on the machine running it.
-for np in "${NET_PROFILES[@]}"; do
-    if profile_is_project "$np"; then
-        if [[ "$(jq -r '(.host_ports // []) | length' "$np")" != "0" ]]; then
-            echo "Error: project profile '$np' may not set 'host_ports'." >&2
-            echo "  Move it to $CONFIG_DIR/profiles/ if you intend to grant it." >&2
-            exit 1
-        fi
-    else
-        while IFS= read -r hp; do
-            [[ -z "$hp" ]] && continue
-            add_host_port "$hp" "profile '$np'"
-        done < <(jq -r '.host_ports[]? | tostring' "$np")
-    fi
-done
-
-# Deduplicate, preserving nothing but the numbers pasta needs.
-if [[ ${#HOST_PORTS_TCP[@]} -gt 0 ]]; then
-    mapfile -t HOST_PORTS_TCP < <(printf '%s\n' "${HOST_PORTS_TCP[@]}" | sort -n -u)
-fi
-if [[ ${#HOST_PORTS_UDP[@]} -gt 0 ]]; then
-    mapfile -t HOST_PORTS_UDP < <(printf '%s\n' "${HOST_PORTS_UDP[@]}" | sort -n -u)
-fi
-
-# A network namespace is needed for a net profile OR for host-port access.
-# The second case is the no-internet one: pasta supplies the loopback splice
-# to the host, and the ruleset below drops every other destination, so the
-# session reaches the named host services and nothing else.
-SBX_NETNS=false
-if [[ ${#NET_PROFILES[@]} -gt 0 || ${#HOST_PORTS_TCP[@]} -gt 0 || ${#HOST_PORTS_UDP[@]} -gt 0 ]]; then
-    SBX_NETNS=true
 fi
 
 if [[ "$CAPS_KEEP" == "true" ]]; then
@@ -910,15 +860,11 @@ done
 
 # Profile-declared passthrough: forwards named host variables. Applied
 # before the profile `env` block below, so an explicit `env` value wins.
-for profile in "${FS_PROFILES[@]}" "$CLI_PROFILE"; do
-    [[ -z "$profile" ]] && continue
-    while IFS= read -r var; do
-        [[ -z "$var" ]] && continue
-        if [[ -n "${!var-}" ]]; then
-            BWRAP_ARGS+=(--setenv "$var" "${!var}")
-        fi
-    done < <(jq -r '.passthrough[]?' "$profile")
-done
+while IFS= read -r var; do
+    if [[ -n "$var" && -n "${!var-}" ]]; then
+        BWRAP_ARGS+=(--setenv "$var" "${!var}")
+    fi
+done < <(plan_get '.passthrough[]')
 
 if [[ "$SBX_NETNS" == "true" ]]; then
     # When a network namespace is used, pasta creates the user and net
@@ -1099,106 +1045,47 @@ SHIMEOF
 chmod +x "$SESSION_DIR/bin/docker"
 BWRAP_ARGS+=(--setenv DOCKER_HOST "unix://$PODMAN_SOCK")
 
-SKIPPED_MOUNTS=()  # profile mounts whose source is absent on this host
 FORKED_MOUNTS=()   # "profile<TAB>source<TAB>dest" — sandbox-owned, seeded once
 FORKED_STORES=()   # host store path per forked mount, filled by the seeding loop
 RECORD_MOUNTS=()   # "source<TAB>dest" — host-owned, reseeded, changes archived
 
-apply_mounts() {
-    local profile="$1"
-    local profile_name
-    profile_name=$(basename "$profile" .json)
-    # Use jq to extract mounts
-    mounts=$(jq -c '.mounts[]?' "$profile")
-    [[ -z "$mounts" ]] && return
+while IFS= read -r -d '' profile_name && IFS= read -r -d '' source &&
+      IFS= read -r -d '' dest && IFS= read -r -d '' perm; do
+    # rw mounts may point at a persistent host directory that doesn't
+    # exist yet (e.g. first-ever use of a profile's storage dir).
+    if [[ "$perm" == "rw" && ! -e "$source" ]]; then
+        mkdir -p "$source"
+    fi
 
-    while IFS= read -r m; do
-        [[ -z "$m" ]] && continue
-        source=$(echo "$m" | jq -r '.source' | envsubst)
-        source=$(realpath -m "$source")
-        dest=$(echo "$m" | jq -r '.dest' | envsubst)
-        perm=$(echo "$m" | jq -r '.perm')
+    # Ensure parent directories exist in the sandbox
+    parent=$(dirname "$dest")
+    if [[ "$parent" != "/" ]]; then
+        IFS='/' read -ra ADDR <<< "$parent"
+        curr=""
+        for i in "${ADDR[@]}"; do
+            if [[ -n "$i" ]]; then
+                curr="$curr/$i"
+                BWRAP_ARGS+=(--dir "$curr")
+            fi
+        done
+    fi
 
-        # rw mounts may point at a persistent host directory that doesn't
-        # exist yet (e.g. first-ever use of a profile's storage dir).
-        if [[ "$perm" == "rw" && ! -e "$source" ]]; then
-            mkdir -p "$source"
-        fi
-
-        # Ensure parent directories exist in the sandbox
-        parent=$(dirname "$dest")
-        if [[ "$parent" != "/" ]]; then
-            IFS='/' read -ra ADDR <<< "$parent"
-            curr=""
-            for i in "${ADDR[@]}"; do
-                if [[ -n "$i" ]]; then
-                    curr="$curr/$i"
-                    BWRAP_ARGS+=(--dir "$curr")
-                fi
-            done
-        fi
-
-        # The -try variants: a profile names paths that are optional on any
-        # given host ($HOME/.nvm, $HOME/.npm-global, /dev/kvm), and a plain
-        # --ro-bind on a missing source aborts the whole launch with
-        # "No such file or directory" — one absent toolchain takes down a
-        # sandbox that had no need of it. -try skips the mount instead.
-        # Only profile-declared mounts are made tolerant; the base binds
-        # (/usr, /etc, the session dir) stay strict, because a sandbox
-        # missing those is broken rather than merely reduced.
-        if [[ ! -e "$source" ]]; then
-            SKIPPED_MOUNTS+=("$perm $source")
-        fi
-
-        case "$perm" in
-            ro)
-                BWRAP_ARGS+=(--ro-bind-try "$source" "$dest")
-                ;;
-            rw)
-                BWRAP_ARGS+=(--bind-try "$source" "$dest")
-                ;;
-            dev)
-                BWRAP_ARGS+=(--dev-bind-try "$source" "$dest")
-                ;;
-            forked)
-                FORKED_MOUNTS+=("$profile_name"$'\t'"$source"$'\t'"$dest")
-                ;;
-            record)
-                RECORD_MOUNTS+=("$source"$'\t'"$dest")
-                ;;
-            copy)
-                echo "Error: $profile: mount \"$dest\" uses perm \"copy\", which has been split." >&2
-                echo "  Use \"forked\" if the SANDBOX owns the data (seeded from the host once," >&2
-                echo "  then never re-read — tool state, config, caches)." >&2
-                echo "  Use \"record\" if the HOST owns it (reseeded every launch, with the" >&2
-                echo "  session's changes archived for inspection — source trees)." >&2
-                exit 1
-                ;;
-            *)
-                echo "Error: $profile: mount \"$dest\" has unknown perm \"$perm\"." >&2
-                exit 1
-                ;;
-        esac
-    done <<< "$mounts"
-}
-
-for profile in "${FS_PROFILES[@]}"; do
-    apply_mounts "$profile"
-done
-
-if [[ -n "$CLI_PROFILE" ]]; then
-    apply_mounts "$CLI_PROFILE"
-fi
-
-# A -try mount that finds nothing is dropped without a word from bwrap, which
-# turns "my toolchain is missing inside the sandbox" into a debugging session.
-# Name them once, here, rather than leaving the absence to be inferred.
-if [[ ${#SKIPPED_MOUNTS[@]} -gt 0 ]]; then
-    echo "Note: ${#SKIPPED_MOUNTS[@]} profile mount(s) skipped — source not present on this host:" >&2
-    for sm in "${SKIPPED_MOUNTS[@]}"; do
-        echo "  ${sm%% *} ${sm#* }" >&2
-    done
-fi
+    # The -try variants: a profile names paths that are optional on any
+    # given host ($HOME/.nvm, $HOME/.npm-global, /dev/kvm), and a plain
+    # --ro-bind on a missing source aborts the whole launch with
+    # "No such file or directory" — one absent toolchain takes down a
+    # sandbox that had no need of it. -try skips the mount instead.
+    # Only profile-declared mounts are made tolerant; the base binds
+    # (/usr, /etc, the session dir) stay strict, because a sandbox
+    # missing those is broken rather than merely reduced.
+    case "$perm" in
+        ro)     BWRAP_ARGS+=(--ro-bind-try "$source" "$dest") ;;
+        rw)     BWRAP_ARGS+=(--bind-try "$source" "$dest") ;;
+        dev)    BWRAP_ARGS+=(--dev-bind-try "$source" "$dest") ;;
+        forked) FORKED_MOUNTS+=("$profile_name"$'\t'"$source"$'\t'"$dest") ;;
+        record) RECORD_MOUNTS+=("$source"$'\t'"$dest") ;;
+    esac
+done < <(jq -j 'def nul: [0] | implode; .mounts[] | .profile, nul, .source, nul, .dest, nul, .perm, nul' <<< "$PLAN")
 
 # Where a forked mount's store lives on the host. Both --reseed and the
 # seeding loop below need this path, and they must never disagree about it:
@@ -1321,7 +1208,8 @@ for fm in "${FORKED_MOUNTS[@]}"; do
     # was re-read every time; `forked` reads it once, so getting it wrong
     # once is getting it wrong forever. The trigger is ordinary: `sbx --cli
     # claude` before Claude Code has ever written ~/.claude.json. Skipping
-    # also makes the mount match what SKIPPED_MOUNTS already told the user.
+    # also makes the mount match what the plan's warnings already told the
+    # user (a source-not-present mount is skipped, per lib/resolve.sh).
     if [[ ! -e "$f_src" ]]; then
         continue
     fi
@@ -1380,52 +1268,17 @@ for rm_ in "${RECORD_MOUNTS[@]}"; do
     fi
 done
 
-# Parse Environment from all profiles
-SANDBOX_PATH=""
-for profile in "${FS_PROFILES[@]}" "$CLI_PROFILE"; do
-    [[ -z "$profile" ]] && continue
-
-    # "workingDirectory" used to be a profile field resolved last-one-wins.
-    # That never composed: --fs a --fs b and --fs b --fs a mount the same
-    # tree but start the session in different places, so the cwd depended on
-    # flag order rather than on what the profiles actually provide. It is now
-    # a single --wd on the command line. Warned about rather than ignored,
-    # because silently starting somewhere else is the confusing failure.
-    if [[ "$(jq -r 'has("workingDirectory")' "$profile")" == "true" ]]; then
-        echo "Warning: profile '$(basename "$profile" .json)' sets \"workingDirectory\", which is no longer honored." >&2
-        echo "  Pass --wd $(jq -r '.workingDirectory' "$profile") instead." >&2
-    fi
-
-    # Environment Variables
-    while IFS='=' read -r key value; do
-        if [[ -n "$key" ]]; then
-            val=$(echo "$value" | envsubst)
-            [[ "$key" == "PATH" ]] && SANDBOX_PATH="$val"
-            BWRAP_ARGS+=(--setenv "$key" "$val")
-        fi
-    done < <(jq -r '.env // {} | to_entries[]? | "\(.key)=\(.value)"' "$profile")
-done
+# Environment from profiles: every assignment, in profile order. bwrap keeps
+# the last --setenv for a name, which is what makes a later profile win.
+while IFS= read -r -d '' key && IFS= read -r -d '' val; do
+    BWRAP_ARGS+=(--setenv "$key" "$val")
+done < <(jq -j 'def nul: [0] | implode; .env[] | .name, nul, .value, nul' <<< "$PLAN")
 
 if [[ -n "$WORKDIR" ]]; then
     BWRAP_ARGS+=(--chdir "$WORKDIR")
 fi
 
-# Handle CLI-specific 'path' prepending
-DEFAULT_PATH="/usr/local/bin:/usr/bin:/bin"
-if [[ -n "$CLI_PROFILE" ]]; then
-    EXTRA_PATHS=$(jq -r '.path[]?' "$CLI_PROFILE" | envsubst | paste -sd: -)
-    if [[ -n "$EXTRA_PATHS" ]]; then
-        if [[ -n "$SANDBOX_PATH" ]]; then
-            SANDBOX_PATH="$EXTRA_PATHS:$SANDBOX_PATH:$DEFAULT_PATH"
-        else
-            SANDBOX_PATH="$EXTRA_PATHS:$DEFAULT_PATH"
-        fi
-    else
-        [[ -z "$SANDBOX_PATH" ]] && SANDBOX_PATH="$DEFAULT_PATH"
-    fi
-else
-    [[ -z "$SANDBOX_PATH" ]] && SANDBOX_PATH="$DEFAULT_PATH"
-fi
+SANDBOX_PATH=$(plan_get '.path')
 # $SESSION_DIR/bin holds the docker shim; first on PATH so `docker` always
 # resolves to it (the host docker socket is never reachable in a sandbox).
 BWRAP_ARGS+=(--setenv PATH "$SESSION_DIR/bin:$SANDBOX_PATH")
@@ -1460,97 +1313,22 @@ if [[ "$SBX_NETNS" == "true" ]]; then
     # because its one reachable destination is a loopback address.
     if [[ ${#NET_PROFILES[@]} -gt 0 ]]; then
 
-    # --- Composing several net profiles ---
-    #
-    # Each destination is paired with the ports of the profile that allowed
-    # it, rather than every destination sharing one union of every profile's
-    # ports. Stacking `--net web` (80,443) with `--net db` (5432) therefore
-    # grants the web hosts 80,443 and the database host 5432 — not both hosts
-    # on all three ports, which is what a flat union would produce and is
-    # strictly more access than either profile asked for.
-    #
-    # Pairing is done by giving each distinct port list its own nftables set
-    # and pointing each domain at the set for its ports. This is forced by
-    # dnsmasq: a domain feeds exactly ONE nftset (verified — with two
-    # --nftset options for one domain, only the first receives the answer),
-    # so a domain cannot be gated two different ways at once. Hence the one
-    # place a union is unavoidable: a domain named by several profiles gets
-    # the union of their ports. That is also the right reading, since each
-    # profile independently authorized it.
-    #
-    # An explicit CIDR needs no set — it is already an address — so it is
-    # emitted as its own rule, gated by the same paired port list.
-
+    # Composition rules for stacked net profiles live in lib/net-merge.sh.
     declare -A DOMAIN_PORTS=()      # domain -> port signature ("*" or "80,443")
     declare -A DOMAIN_UPSTREAM=()   # domain -> resolver that profile chose
     declare -A CIDR_PORTS=()        # cidr   -> port signature
-    ALLOW_ALL=false
-    ALLOW_ALL_PORTS=""
-    DNS_UPSTREAMS=()
-
-    # Union of two port signatures. "*" absorbs everything.
-    merge_ports() {
-        local a="$1" b="$2"
-        [[ -z "$a" ]] && { echo "$b"; return; }
-        [[ "$a" == "*" || "$b" == "*" ]] && { echo "*"; return; }
-        printf '%s\n%s\n' "${a//,/$'\n'}" "${b//,/$'\n'}" | sort -n -u | paste -sd, -
-    }
-
-    for np in "${NET_PROFILES[@]}"; do
-        # DNS upstream must be a plain IP — dnsmasq does not speak DoH stamps.
-        # If the profile supplies a stamp or leaves dns empty, fall back to
-        # Cloudflare. Resolved per profile: each profile's domains are asked
-        # of the resolver that profile named.
-        np_upstream=$(jq -r '.dns // empty' "$np")
-        if ! [[ "$np_upstream" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            np_upstream="1.1.1.1"
-        fi
-        DNS_UPSTREAMS+=("$np_upstream")
-
-        # This profile's port signature, normalised once.
-        if jq -e '.ports[]? | select(. == "*")' "$np" >/dev/null 2>&1; then
-            np_ports="*"
-        else
-            np_ports=$(jq -r '.ports[]?' "$np" | sort -n -u | paste -sd, -)
-            # Hostnames allowed but no ports specified -> default to web.
-            [[ -z "$np_ports" ]] && np_ports="80,443"
-        fi
-
-        while IFS= read -r entry; do
-            [[ -z "$entry" ]] && continue
-            if [[ "$entry" == "*" ]]; then
-                ALLOW_ALL=true
-                ALLOW_ALL_PORTS=$(merge_ports "$ALLOW_ALL_PORTS" "$np_ports")
-                continue
-            fi
-            # Strips leading '*.' — dnsmasq --server=/domain/up matches the
-            # apex plus all subdomains.
-            domain="${entry#\*.}"
-            DOMAIN_PORTS["$domain"]=$(merge_ports "${DOMAIN_PORTS[$domain]:-}" "$np_ports")
-            [[ -n "${DOMAIN_UPSTREAM[$domain]:-}" ]] || DOMAIN_UPSTREAM["$domain"]="$np_upstream"
-        done < <(jq -r '.allow[]? | select(type == "string" and test("^[a-zA-Z*]"))' "$np")
-
-        while IFS= read -r cidr; do
-            [[ -z "$cidr" ]] && continue
-            CIDR_PORTS["$cidr"]=$(merge_ports "${CIDR_PORTS[$cidr]:-}" "$np_ports")
-        done < <(jq -r '.allow[]? | select(type == "string" and test("^[0-9]"))' "$np")
-    done
-
-    mapfile -t DNS_UPSTREAMS < <(printf '%s\n' "${DNS_UPSTREAMS[@]}" | sort -u)
+    while IFS= read -r -d '' domain && IFS= read -r -d '' sig && IFS= read -r -d '' upstream; do
+        DOMAIN_PORTS["$domain"]="$sig"
+        DOMAIN_UPSTREAM["$domain"]="$upstream"
+    done < <(jq -j 'def nul: [0] | implode; .net.domains | to_entries[] | .key, nul, .value.ports, nul, .value.upstream, nul' <<< "$PLAN")
+    while IFS= read -r -d '' cidr && IFS= read -r -d '' sig; do
+        CIDR_PORTS["$cidr"]="$sig"
+    done < <(jq -j 'def nul: [0] | implode; .net.cidrs | to_entries[] | .key, nul, .value, nul' <<< "$PLAN")
+    ALLOW_ALL=$(plan_get '.net.allow_all')
+    ALLOW_ALL_PORTS=$(plan_get '.net.allow_all_ports')
+    mapfile -t DNS_UPSTREAMS < <(plan_get '.net.upstreams[]')
     DNS_UPSTREAM="${DNS_UPSTREAMS[0]}"
-
-    # A wildcard profile authorizes every domain, including ones another
-    # profile also named on narrower ports. Because a domain feeds exactly
-    # one nftset, and dnsmasq prefers the more specific match, such a domain
-    # would otherwise land in the narrow set and lose the access the
-    # wildcard already granted — stacking a profile would REMOVE reach.
-    # Folding the wildcard's ports into every named domain keeps the rule
-    # that composing profiles only ever adds.
-    if [[ "$ALLOW_ALL" == "true" ]]; then
-        for domain in "${!DOMAIN_PORTS[@]}"; do
-            DOMAIN_PORTS["$domain"]=$(merge_ports "${DOMAIN_PORTS[$domain]}" "$ALLOW_ALL_PORTS")
-        done
-    fi
+    TEST_DOMAIN=$(plan_get '.net.test_domain')
 
     # Assign every distinct port signature its own set name, then build the
     # dnsmasq flags: one --server and one --nftset per domain.
@@ -1574,13 +1352,6 @@ if [[ "$SBX_NETNS" == "true" ]]; then
         fi
         ALLOW_ALL_SET="${PORTS_SETNAME[$ALLOW_ALL_PORTS]}"
     fi
-
-    # First hostname from any profile, for the readiness probe.
-    TEST_DOMAIN=""
-    for np in "${NET_PROFILES[@]}"; do
-        TEST_DOMAIN=$(jq -r '.allow[]? | select(type=="string" and test("^[a-zA-Z]"))' "$np" | head -n1)
-        [[ -n "$TEST_DOMAIN" ]] && break
-    done
 
     # resolv.conf points into the sandbox at our dnsmasq instance.
     printf 'nameserver %s\n' "$SBX_DNS_ADDR" > "$DNS_DIR/resolv.conf"

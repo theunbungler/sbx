@@ -94,7 +94,8 @@ EOF
 EOF
     run bash -c "cd '$PROJ' && $SBX --fs noperm -- true 2>&1"
     [ "$status" -ne 0 ]
-    [[ "$output" == *null* ]]
+    # Validation names the field now; it used to surface as jq's "null".
+    [[ "$output" == *".mounts[0].perm: required"* ]]
 }
 
 @test "every shipped profile loads" {
