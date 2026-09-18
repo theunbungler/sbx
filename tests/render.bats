@@ -50,11 +50,21 @@ line() {   # <prefix> -> the first output line starting with it
         {profile:"pi",from:"cli/pi",source:"/home/u/.pi",dest:"/home/u/.pi",perm:"forked",present:true},
         {profile:"s",from:"fs/s",source:"/opt/missing",dest:"/opt/x",perm:"ro",present:false},
         {profile:"s",from:"fs/s",source:"/home/u/new",dest:"/n",perm:"rw",present:false}]
-      | .writes = [{kind:"persistent",path:"/s/forked",detail:"forked store",dest:"/home/u/.pi",note:"will seed, 12M"},
-                   {kind:"host",path:"/home/u/new",detail:"rw bind",dest:"/n",note:"created at launch"}]'
+      | .writes = [{kind:"persistent",path:"/s/forked",detail:"forked store",dest:"/home/u/.pi",note:"will seed, 12M",source:"/home/u/.pi"},
+                   {kind:"host",path:"/home/u/new",detail:"rw bind",dest:"/n",note:"created at launch",source:"/home/u/new"}]'
     [ "$(line Mounts)" = "Mounts     forked  ~/.pi → ~/.pi  (will seed, 12M)  cli/pi" ]
     printf '%s\n' "$output" | grep -qxF "           skip    /opt/missing → /opt/x  (source absent)  fs/s"
     printf '%s\n' "$output" | grep -qxF "           rw      ~/new → /n  (created at launch)  fs/s"
+}
+
+@test "two mounts sharing a dest each show their own write note, matched by source" {
+    render '.mounts = [
+        {profile:"a",from:"fs/a",source:"/home/u/a",dest:"/d",perm:"forked",present:true},
+        {profile:"b",from:"fs/b",source:"/home/u/b",dest:"/d",perm:"forked",present:true}]
+      | .writes = [{kind:"persistent",path:"/s/a",detail:"forked store",dest:"/d",note:"note-for-a",source:"/home/u/a"},
+                   {kind:"persistent",path:"/s/b",detail:"forked store",dest:"/d",note:"note-for-b",source:"/home/u/b"}]'
+    printf '%s\n' "$output" | grep -qxF "Mounts     forked  ~/a → /d  (note-for-a)  fs/a"
+    printf '%s\n' "$output" | grep -qxF "           forked  ~/b → /d  (note-for-b)  fs/b"
 }
 
 @test "env shows the winning value and what it overrides; PATH has its own line" {

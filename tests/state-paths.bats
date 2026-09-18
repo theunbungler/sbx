@@ -104,6 +104,14 @@ setup_writes() {
     [ "$(jq -r '.[-1].path' <<< "$output")" = "$STATE/sessions/my-proj/" ]
 }
 
+@test "writes: a mount row carries its source; the session directory's source is empty" {
+    setup_writes
+    run sbx_state_writes "$(plan "[$(mount forked "$SRC/tree" /t true)]")" "$STATE" "$LAUNCH"
+    [ "$(jq -r '.[0].source' <<< "$output")" = "$SRC/tree" ]
+    run sbx_state_writes "$(plan '[]')" "$STATE" "$LAUNCH"
+    [ "$(jq -r '.[-1].source' <<< "$output")" = "" ]
+}
+
 @test "writes: session bookkeeping is a temporary row right before the session directory" {
     setup_writes
     run sbx_state_writes "$(plan '[]')" "$STATE" "$LAUNCH"

@@ -52,7 +52,7 @@ def mark($ok): if $ok then "✓" else "✗" end;
       else empty end ),
 
     section("Mounts"; [ $d.mounts[] as $m
-        | ($d.writes | map(select(.dest == $m.dest and .note != "")) | .[0]) as $w
+        | ($d.writes | map(select(.dest == $m.dest and .source == $m.source and .note != "")) | .[0]) as $w
         | ((if ($m.present | not) and $m.perm != "rw" then "skip" else $m.perm end) | pad(7))
           + " " + ($m.source | tilde) + " → " + ($m.dest | tilde)
           + ( if ($m.present | not) and $m.perm != "rw" then "  (source absent)"

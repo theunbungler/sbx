@@ -45,9 +45,9 @@ sbx_state_forked_store() {   # <state_dir> <launch_dir> <profile> <dest>
     printf '%s\n' "$1/forked/$3/$(sbx_copy_path_slug "$2")/$(sbx_copy_mount_id "$4")"
 }
 
-sbx_state_write_row() {   # <kind> <path> <detail> <dest> <note>
-    jq -cn --arg kind "$1" --arg path "$2" --arg detail "$3" --arg dest "$4" --arg note "$5" \
-        '{kind: $kind, path: $path, detail: $detail, dest: $dest, note: $note}'
+sbx_state_write_row() {   # <kind> <path> <detail> <dest> <note> <source>
+    jq -cn --arg kind "$1" --arg path "$2" --arg detail "$3" --arg dest "$4" --arg note "$5" --arg source "$6" \
+        '{kind: $kind, path: $path, detail: $detail, dest: $dest, note: $note, source: $source}'
 }
 
 # Every host location a launch of this plan writes, for --dry-run. Reads
@@ -78,11 +78,11 @@ sbx_state_writes() {   # <plan json> <state_dir> <launch_dir>
                     note="will seed, ${size:-unknown size}"
                 fi
                 rows+=("$(sbx_state_write_row persistent "$store" \
-                    "forked store for $dest from $from; kept until --reseed" "$dest" "$note")")
+                    "forked store for $dest from $from; kept until --reseed" "$dest" "$note" "$source")")
                 ;;
             record)
                 rows+=("$(sbx_state_write_row temporary "$state/work/<session-id>/$(sbx_copy_mount_id "$dest")" \
-                    "record working copy of $source; removed at teardown" "$dest" "")")
+                    "record working copy of $source; removed at teardown" "$dest" "" "$source")")
                 record_seen=true
                 ;;
             rw)
@@ -90,11 +90,11 @@ sbx_state_writes() {   # <plan json> <state_dir> <launch_dir>
                 if [[ "$present" != "true" ]]; then
                     note="created at launch"
                 fi
-                rows+=("$(sbx_state_write_row host "$source" "read-write bind at $dest from $from" "$dest" "$note")")
+                rows+=("$(sbx_state_write_row host "$source" "read-write bind at $dest from $from" "$dest" "$note" "$source")")
                 ;;
             dev)
                 if [[ "$present" == "true" ]]; then
-                    rows+=("$(sbx_state_write_row host "$source" "device bind at $dest from $from" "$dest" "")")
+                    rows+=("$(sbx_state_write_row host "$source" "device bind at $dest from $from" "$dest" "" "$source")")
                 fi
                 ;;
         esac
@@ -103,22 +103,22 @@ sbx_state_writes() {   # <plan json> <state_dir> <launch_dir>
 
     if [[ "$record_seen" == "true" ]]; then
         rows+=("$(sbx_state_write_row archived "$state/changes/$slug/<stamp>-<session-id>/" \
-            "files the session created or changed in record mounts; the newest SBX_KEEP_CHANGES (default 10) are kept" "" "")")
+            "files the session created or changed in record mounts; the newest SBX_KEEP_CHANGES (default 10) are kept" "" "" "")")
     fi
 
     if [[ "$(jq -r '.security.userns_full' <<< "$plan")" == "true" ]]; then
         rows+=("$(sbx_state_write_row persistent "$state/virt/containers-full" \
-            "podman image and container store (userns full)" "" "")")
+            "podman image and container store (userns full)" "" "" "")")
     elif [[ "$(jq -r '.security.caps_keep or .security.docker_api' <<< "$plan")" == "true" ]]; then
         rows+=("$(sbx_state_write_row persistent "$state/virt/containers" \
-            "podman image and container store" "" "")")
+            "podman image and container store" "" "" "")")
     fi
 
     rows+=("$(sbx_state_write_row temporary "$state/join/$base.{pid,json,lock}" \
-        "session bookkeeping (pid, join sidecar, lock); removed at teardown" "" "")")
+        "session bookkeeping (pid, join sidecar, lock); removed at teardown" "" "" "")")
 
     rows+=("$(sbx_state_write_row temporary "$state/sessions/$base/" \
-        "session directory; removed at teardown (-N is appended if the name is in use)" "" "")")
+        "session directory; removed at teardown (-N is appended if the name is in use)" "" "" "")")
 
     printf '%s\n' "${rows[@]}" | jq -cs .
 }
