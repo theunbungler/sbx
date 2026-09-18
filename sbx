@@ -28,9 +28,6 @@ source "$SCRIPT_DIR/lib/resolve.sh"
 GUI_MODE=false
 XPRA_DISPLAY=""
 
-# Ensure state directory exists
-mkdir -p "$STATE_DIR"
-
 # Serializes every observation of the two-step session claim (see the claim
 # loop below for what the two steps are and why the gap between them must
 # never be seen). Defined here rather than beside the claim loop because
@@ -60,32 +57,64 @@ sbx_keep_changes() {
     printf '%s\n' "$keep"
 }
 
-# One-time relocation of the pre-`forked` cli store. The old path is
-# $STATE_DIR/profiles/cli/<profile>/<slug>/<mount-id>, which is the same
-# shape the forked store uses, so this is a rename rather than a conversion
-# — the contents are already a valid sandbox-owned tree. ("profiles/" was
-# always a poor name for state; nothing else lives under it.)
-#
-# The guard is per-entry, not "does forked/ exist": forked/ is created by
-# ordinary use (or by moving the very first entry below), so an "absent"
-# check on it can only ever fire once and then never again. That turned an
-# interrupted migration into a permanent one — stores after the first would
-# be stranded under profiles/cli forever. Testing each destination
-# individually makes this resumable: an interrupt just means the next
-# launch finishes what the last one started.
-if [[ -d "$STATE_DIR/profiles/cli" ]]; then
-    for old_store in "$STATE_DIR/profiles/cli"/*; do
-        [[ -d "$old_store" ]] || continue
-        new_store="$STATE_DIR/forked/$(basename "$old_store")"
-        if [[ -e "$new_store" ]]; then
-            echo "Warning: both $old_store and $new_store exist; leaving the old store in place — reconcile manually." >&2
-            continue
-        fi
-        mkdir -p "$STATE_DIR/forked"
-        mv "$old_store" "$new_store"
-    done
-    rmdir "$STATE_DIR/profiles/cli" "$STATE_DIR/profiles" 2>/dev/null || true
-fi
+# Creates the state directory and finishes any interrupted one-time store
+# migration. Every path runs this before touching state — except --dry-run,
+# which must create nothing.
+sbx_state_init() {
+    mkdir -p "$STATE_DIR"
+
+    # One-time relocation of the pre-`forked` cli store. The old path is
+    # $STATE_DIR/profiles/cli/<profile>/<slug>/<mount-id>, which is the same
+    # shape the forked store uses, so this is a rename rather than a conversion
+    # — the contents are already a valid sandbox-owned tree. ("profiles/" was
+    # always a poor name for state; nothing else lives under it.)
+    #
+    # The guard is per-entry, not "does forked/ exist": forked/ is created by
+    # ordinary use (or by moving the very first entry below), so an "absent"
+    # check on it can only ever fire once and then never again. That turned an
+    # interrupted migration into a permanent one — stores after the first would
+    # be stranded under profiles/cli forever. Testing each destination
+    # individually makes this resumable: an interrupt just means the next
+    # launch finishes what the last one started.
+    if [[ -d "$STATE_DIR/profiles/cli" ]]; then
+        local old_store new_store
+        for old_store in "$STATE_DIR/profiles/cli"/*; do
+            [[ -d "$old_store" ]] || continue
+            new_store="$STATE_DIR/forked/$(basename "$old_store")"
+            if [[ -e "$new_store" ]]; then
+                echo "Warning: both $old_store and $new_store exist; leaving the old store in place — reconcile manually." >&2
+                continue
+            fi
+            mkdir -p "$STATE_DIR/forked"
+            mv "$old_store" "$new_store"
+        done
+        rmdir "$STATE_DIR/profiles/cli" "$STATE_DIR/profiles" 2>/dev/null || true
+    fi
+}
+
+# --dry-run applies only to a launch. Each command that acts on state calls
+# this with its own remaining arguments, so the combination is refused in
+# either order: "--dry-run --gc" is caught through DRY_RUN, "--gc --dry-run"
+# through the scan (which stops at --, where the payload's arguments begin).
+sbx_refuse_dry_run() {   # <this command> <remaining args...>
+    local cmd="$1" arg
+    shift
+    if [[ "$DRY_RUN" != "true" ]]; then
+        for arg in "$@"; do
+            if [[ "$arg" == "--" ]]; then
+                break
+            fi
+            if [[ "$arg" == "--dry-run" ]]; then
+                DRY_RUN=true
+                break
+            fi
+        done
+    fi
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "Error: --dry-run applies only to a launch; it cannot be combined with $cmd." >&2
+        exit 2
+    fi
+}
 
 usage() {
     cat <<EOF
@@ -108,6 +137,8 @@ Options:
   --wd <path>            Start in this directory inside the sandbox
                          (default: launch dir if present, else \$HOME, else /)
   --gui                  Enable isolated GUI via xpra (attach with: xpra attach :<N>)
+  --dry-run [--json]     Show what this launch would do, without doing it
+                         (exits 1 if the launch would stop)
   --reseed               Discard this directory's forked stores, so the next
                          launch re-seeds them from the host (asks first)
   --gc                   Remove crash residue and old change archives
@@ -164,6 +195,8 @@ add_host_port() {
     esac
 }
 GUI_FLAG=false
+DRY_RUN=false
+DRY_RUN_JSON=false
 CAPS_KEEP=false
 RESEED=false
 ASSUME_YES=false
@@ -171,6 +204,8 @@ ASSUME_YES=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --doctor)
+            sbx_refuse_dry_run --doctor "${@:2}"
+            sbx_state_init
             if [[ -n "${2:-}" && "${2:-}" != "--json" ]]; then
                 echo "Error: --doctor takes only --json." >&2
                 exit 2
@@ -180,10 +215,14 @@ while [[ $# -gt 0 ]]; do
             exit "$doctor_rc"
             ;;
         --list-profiles)
+            sbx_refuse_dry_run --list-profiles "${@:2}"
+            sbx_state_init
             list_profiles
             exit 0
             ;;
         --gc)
+            sbx_refuse_dry_run --gc "${@:2}"
+            sbx_state_init
             # Both sweeps below judge a session dead by the absence of a
             # liveness record, which is exactly the intermediate state the
             # claim loop hides behind this lock: between its mkdir and its
@@ -330,6 +369,8 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --list-sessions)
+            sbx_refuse_dry_run --list-sessions "${@:2}"
+            sbx_state_init
             echo "Active Sessions (this directory):"
             for sdir in "$STATE_DIR"/sessions/*; do
                 [[ -d "$sdir" && -f "$sdir/session.json" ]] || continue
@@ -357,6 +398,8 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         --changes)
+            sbx_refuse_dry_run --changes "${@:2}"
+            sbx_state_init
             CHANGES_DIR="$STATE_DIR/changes/$(sbx_copy_path_slug "$PWD")"
             if [[ -n "${2-}" && "$2" != -* ]]; then
                 target="$CHANGES_DIR/$2"; shift 2
@@ -381,6 +424,8 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         --join)
+            sbx_refuse_dry_run --join "${@:2}"
+            sbx_state_init
             JOIN_SESSION="$2"
             shift 2
             # A trailing `-- cmd` has to be consumed here: this branch exits
@@ -482,6 +527,8 @@ while [[ $# -gt 0 ]]; do
                 /usr/bin/env "PATH=$JOIN_PATH" "${JOIN_CMD[@]}"
             ;;
         --attach)
+            sbx_refuse_dry_run --attach "${@:2}"
+            sbx_state_init
             ATTACH_SESSION="$2"
             shift 2
             # Same validation as --join, and for the same reason.
@@ -537,7 +584,16 @@ while [[ $# -gt 0 ]]; do
             GUI_FLAG=true
             shift
             ;;
+        --dry-run)
+            DRY_RUN=true
+            shift
+            if [[ "${1:-}" == "--json" ]]; then
+                DRY_RUN_JSON=true
+                shift
+            fi
+            ;;
         -h|--help)
+            sbx_state_init
             usage
             exit 0
             ;;
@@ -551,6 +607,14 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ "$RESEED" == "true" && "$DRY_RUN" == "true" ]]; then
+    echo "Error: --dry-run applies only to a launch; it cannot be combined with --reseed." >&2
+    exit 2
+fi
+if [[ "$DRY_RUN" != "true" ]]; then
+    sbx_state_init
+fi
 
 if [[ ${#COMMAND[@]} -eq 0 ]]; then
     COMMAND=("/bin/bash")
@@ -612,7 +676,16 @@ prompt_project_profile() {
 # bwrap used to be discovered only when launch.sh tried to exec it, which
 # reported nothing but "bwrap: not found" after a session directory, an
 # xpra display and a pasta namespace had already been built.
-sbx_deps_require core || exit 1
+if [[ "$DRY_RUN" == "true" ]]; then
+    # Resolving needs the core tools (jq, realpath, envsubst) to exist at
+    # all. Everything else — the user-namespace probe, optional groups —
+    # is reported in the dry-run output instead of stopping it.
+    if [[ -n "$(sbx_deps_missing core)" ]]; then
+        sbx_deps_require core || exit 1
+    fi
+else
+    sbx_deps_require core || exit 1
+fi
 
 # --- Resolve ---
 # Every decision about profiles is made here, from the flags and the profile
@@ -645,6 +718,31 @@ PLAN=$(sbx_resolve "${RESOLVE_ARGS[@]}")
 plan_get() {
     jq -r "$1" <<< "$PLAN"
 }
+
+# --- Dry run ---
+# Everything below this point acts: prompts, creates state, launches. A dry
+# run stops here with the plan, the host locations it would write, and the
+# dependency check in report-only form.
+if [[ "$DRY_RUN" == "true" ]]; then
+    DRY_DEPS_ARGS=()
+    if [[ "$(plan_get '.security.userns_full')" == "true" ]]; then
+        DRY_DEPS_ARGS+=(--subids)
+    fi
+    mapfile -t DRY_GROUPS < <(plan_get '.deps[]')
+    DRY_NEEDS=$(sbx_deps_status "${DRY_DEPS_ARGS[@]}" "${DRY_GROUPS[@]}")
+    DRY_WRITES=$(sbx_state_writes "$PLAN" "$STATE_DIR" "$PWD")
+    DRY_DOC=$(jq -c --argjson needs "$DRY_NEEDS" --argjson writes "$DRY_WRITES" \
+        '. + {needs: $needs, writes: $writes}' <<< "$PLAN")
+    if [[ "$DRY_RUN_JSON" == "true" ]]; then
+        jq . <<< "$DRY_DOC"
+    else
+        sbx_render_plan "$DRY_DOC" "$HOME"
+    fi
+    if [[ "$(jq -r '(.errors | length) == 0 and .needs.ok' <<< "$DRY_DOC")" == "true" ]]; then
+        exit 0
+    fi
+    exit 1
+fi
 
 # Errors are never profile-authored trust decisions — they gate the whole
 # launch — so they print and exit before anything else, including the

@@ -83,6 +83,7 @@ To see all available commands and options, run:
 | Command | Description |
 |---------|-------------|
 | `--doctor [--json]` | Check that required tools are installed and that unprivileged user namespaces work. Prints the install command for your distro. Exits non-zero only if something every session needs is missing. |
+| `--dry-run [--json]` | Show everything this launch would do — profiles, mounts, environment, network grants, every host location it would write, missing dependencies, confirmations, warnings and errors — without creating, prompting or launching anything. Exits 1 if the real launch would stop. |
 | `--list-profiles` | Show all available CLI, FS, and NET profiles. |
 | `--list-sessions` | List all currently active sandbox sessions. |
 | `--join <session>` | Open a new shell inside a running sandbox session, with its own terminal. Append `-- <cmd>` to run a command instead. |
@@ -318,6 +319,26 @@ CIDR.
 field, a `dns` value that is not a bare IPv4 address (1.1.1.1 is used), a
 mount whose source does not exist on this host (the mount is skipped), and
 a `*.` wildcard in `allow`.
+
+### Previewing a launch
+
+`--dry-run` takes the same flags as a launch and prints what that launch
+would do, without doing any of it:
+
+    ./sbx --dry-run --cli claude --fs sandbox --net anthropic
+
+It shows the security settings, every mount (with forked stores marked
+*will seed* or *exists*), the environment with which profile won each
+variable, the network grants, and a **Writes** section listing every host
+location the session would write: forked stores, record working copies and
+change archives, read-write binds, podman stores and the session directory.
+It runs the dependency check in report-only form, lists project profiles
+that would ask for confirmation (without asking), and ends with whether the
+launch would proceed. `--dry-run --json` prints the same information as one
+JSON document.
+
+Passthrough variables are listed by name, never by value. The preview
+describes what is mounted, not what the mounted trees contain.
 
 ## Forked and Record Mounts
 
