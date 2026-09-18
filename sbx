@@ -12,6 +12,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/copy-mounts.sh"
 # shellcheck source=lib/state-paths.sh
 source "$SCRIPT_DIR/lib/state-paths.sh"
+# shellcheck source=lib/render.sh
+source "$SCRIPT_DIR/lib/render.sh"
 # shellcheck source=lib/deps.sh
 source "$SCRIPT_DIR/lib/deps.sh"
 # shellcheck source=lib/profiles.sh
@@ -642,22 +644,6 @@ PLAN=$(sbx_resolve "${RESOLVE_ARGS[@]}")
 
 plan_get() {
     jq -r "$1" <<< "$PLAN"
-}
-
-# Profile-authored text (mount sources, .workingDirectory) reaches this
-# print loop verbatim from validation. Strip anything outside printable
-# ASCII plus tab and cap the length before it ever reaches the terminal —
-# a warning is not a trusted string, and the trust prompt printed just
-# above it (see the confirm loop below) is the one control between a
-# cloned repository and an arbitrary mount set; nothing printed here may
-# be able to repaint or crowd it. Phase 3's --dry-run is another consumer.
-sbx_sanitize_message() {   # <text>
-    local msg="$1" clean
-    clean=$(LC_ALL=C tr -cd '\11\40-\176' <<< "$msg")
-    if [[ ${#clean} -gt 500 ]]; then
-        clean="${clean:0:500}..."
-    fi
-    printf '%s' "$clean"
 }
 
 # Errors are never profile-authored trust decisions — they gate the whole
