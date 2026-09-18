@@ -114,6 +114,9 @@ sbx_state_writes() {   # <plan json> <state_dir> <launch_dir>
             "podman image and container store" "" "")")
     fi
 
+    rows+=("$(sbx_state_write_row temporary "$state/join/$base.{pid,json,lock}" \
+        "session bookkeeping (pid, join sidecar, lock); removed at teardown" "" "")")
+
     rows+=("$(sbx_state_write_row temporary "$state/sessions/$base/" \
         "session directory; removed at teardown (-N is appended if the name is in use)" "" "")")
 

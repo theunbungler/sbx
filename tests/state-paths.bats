@@ -68,13 +68,13 @@ setup_writes() {
 @test "writes: an absent forked source, a ro mount and an absent dev mount write nothing" {
     setup_writes
     run sbx_state_writes "$(plan "[$(mount forked "$SRC/gone" /g false),$(mount ro "$SRC/tree" /r true),$(mount dev /nonexistent /d false)]")" "$STATE" "$LAUNCH"
-    [ "$(jq -r 'map(.kind) | join(",")' <<< "$output")" = "temporary" ]
+    [ "$(jq -r 'map(.kind) | join(",")' <<< "$output")" = "temporary,temporary" ]
 }
 
 @test "writes: record mounts get a working copy each and one archive" {
     setup_writes
     run sbx_state_writes "$(plan "[$(mount record "$SRC/tree" /a true),$(mount record "$SRC/tree" /b true)]")" "$STATE" "$LAUNCH"
-    [ "$(jq -r 'map(.kind) | join(",")' <<< "$output")" = "temporary,temporary,archived,temporary" ]
+    [ "$(jq -r 'map(.kind) | join(",")' <<< "$output")" = "temporary,temporary,archived,temporary,temporary" ]
     [ "$(jq -r '.[0].path' <<< "$output")" = "$STATE/work/<session-id>/_a" ]
     [ "$(jq -r '.[2].path' <<< "$output")" = "$STATE/changes/$(sbx_copy_path_slug "$LAUNCH")/<stamp>-<session-id>/" ]
 }
@@ -95,13 +95,20 @@ setup_writes() {
     [ "$(jq -r '.[0].path' <<< "$output")" = "$STATE/virt/containers" ]
     run sbx_state_writes "$(plan '[]' true true false)" "$STATE" "$LAUNCH"
     [ "$(jq -r '.[0].path' <<< "$output")" = "$STATE/virt/containers-full" ]
-    [ "$(jq -r 'length' <<< "$output")" = "2" ]
+    [ "$(jq -r 'length' <<< "$output")" = "3" ]
 }
 
 @test "writes: the session directory is always last, named like the launch" {
     setup_writes
     run sbx_state_writes "$(plan '[]')" "$STATE" "$LAUNCH"
     [ "$(jq -r '.[-1].path' <<< "$output")" = "$STATE/sessions/my-proj/" ]
+}
+
+@test "writes: session bookkeeping is a temporary row right before the session directory" {
+    setup_writes
+    run sbx_state_writes "$(plan '[]')" "$STATE" "$LAUNCH"
+    [ "$(jq -r '.[-2].path' <<< "$output")" = "$STATE/join/my-proj.{pid,json,lock}" ]
+    [ "$(jq -r '.[-2].kind' <<< "$output")" = "temporary" ]
 }
 
 @test "writes: computing the list creates nothing" {
