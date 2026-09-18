@@ -371,3 +371,48 @@ sbx_deps_doctor() {
     fi
     return $rc
 }
+
+# Report-only form of sbx_deps_require, for --dry-run: which of the given
+# groups' tools are missing, whether the user-namespace probe passes (only
+# when core is requested and bwrap exists), and whether subordinate IDs
+# exist (only with --subids). Prints one JSON object and returns 0 either
+# way — .ok carries the verdict, so the caller can show everything before
+# deciding its exit status.
+sbx_deps_status() {   # [--subids] <group>...
+    local want_subids=false group ok=true userns=null subids=null groups_json=""
+    local -a missing all_missing=() hint=()
+    if [[ "${1:-}" == "--subids" ]]; then
+        want_subids=true
+        shift
+    fi
+    for group in "$@"; do
+        mapfile -t missing < <(sbx_deps_missing "$group")
+        if [[ -n "$groups_json" ]]; then
+            groups_json+=","
+        fi
+        groups_json+="\"$group\":$(sbx_deps_json_list "${missing[@]}")"
+        all_missing+=("${missing[@]}")
+    done
+    if [[ ${#all_missing[@]} -gt 0 ]]; then
+        ok=false
+        mapfile -t hint < <(sbx_deps_install_hint "$(sbx_deps_family)" "${all_missing[@]}")
+    fi
+    if [[ " $* " == *" core "* ]] && command -v bwrap >/dev/null 2>&1; then
+        if sbx_deps_userns_check >/dev/null 2>&1; then
+            userns=true
+        else
+            userns=false
+            ok=false
+        fi
+    fi
+    if [[ "$want_subids" == "true" ]]; then
+        if sbx_deps_subids_ok; then
+            subids=true
+        else
+            subids=false
+            ok=false
+        fi
+    fi
+    printf '{"groups":{%s},"userns":%s,"subids":%s,"install":%s,"ok":%s}\n' \
+        "$groups_json" "$userns" "$subids" "$(sbx_deps_json_list "${hint[@]}")" "$ok"
+}

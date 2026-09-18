@@ -293,3 +293,53 @@ doctor_bin() {   # <tool to omit>...: a PATH holding every table tool except tho
     [ "$(jq -r .subids <<< "$output")" = "false" ]
     [ "$(jq -r '.install[0]' <<< "$output")" = "sudo apt install passt" ]
 }
+
+@test "status: everything present is ok" {
+    doctor_bin bwrap
+    fake_bwrap 0
+    PATH="$FIX/bin" run sbx_deps_status core net
+    [ "$status" -eq 0 ]
+    [ "$(jq -c .groups <<< "$output")" = '{"core":[],"net":[]}' ]
+    [ "$(jq -r .userns <<< "$output")" = "true" ]
+    [ "$(jq -r .subids <<< "$output")" = "null" ]
+    [ "$(jq -c .install <<< "$output")" = '[]' ]
+    [ "$(jq -r .ok <<< "$output")" = "true" ]
+}
+
+@test "status: a missing tool is listed with the distro's command, and returns 0" {
+    doctor_bin bwrap pasta
+    fake_bwrap 0
+    os_release "$FIX/os" manjaro arch
+    PATH="$FIX/bin" SBX_OS_RELEASE="$FIX/os" run sbx_deps_status core net
+    [ "$status" -eq 0 ]
+    [ "$(jq -c .groups.net <<< "$output")" = '["pasta"]' ]
+    [ "$(jq -r '.install[0]' <<< "$output")" = "sudo pacman -S passt" ]
+    [ "$(jq -r .ok <<< "$output")" = "false" ]
+}
+
+@test "status: a failing probe is reported, not printed" {
+    doctor_bin bwrap
+    fake_bwrap 1 "bwrap: nope"
+    mkdir -p "$FIX/sys"
+    PATH="$FIX/bin" SBX_PROC_SYS="$FIX/sys" run sbx_deps_status core
+    [ "$status" -eq 0 ]
+    [ "$(jq -r .userns <<< "$output")" = "false" ]
+    [ "$(jq -r .ok <<< "$output")" = "false" ]
+}
+
+@test "status: the probe does not run without core" {
+    doctor_bin bwrap
+    fake_bwrap 1 "bwrap: nope"
+    PATH="$FIX/bin" run sbx_deps_status net
+    [ "$(jq -r .userns <<< "$output")" = "null" ]
+    [ "$(jq -r .ok <<< "$output")" = "true" ]
+}
+
+@test "status: --subids reports a missing range" {
+    doctor_bin bwrap
+    fake_bwrap 0
+    : > "$FIX/subuid"; : > "$FIX/subgid"
+    PATH="$FIX/bin" SBX_SUBUID="$FIX/subuid" SBX_SUBGID="$FIX/subgid" run sbx_deps_status --subids core podman
+    [ "$(jq -r .subids <<< "$output")" = "false" ]
+    [ "$(jq -r .ok <<< "$output")" = "false" ]
+}
