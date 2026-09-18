@@ -30,6 +30,7 @@ def is_cidr:
 def is_host_glob:
   . == "*" or test("^(\\*\\.)?[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$");
 def is_var_name: type == "string" and test("^[A-Za-z_][A-Za-z0-9_]*$");
+def has_ctrl: any(explode[]; . < 32);
 
 if type != "object" then [err("."; "expected a JSON object at the top level")]
 else
@@ -45,6 +46,12 @@ else
           else .env | to_entries[] | select(.value | type | IN("string", "number") | not)
                | err(".env.\(.key)"; "expected a string or number, got \(.value | tojson)")
           end
+        else empty end ),
+
+      ( if has("env") and (.env | type) == "object" then
+          ( .env | keys[] | select(has_ctrl) | err(".env.\(.)"; "expected no control characters") ),
+          ( .env | to_entries[] | select(.value | type == "string" and has_ctrl)
+               | err(".env.\(.key)"; "expected no control characters") )
         else empty end ),
 
       ( if has("path") then
@@ -71,6 +78,7 @@ else
                      ( ("source", "dest") as $f
                         | if ($m | has($f)) | not then err(".mounts[\($i)].\($f)"; "required")
                           elif ($m[$f] | type) != "string" then err(".mounts[\($i)].\($f)"; "expected a string, got \($m[$f] | tojson)")
+                          elif ($m[$f] | has_ctrl) then err(".mounts[\($i)].\($f)"; "expected no control characters")
                           else empty end ),
                      ( if ($m | has("perm")) | not then err(".mounts[\($i)].perm"; "required")
                        elif $m.perm == "copy" then err(".mounts[\($i)].perm"; "\"copy\" has been split: use \"forked\" if the sandbox owns the data (seeded from the host once), \"record\" if the host owns it (reseeded every launch, changes archived)")
@@ -96,6 +104,7 @@ else
           if (.allow | type) != "array" then err(".allow"; "expected an array, got \(.allow | tojson)")
           else .allow | to_entries[] | .key as $i | .value as $a
                | if ($a | type) != "string" then err(".allow[\($i)]"; "expected a string, got \($a | tojson)")
+                 elif ($a | has_ctrl) then err(".allow[\($i)]"; "expected no control characters")
                  elif ($a | test("^[0-9]")) then
                    ( if ($a | is_cidr) then empty
                      else err(".allow[\($i)]"; "expected an IPv4 address or CIDR, got \($a | tojson) (entries starting with a digit are read as addresses)") end )

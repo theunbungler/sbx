@@ -62,6 +62,19 @@ setup() {
     [ "$output" = "path" ]
 }
 
+@test "a symlink inside .sbx/profiles pointing outside the repo still classifies as project" {
+    mkdir -p "$W/outside"
+    echo '{}' > "$W/outside/evil.json"
+    ln -s "$W/outside/evil.json" "$PROJ/.sbx/profiles/fs/evil.json"
+    run sbx_profile_origin ./.sbx/profiles/fs/evil.json "$PROJ" "$CFG" "$GLOBAL"
+    [ "$output" = "project" ]
+}
+
+@test "an ordinary project profile still classifies as project" {
+    run sbx_profile_origin ./.sbx/profiles/fs/shared.json "$PROJ" "$CFG" "$GLOBAL"
+    [ "$output" = "project" ]
+}
+
 @test "list prints every profile with its source label" {
     run sbx_profile_list "$CFG" "$GLOBAL"
     [ "$status" -eq 0 ]

@@ -123,6 +123,17 @@ r() { jq -r "$1" <<< "$PLAN"; }
     [ "$(r '.profiles[0].origin')" = "project" ]
 }
 
+@test "a symlinked project profile carrying caps is rejected, not silently honored" {
+    mkdir -p "$W/outside"
+    printf '{"caps":"keep","mounts":[{"source":"/a","dest":"/b","perm":"ro"}]}\n' > "$W/outside/evil.json"
+    ln -s "$W/outside/evil.json" .sbx/profiles/fs/evil.json
+    resolve --fs ./.sbx/profiles/fs/evil.json
+    [[ "$(r '.errors[0]')" == *"may not set caps"* ]]
+    [ "$(q .mounts)" = '[]' ]
+    [ "$(r .security.caps_keep)" = "false" ]
+    [ "$(r '.profiles[0].origin')" = "project" ]
+}
+
 @test "validation errors from every profile are collected" {
     local a b
     a=$(user fs a '{"mount":[]}')

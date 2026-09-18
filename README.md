@@ -306,9 +306,13 @@ for the profile's type (there is no comment syntax — a misspelt field would
 otherwise be silently ignored); a wrong type or value (`perm`, `caps`,
 `userns`, `docker_api`, `ports`, `host_ports`, `allow`, `passthrough`
 names, `env` values); and, in a project profile, `caps`, `userns`,
-`docker_api` or `host_ports`. An `allow` entry that starts with a digit is
-read as an address, so a hostname like `1password.com` is rejected rather
-than silently treated as a malformed CIDR.
+`docker_api` or `host_ports`. This checks whether the field is *present*,
+not what it's set to — a project profile with `"docker_api": false` is
+rejected the same as `"docker_api": true`; if you don't want to grant it,
+omit the field rather than setting it to `false`. An `allow` entry that
+starts with a digit is read as an address, so a hostname like
+`1password.com` is rejected rather than silently treated as a malformed
+CIDR.
 
 **Warnings are printed and the launch continues:** a `workingDirectory`
 field, a `dns` value that is not a bare IPv4 address (1.1.1.1 is used), a

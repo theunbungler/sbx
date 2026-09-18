@@ -95,6 +95,28 @@ check() {   # <type> <origin> <json>
     [ -z "$output" ]
 }
 
+@test "control characters are rejected in env name, env value, mount dest and allow entries" {
+    jq -cn --arg s "$(printf 'bad\x1bname')" '{env: {($s): "ok"}}' > "$F"
+    run sbx_profile_check fs "$F" user
+    [[ "$output" == *'.env.bad'$'\x1b''name: expected no control characters'* ]]
+
+    jq -cn --arg s "$(printf 'bad\x1bvalue')" '{env: {OK: $s}}' > "$F"
+    run sbx_profile_check fs "$F" user
+    [[ "$output" == *'.env.OK: expected no control characters'* ]]
+
+    jq -cn --arg s "$(printf '/b\x1bbad')" '{mounts: [{source: "/a", dest: $s, perm: "ro"}]}' > "$F"
+    run sbx_profile_check fs "$F" user
+    [[ "$output" == *'.mounts[0].dest: expected no control characters'* ]]
+
+    jq -cn '{mounts: [{source: ("/a" + ([0] | implode) + "bad"), dest: "/b", perm: "ro"}]}' > "$F"
+    run sbx_profile_check fs "$F" user
+    [[ "$output" == *'.mounts[0].source: expected no control characters'* ]]
+
+    jq -cn --arg s "$(printf 'bad\x1bhost')" '{allow: [$s]}' > "$F"
+    run sbx_profile_check net "$F" user
+    [[ "$output" == *'.allow[0]: expected no control characters'* ]]
+}
+
 @test "every shipped profile validates clean" {
     local f type
     for f in "$BATS_TEST_DIRNAME"/../profiles/*/*.json; do

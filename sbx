@@ -552,27 +552,20 @@ if [[ ${#COMMAND[@]} -eq 0 ]]; then
     COMMAND=("/bin/bash")
 fi
 
-# True when a resolved profile path lies inside the launch directory's
-# .sbx tree — i.e. it was supplied by the project rather than by the user.
-profile_is_project() {
-    [[ "$(sbx_profile_origin "$1" "$PWD" "$CONFIG_DIR" "$SCRIPT_DIR/profiles")" == "project" ]]
-}
-
+# Prompts for a profile that lib/resolve.sh has already decided needs
+# confirmation (plan.confirm: project origin, git-tracked, trust not
+# granted — see the comment by "confirm+=" in lib/resolve.sh). This
+# function only performs the prompt; it does not recompute the trust
+# decision, so it and the plan it is driven from can never disagree about
+# which profiles land here (that used to be two independent
+# implementations — see the "trust decision is computed twice" finding).
+#
 # A version-controlled project directory is untrusted input: it can ship
 # .sbx/profiles that mount anything anywhere, authored by whoever wrote the
 # repository. Using one is a decision the user makes explicitly, outside the
 # repository.
-#
-# A project profile that git does not track is treated as the user's own
-# scratch config — it cannot have arrived via clone or pull, so there is
-# nobody else to distrust and no prompt is raised. (Tracked-but-uncommitted
-# counts as version-controlled: once it is in the index it travels.)
-confirm_project_profile() {
+prompt_project_profile() {
     local profile="$1"
-    profile_is_project "$profile" || return 0
-    [[ "${SBX_TRUST_PROJECT_PROFILES:-}" == "1" ]] && return 0
-    git -C "$PWD" ls-files --error-unmatch "$profile" >/dev/null 2>&1 || return 0
-
     local remote="" rname=""
     rname=$(git -C "$PWD" remote 2>/dev/null | head -n1)
     if [[ -n "$rname" ]]; then
@@ -649,12 +642,25 @@ plan_get() {
     jq -r "$1" <<< "$PLAN"
 }
 
-while IFS= read -r msg; do
-    if [[ -n "$msg" ]]; then
-        echo "Warning: $msg" >&2
+# Profile-authored text (mount sources, .workingDirectory) reaches this
+# print loop verbatim from validation. Strip anything outside printable
+# ASCII plus tab and cap the length before it ever reaches the terminal —
+# a warning is not a trusted string, and the trust prompt printed just
+# above it (see the confirm loop below) is the one control between a
+# cloned repository and an arbitrary mount set; nothing printed here may
+# be able to repaint or crowd it. Phase 3's --dry-run is another consumer.
+sbx_sanitize_message() {   # <text>
+    local msg="$1" clean
+    clean=$(LC_ALL=C tr -cd '\11\40-\176' <<< "$msg")
+    if [[ ${#clean} -gt 500 ]]; then
+        clean="${clean:0:500}..."
     fi
-done < <(plan_get '.warnings[]')
+    printf '%s' "$clean"
+}
 
+# Errors are never profile-authored trust decisions — they gate the whole
+# launch — so they print and exit before anything else, including the
+# confirmation prompt: a rejected profile must never prompt.
 if [[ "$(plan_get '.errors | length')" != "0" ]]; then
     while IFS= read -r msg; do
         echo "Error: $msg" >&2
@@ -662,10 +668,27 @@ if [[ "$(plan_get '.errors | length')" != "0" ]]; then
     exit 1
 fi
 
-for profile in "${FS_PROFILES[@]}" "$CLI_PROFILE" "${NET_PROFILES[@]}"; do
-    [[ -z "$profile" ]] && continue
-    confirm_project_profile "$profile"
+# Drive the confirmation loop from the plan's own list, not a
+# reimplementation of the trust decision beside it (see prompt_project_profile).
+# mapfile first, then a plain `for`: a `while read ... done < <(...)` loop
+# would redirect fd 0 to the process substitution for the loop body,
+# which is exactly the fd prompt_project_profile's `[[ ! -t 0 ]]` tests —
+# a real interactive launch would misreport itself as non-interactive.
+mapfile -t CONFIRM_PROFILES < <(plan_get '.confirm[]')
+for profile in "${CONFIRM_PROFILES[@]}"; do
+    [[ -n "$profile" ]] && prompt_project_profile "$profile"
 done
+
+# Warnings print only after the confirmation prompt above has run: before
+# Phase 2, nothing was echoed before that prompt, and profile-authored
+# warning text (see sbx_sanitize_message) must not be given the chance to
+# repaint or crowd out the one prompt standing between a cloned repository
+# and an arbitrary mount set.
+while IFS= read -r msg; do
+    if [[ -n "$msg" ]]; then
+        echo "Warning: $(sbx_sanitize_message "$msg")" >&2
+    fi
+done < <(plan_get '.warnings[]')
 
 USERNS_FULL=$(plan_get '.security.userns_full')
 USERNS_PROFILE=$(plan_get '.security.userns_profile')
@@ -1084,6 +1107,14 @@ while IFS= read -r -d '' profile_name && IFS= read -r -d '' source &&
         dev)    BWRAP_ARGS+=(--dev-bind-try "$source" "$dest") ;;
         forked) FORKED_MOUNTS+=("$profile_name"$'\t'"$source"$'\t'"$dest") ;;
         record) RECORD_MOUNTS+=("$source"$'\t'"$dest") ;;
+        *)
+            # Unreachable while sbx_profile_check rejects any other perm,
+            # but this must fail closed, not open: a mount that falls
+            # through here silently would launch with less isolation than
+            # the profile asked for, and nobody would know.
+            echo "Error: unknown perm '$perm' for mount $dest" >&2
+            exit 1
+            ;;
     esac
 done < <(jq -j 'def nul: [0] | implode; .mounts[] | .profile, nul, .source, nul, .dest, nul, .perm, nul' <<< "$PLAN")
 

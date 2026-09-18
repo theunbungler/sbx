@@ -41,10 +41,18 @@ sbx_profile_resolve() {   # <type> <name> <config_dir> <global_dir>
 
 # Where a resolved profile came from. "project" is what matters for trust:
 # a project profile arrived with the repository and is untrusted input.
+#
+# Classification is OR, not just realpath containment: a project profile
+# that is itself a symlink (e.g. ./.sbx/profiles/fs/evil.json -> /elsewhere)
+# resolves outside <launch_dir>/.sbx via realpath -m, which would otherwise
+# read it as "path" origin and skip both the restricted-field validation
+# and the trust prompt. sbx_profile_resolve only ever finds a project
+# profile under the literal "./.sbx/" prefix, so matching that lexical
+# form as well closes the symlink escape without following the link.
 sbx_profile_origin() {   # <path> <launch_dir> <config_dir> <global_dir>
     local abs
     abs=$(realpath -m "$1")
-    if [[ "$abs" == "$(realpath -m "$2/.sbx")/"* ]]; then
+    if [[ "$abs" == "$(realpath -m "$2/.sbx")/"* || "$1" == "./.sbx/"* ]]; then
         echo project
     elif [[ "$abs" == "$(realpath -m "$3/profiles")/"* ]]; then
         echo user
