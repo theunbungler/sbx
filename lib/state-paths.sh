@@ -44,3 +44,78 @@ sbx_state_session_base() {   # <launch_dir>
 sbx_state_forked_store() {   # <state_dir> <launch_dir> <profile> <dest>
     printf '%s\n' "$1/forked/$3/$(sbx_copy_path_slug "$2")/$(sbx_copy_mount_id "$4")"
 }
+
+sbx_state_write_row() {   # <kind> <path> <detail> <dest> <note>
+    jq -cn --arg kind "$1" --arg path "$2" --arg detail "$3" --arg dest "$4" --arg note "$5" \
+        '{kind: $kind, path: $path, detail: $detail, dest: $dest, note: $note}'
+}
+
+# Every host location a launch of this plan writes, for --dry-run. Reads
+# the disk (does a forked store exist yet? how big is the source it would
+# be seeded from?) and writes nothing. Session IDs and archive timestamps
+# are assigned at launch, so they appear as <session-id> and <stamp>.
+sbx_state_writes() {   # <plan json> <state_dir> <launch_dir>
+    local plan="$1" state="$2" launch="$3" slug base
+    local profile source dest perm present from store size note record_seen=false
+    local -a rows=()
+    slug=$(sbx_copy_path_slug "$launch")
+    base=$(sbx_state_session_base "$launch")
+
+    while IFS= read -r -d '' profile && IFS= read -r -d '' source &&
+          IFS= read -r -d '' dest && IFS= read -r -d '' perm &&
+          IFS= read -r -d '' present && IFS= read -r -d '' from; do
+        case "$perm" in
+            forked)
+                # An absent source is skipped outright at launch: no store.
+                if [[ "$present" != "true" ]]; then
+                    continue
+                fi
+                store=$(sbx_state_forked_store "$state" "$launch" "$profile" "$dest")
+                if [[ -e "$store" ]]; then
+                    note="exists"
+                else
+                    size=$(du -sh "$source" 2>/dev/null | cut -f1)
+                    note="will seed, ${size:-unknown size}"
+                fi
+                rows+=("$(sbx_state_write_row persistent "$store" \
+                    "forked store for $dest from $from; kept until --reseed" "$dest" "$note")")
+                ;;
+            record)
+                rows+=("$(sbx_state_write_row temporary "$state/work/<session-id>/$(sbx_copy_mount_id "$dest")" \
+                    "record working copy of $source; removed at teardown" "$dest" "")")
+                record_seen=true
+                ;;
+            rw)
+                note=""
+                if [[ "$present" != "true" ]]; then
+                    note="created at launch"
+                fi
+                rows+=("$(sbx_state_write_row host "$source" "read-write bind at $dest from $from" "$dest" "$note")")
+                ;;
+            dev)
+                if [[ "$present" == "true" ]]; then
+                    rows+=("$(sbx_state_write_row host "$source" "device bind at $dest from $from" "$dest" "")")
+                fi
+                ;;
+        esac
+    done < <(jq -j 'def nul: [0] | implode;
+        .mounts[] | .profile, nul, .source, nul, .dest, nul, .perm, nul, (.present | tostring), nul, .from, nul' <<< "$plan")
+
+    if [[ "$record_seen" == "true" ]]; then
+        rows+=("$(sbx_state_write_row archived "$state/changes/$slug/<stamp>-<session-id>/" \
+            "files the session created or changed in record mounts; the newest SBX_KEEP_CHANGES (default 10) are kept" "" "")")
+    fi
+
+    if [[ "$(jq -r '.security.userns_full' <<< "$plan")" == "true" ]]; then
+        rows+=("$(sbx_state_write_row persistent "$state/virt/containers-full" \
+            "podman image and container store (userns full)" "" "")")
+    elif [[ "$(jq -r '.security.caps_keep or .security.docker_api' <<< "$plan")" == "true" ]]; then
+        rows+=("$(sbx_state_write_row persistent "$state/virt/containers" \
+            "podman image and container store" "" "")")
+    fi
+
+    rows+=("$(sbx_state_write_row temporary "$state/sessions/$base/" \
+        "session directory; removed at teardown (-N is appended if the name is in use)" "" "")")
+
+    printf '%s\n' "${rows[@]}" | jq -cs .
+}
