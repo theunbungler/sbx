@@ -318,6 +318,8 @@ Use `sbx-profile`:
     ./sbx-profile check                             # validate every profile you can see
     ./sbx-profile ls                                # list them, marking shadowed ones
 
+`check` is schema-only: it validates a profile's fields, not what a launch would actually do with it. Facts like an absent mount source or whether a project profile will prompt only show up in `sbx --dry-run`.
+
 `new` writes a minimal profile that grants nothing (or a copy of `--from`),
 validates it before writing, never overwrites an existing file, and never
 writes the global directory. Without `--user` or `--local` it asks where to

@@ -30,8 +30,8 @@ teardown() {
 @test "check with no argument reports every visible profile and passes when none has errors" {
     run "$SBXP" check
     [ "$status" -eq 0 ]
-    [[ "$output" == *"fs/sandbox (global): ok"* ]]
-    [[ "$output" == *"net/web (global): 1 warning"* ]]
+    [[ "$output" == *"fs/sandbox (global, $REPO/profiles/fs/sandbox.json): ok"* ]]
+    [[ "$output" == *"net/web (global, $REPO/profiles/net/web.json): 1 warning"* ]]
     [[ "$output" == *"  warning: "*"*.google.com admits any address"* ]]
 }
 
@@ -39,9 +39,11 @@ teardown() {
     echo '{"mount":[],"caps":"drop"}' > "$HOME/.config/sbx/profiles/fs/bad.json"
     run "$SBXP" check
     [ "$status" -eq 1 ]
-    [[ "$output" == *"fs/bad (user): 2 errors"* ]]
-    [[ "$output" == *"  error:   $HOME/.config/sbx/profiles/fs/bad.json: .mount: unknown field for a fs profile"* ]]
-    [[ "$output" == *"  error:   $HOME/.config/sbx/profiles/fs/bad.json: .caps: expected \"keep\", got \"drop\""* ]]
+    [[ "$output" == *"fs/bad (user, ~/.config/sbx/profiles/fs/bad.json): 2 errors"* ]]
+    [[ "$output" == *"  error:   .mount: unknown field for a fs profile"* ]]
+    [[ "$output" == *'  error:   .caps: expected "keep", got "drop"'* ]]
+    # the path prefix that sbx_profile_check produces is stripped, not just hidden
+    if [[ "$output" == *"$HOME/.config/sbx/profiles/fs/bad.json: .mount"* ]]; then return 1; fi
 }
 
 @test "check <type>/<name> resolves like a launch" {
@@ -49,7 +51,7 @@ teardown() {
     echo '{"caps":"keep"}' > .sbx/profiles/fs/sandbox.json
     run "$SBXP" check fs/sandbox
     [ "$status" -eq 1 ]
-    [[ "$output" == *"fs/sandbox (project): 1 error"* ]]
+    [[ "$output" == *"fs/sandbox (project, ./.sbx/profiles/fs/sandbox.json): 1 error"* ]]
     [[ "$output" == *"project profiles may not set caps"* ]]
 }
 
@@ -57,7 +59,7 @@ teardown() {
     echo '{"allow":["github.com"]}' > "$HOME/.config/sbx/profiles/net/gh.json"
     run "$SBXP" check "$HOME/.config/sbx/profiles/net/gh.json"
     [ "$status" -eq 0 ]
-    [[ "$output" == *"net/gh (user): ok"* ]]
+    [[ "$output" == *"net/gh (user, ~/.config/sbx/profiles/net/gh.json): ok"* ]]
     mkdir -p "$ROOT/elsewhere"
     echo '{}' > "$ROOT/elsewhere/x.json"
     run "$SBXP" check "$ROOT/elsewhere/x.json"
@@ -71,7 +73,7 @@ teardown() {
     ln -s "$ROOT/outside/evil.json" .sbx/profiles/fs/evil.json
     run "$SBXP" check "$PWD/.sbx/profiles/fs/evil.json"
     [ "$status" -eq 1 ]
-    [[ "$output" == *"fs/evil (project)"* ]]
+    [[ "$output" == *"fs/evil (project, $PWD/.sbx/profiles/fs/evil.json)"* ]]
     [[ "$output" == *"project profiles may not set caps"* ]]
 }
 
@@ -144,12 +146,48 @@ teardown() {
     [ "$(jq -r .description "$HOME/.config/sbx/profiles/fs/keep.json")" = "mine" ]
 }
 
+@test "a read-only destination directory reports 'cannot', not 'already exists'" {
+    chmod 555 "$HOME/.config/sbx/profiles/fs"
+    run "$SBXP" new fs blocked --user
+    chmod 755 "$HOME/.config/sbx/profiles/fs"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Error: cannot write"* ]]
+    if [[ "$output" == *"already exists"* ]]; then return 1; fi
+    if [[ -e "$HOME/.config/sbx/profiles/fs/blocked.json" ]]; then return 1; fi
+}
+
+@test "a read-only config directory reports 'cannot create'" {
+    rmdir "$HOME/.config/sbx/profiles/net"
+    chmod 555 "$HOME/.config/sbx/profiles"
+    run "$SBXP" new net blocked --user
+    chmod 755 "$HOME/.config/sbx/profiles"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Error: cannot create"* ]]
+}
+
+@test "a 201-character name is rejected" {
+    local long
+    long="$(printf 'a%.0s' $(seq 1 201))"
+    run "$SBXP" new fs "$long" --user
+    [ "$status" -eq 2 ]
+}
+
+@test "new never writes sbx's own global profile directory" {
+    rm -rf "$HOME/.config/sbx/profiles"
+    ln -s "$REPO/profiles" "$HOME/.config/sbx/profiles"
+    run "$SBXP" new fs viaglobal --user
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"is sbx's global profile directory; sbx-profile never writes there."* ]]
+    if [[ -e "$REPO/profiles/fs/viaglobal.json" ]]; then return 1; fi
+}
+
 @test "--from copies a profile under a new description" {
     run "$SBXP" new net web2 --user --from web
     [ "$status" -eq 0 ]
-    [ "$(jq -r .description "$HOME/.config/sbx/profiles/net/web2.json")" = "web2 (copied from net/web)" ]
+    [ "$(jq -r .description "$HOME/.config/sbx/profiles/net/web2.json")" = "web2 (copied from net/web, global)" ]
     [ "$(jq -c .allow "$HOME/.config/sbx/profiles/net/web2.json")" = "$(jq -c .allow "$REPO/profiles/net/web.json")" ]
     [[ "$output" == *"warning: "* ]]
+    [[ "$output" == *"Copied from $REPO/profiles/net/web.json (global)."* ]]
 }
 
 @test "--local --from refuses a profile with restricted fields" {
@@ -157,6 +195,32 @@ teardown() {
     [ "$status" -eq 1 ]
     [[ "$output" == *"sets caps docker_api, which a project profile may not set"* ]]
     if [[ -e "$PROJ/.sbx" ]]; then return 1; fi
+}
+
+@test "--from refuses a project-origin source with restricted fields, for --user too" {
+    mkdir -p .sbx/profiles/fs
+    echo '{"description":"mine","caps":"keep"}' > .sbx/profiles/fs/mine.json
+    run "$SBXP" new fs copy --user --from fs/mine
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"is a project profile and sets caps, which a project profile may not set; sbx-profile will not copy it into a profile that would allow them."* ]]
+    if [[ -e "$HOME/.config/sbx/profiles/fs/copy.json" ]]; then return 1; fi
+}
+
+@test "--from a clean project-origin source is allowed and named (project)" {
+    mkdir -p .sbx/profiles/fs
+    echo '{"description":"clean"}' > .sbx/profiles/fs/clean.json
+    run "$SBXP" new fs copy2 --user --from fs/clean
+    [ "$status" -eq 0 ]
+    [ "$(jq -r .description "$HOME/.config/sbx/profiles/fs/copy2.json")" = "copy2 (copied from fs/clean, project)" ]
+    [[ "$output" == *"Copied from ./.sbx/profiles/fs/clean.json (project)."* ]]
+}
+
+@test "--from a user-origin source is named (user)" {
+    "$SBXP" new fs usersrc --user > /dev/null
+    run "$SBXP" new fs copy3 --user --from fs/usersrc
+    [ "$status" -eq 0 ]
+    [ "$(jq -r .description "$HOME/.config/sbx/profiles/fs/copy3.json")" = "copy3 (copied from fs/usersrc, user)" ]
+    [[ "$output" == *"Copied from ~/.config/sbx/profiles/fs/usersrc.json (user)."* ]]
 }
 
 @test "--from must match the type" {
@@ -171,6 +235,27 @@ teardown() {
     echo '{}' > .sbx/profiles/fs/mine.json
     run bash -c "cd '$PROJ' && '$SBXP' new fs mine --user 2>&1"
     [[ "$output" == *"Warning: the project profile ./.sbx/profiles/fs/mine.json takes precedence"* ]]
+}
+
+@test "check with no argument marks a shadowed profile and does not count its errors" {
+    # global fs/sandbox.json is clean; shadow it with a user profile that
+    # has an error. The shadowed (global) one must still print but not
+    # gate the exit status; the shadowing (user) one is what a launch
+    # actually uses and does gate it.
+    echo '{"caps":"drop"}' > "$HOME/.config/sbx/profiles/fs/sandbox.json"
+    run "$SBXP" check
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"fs/sandbox (user, ~/.config/sbx/profiles/fs/sandbox.json): 1 error"* ]]
+    [[ "$output" == *"fs/sandbox (global, $REPO/profiles/fs/sandbox.json, shadowed by user): ok"* ]]
+}
+
+@test "--user --user is not an error; --user --local still is" {
+    run "$SBXP" new fs dup --user --user
+    [ "$status" -eq 0 ]
+    [ -f "$HOME/.config/sbx/profiles/fs/dup.json" ]
+    run "$SBXP" new fs dup2 --user --local
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"choose one"* ]]
 }
 
 @test "bad types and names are refused and write nothing" {
@@ -191,7 +276,7 @@ teardown() {
         "$SBXP" new "$type" "t$type" --user > /dev/null
         run "$SBXP" check "$type/t$type"
         [ "$status" -eq 0 ]
-        [[ "$output" == *"$type/t$type (user): ok"* ]]
+        [[ "$output" == *"$type/t$type (user, ~/.config/sbx/profiles/$type/t$type.json): ok"* ]]
     done
 }
 

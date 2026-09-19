@@ -151,6 +151,14 @@ setup() {
     [ "$status" -eq 1 ]
 }
 
+@test "the restricted-field list agrees between lib/profile-check.sh and sbx_profile_restricted_fields" {
+    local a b
+    a=$(grep -o '\["caps"[^]]*\]' "$BATS_TEST_DIRNAME/../lib/profiles.sh" | head -1 | tr -d '[]" ' | tr ',' '\n' | sort)
+    b=$(grep -o '\["caps"[^]]*\]' "$BATS_TEST_DIRNAME/../lib/profile-check.sh" | head -1 | tr -d '[]" ' | tr ',' '\n' | sort)
+    [ -n "$a" ]
+    [ "$a" = "$b" ]
+}
+
 @test "restricted fields are listed in order" {
     echo '{"host_ports":[1],"caps":"keep","description":"x","docker_api":false}' > "$W/r.json"
     run sbx_profile_restricted_fields "$W/r.json"
