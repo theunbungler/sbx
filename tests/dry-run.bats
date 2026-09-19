@@ -148,6 +148,20 @@ EOF
     if [[ "$output" == *hunter2* ]]; then return 1; fi
 }
 
+@test "env values are shown unexpanded, in text and --json, so host secrets are never printed" {
+    echo '{"env":{"TOK":"$SBX_DRY_TOKEN"}}' > "$HOME/.config/sbx/profiles/fs/envtok.json"
+    export SBX_DRY_TOKEN=hunter2
+    dry --fs envtok
+    [[ "$output" == *'TOK=$SBX_DRY_TOKEN'* ]]
+    if [[ "$output" == *hunter2* ]]; then return 1; fi
+
+    run bash -c 'cd "$1" && shift && "$@" < /dev/null 2>/dev/null' _ "$PROJ" "$SBX" --dry-run --json --fs envtok
+    [ "$status" -eq 0 ]
+    [ "$(jq -r '.env[0].raw' <<< "$output")" = '$SBX_DRY_TOKEN' ]
+    [ "$(jq -r '.env[0] | has("value")' <<< "$output")" = "false" ]
+    if [[ "$output" == *hunter2* ]]; then return 1; fi
+}
+
 @test "a tracked project profile does not prompt" {
     mkdir -p "$PROJ/.sbx/profiles/fs"
     echo '{"description":"t"}' > "$PROJ/.sbx/profiles/fs/t.json"

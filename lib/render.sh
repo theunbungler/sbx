@@ -68,7 +68,7 @@ def mark($ok): if $ok then "✓" else "✗" end;
 
     section("Env"; [ $d.env | map(select(.name != "PATH")) | group_by(.name)[]
         | .[-1] as $win
-        | "\($win.name)=\($win.value)  (\($win.from)"
+        | "\($win.name)=\($win.raw)  (\($win.from)"
           + (.[:-1] | map(.from) | unique | if length > 0 then "; overrides " + join(", ") else "" end)
           + ")" ]),
 

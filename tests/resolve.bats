@@ -84,6 +84,15 @@ r() { jq -r "$1" <<< "$PLAN"; }
     [ "$(r '.env[0].value')" = "-n" ]
 }
 
+@test "env carries raw (pre-envsubst) alongside the expanded value" {
+    local fs
+    export SBX_RESOLVE_TOKEN=hunter2
+    fs=$(user fs t '{"env":{"TOK":"$SBX_RESOLVE_TOKEN"}}')
+    resolve --fs "$fs"
+    [ "$(r '.env[0].raw')" = '$SBX_RESOLVE_TOKEN' ]
+    [ "$(r '.env[0].value')" = "hunter2" ]
+}
+
 @test "passthrough carries names, never values" {
     local fs
     export SBX_RESOLVE_SECRET=hunter2

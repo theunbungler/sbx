@@ -204,9 +204,10 @@ sbx_resolve() {
                 if [[ -z "$key" ]]; then
                     continue
                 fi
+                raw="$value"
                 value=$(printf '%s' "$value" | envsubst)
-                env+=("$(jq -cn --arg name "$key" --arg value "$value" --arg from "$from" \
-                    '{name: $name, value: $value, from: $from}')")
+                env+=("$(jq -cn --arg name "$key" --arg value "$value" --arg raw "$raw" --arg from "$from" \
+                    '{name: $name, value: $value, raw: $raw, from: $from}')")
                 if [[ "$key" == "PATH" ]]; then
                     sandbox_path="$value"
                 fi

@@ -338,7 +338,9 @@ launch would proceed. `--dry-run --json` prints the same information as one
 JSON document.
 
 Passthrough variables are listed by name, never by value. The preview
-describes what is mounted, not what the mounted trees contain.
+describes what is mounted, not what the mounted trees contain. Env values
+are shown as the profile wrote them, before `$VAR` expansion, so secrets
+pulled from the host environment are not printed.
 
 ## Forked and Record Mounts
 

@@ -70,8 +70,8 @@ line() {   # <prefix> -> the first output line starting with it
 }
 
 @test "env shows the winning value and what it overrides; PATH has its own line" {
-    render '.env = [{name:"A",value:"1",from:"fs/x"},{name:"PATH",value:"/p",from:"fs/x"},{name:"A",value:"2",from:"cli/c"}]'
-    [ "$(line Env)" = "Env        A=2  (cli/c; overrides fs/x)" ]
+    render '.env = [{name:"A",value:"1",raw:"1",from:"fs/x"},{name:"PATH",value:"/p",raw:"/p",from:"fs/x"},{name:"A",value:"2",raw:"$A",from:"cli/c"}]'
+    [ "$(line Env)" = "Env        A=\$A  (cli/c; overrides fs/x)" ]
     if printf '%s\n' "$output" | grep -q 'PATH=/p'; then return 1; fi
     [ "$(line Path)" = "Path       ~/.local/state/sbx/sessions/proj/bin:/usr/local/bin:/usr/bin:/bin" ]
 }
@@ -84,7 +84,7 @@ line() {   # <prefix> -> the first output line starting with it
 @test "passthrough notes an unset variable and one overridden by env" {
     render '.passthrough = ["SET_VAR","UNSET_VAR","OVER_VAR"]
       | .passthrough_set = ["SET_VAR","OVER_VAR"]
-      | .env = [{name:"OVER_VAR",value:"x",from:"fs/x"}]'
+      | .env = [{name:"OVER_VAR",value:"x",raw:"x",from:"fs/x"}]'
     [ "$(line Passthru)" = "Passthru   OVER_VAR (overridden by env), SET_VAR, UNSET_VAR (unset on host)" ]
 }
 
@@ -147,7 +147,7 @@ line() {   # <prefix> -> the first output line starting with it
 }
 
 @test "control characters in profile-authored text are removed; unicode is kept" {
-    render '.warnings = ["bad[2K\rtextend"] | .env = [{name:"U",value:"héllo",from:"fs/x"}]'
+    render '.warnings = ["bad[2K\rtextend"] | .env = [{name:"U",value:"héllo",raw:"héllo",from:"fs/x"}]'
     [ "$(line Warnings)" = "Warnings   bad[2Ktextend" ]
     [ "$(line Env)" = "Env        U=héllo  (fs/x)" ]
 }
