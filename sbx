@@ -593,7 +593,6 @@ while [[ $# -gt 0 ]]; do
             fi
             ;;
         -h|--help)
-            sbx_state_init
             usage
             exit 0
             ;;

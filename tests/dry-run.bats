@@ -130,3 +130,17 @@ EOF
     run bash -c 'cd "$1" && shift && "$@" < /dev/null 2>&1' _ "$PROJ" "$SBX" --list-sessions
     [ -d "$HOME/.local/state/sbx" ]
 }
+
+@test "--dry-run --help prints usage, exits 0 and creates nothing" {
+    dry --help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Usage:"* ]]
+    nothing_created
+}
+
+@test "--help --dry-run prints usage, exits 0 and creates nothing" {
+    run bash -c 'cd "$1" && shift && "$@" < /dev/null 2>&1' _ "$PROJ" "$SBX" --help --dry-run
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Usage:"* ]]
+    nothing_created
+}
