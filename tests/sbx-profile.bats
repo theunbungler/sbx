@@ -194,3 +194,40 @@ teardown() {
         [[ "$output" == *"$type/t$type (user): ok"* ]]
     done
 }
+
+@test "--local refuses when ./.sbx is a symlink" {
+    mkdir -p "$ROOT/outside"
+    ln -s "$ROOT/outside" .sbx
+    run "$SBXP" new fs x --local
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"./.sbx is a symbolic link"* ]]
+    if [[ -e "$ROOT/outside/x.json" || -e "$ROOT/outside/profiles/fs/x.json" ]]; then return 1; fi
+}
+
+@test "--local refuses when ./.sbx/profiles/<type> is a symlink" {
+    mkdir -p "$ROOT/outside" .sbx/profiles
+    ln -s "$ROOT/outside" .sbx/profiles/fs
+    run "$SBXP" new fs x --local
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"./.sbx/profiles/fs is a symbolic link"* ]]
+    if [[ -e "$ROOT/outside/x.json" ]]; then return 1; fi
+}
+
+@test "--user still writes through a symlinked config directory" {
+    mkdir -p "$ROOT/elsewhere"
+    rm -rf "$HOME/.config/sbx/profiles"
+    ln -s "$ROOT/elsewhere" "$HOME/.config/sbx/profiles"
+    run "$SBXP" new fs sym --user
+    [ "$status" -eq 0 ]
+    [ -f "$ROOT/elsewhere/fs/sym.json" ]
+}
+
+@test "--from sanitizes an escape-laden source path in error messages" {
+    mkdir -p .sbx/profiles/fs
+    printf 'not json' > $'.sbx/profiles/fs/\x1b[2Kbad.json'
+    run "$SBXP" new fs y --user --from $'fs/\x1b[2Kbad'
+    [ "$status" -eq 1 ]
+    if [[ "$output" == *$'\033'* ]]; then return 1; fi
+    [[ "$output" == *"[2Kbad"* ]]
+    [[ "$output" == *"is not valid JSON"* ]]
+}

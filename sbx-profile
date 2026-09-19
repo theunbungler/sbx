@@ -230,6 +230,13 @@ cmd_new() {
         dir="$CONFIG_DIR/profiles/$type"
     else
         dir="./.sbx/profiles/$type"
+        local guard
+        for guard in "./.sbx" "./.sbx/profiles" "./.sbx/profiles/$type"; do
+            if [[ -L "$guard" ]]; then
+                echo "Error: $guard is a symbolic link; sbx-profile will not write a project profile through it." >&2
+                return 1
+            fi
+        done
     fi
     final="$dir/$name.json"
     if [[ -e "$final" ]]; then
@@ -252,13 +259,13 @@ cmd_new() {
         if [[ "$location" == "project" ]]; then
             mapfile -t restricted < <(sbx_profile_restricted_fields "$src" 2>/dev/null)
             if [[ ${#restricted[@]} -gt 0 ]]; then
-                echo "Error: $src sets ${restricted[*]}, which a project profile may not set. Create it with --user instead." >&2
+                echo "Error: $(sbx_sanitize_message "$src") sets ${restricted[*]}, which a project profile may not set. Create it with --user instead." >&2
                 return 1
             fi
         fi
         if ! content=$(jq --indent 4 --arg d "$name (copied from $type/$(basename "$src" .json))" \
                 '.description = $d' "$src" 2>/dev/null); then
-            echo "Error: $src is not valid JSON." >&2
+            echo "Error: $(sbx_sanitize_message "$src") is not valid JSON." >&2
             return 1
         fi
     else
