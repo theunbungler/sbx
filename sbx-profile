@@ -1,0 +1,163 @@
+#!/bin/bash
+# sbx-profile — list, check and create sbx profiles.
+#
+# Works on profile files only. Everything that takes launch flags,
+# including previewing a launch (sbx --dry-run), stays in sbx.
+
+set -e
+
+CONFIG_DIR="$HOME/.config/sbx"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GLOBAL_DIR="$SCRIPT_DIR/profiles"
+
+# shellcheck source=lib/profiles.sh
+source "$SCRIPT_DIR/lib/profiles.sh"
+# shellcheck source=lib/profile-check.sh
+source "$SCRIPT_DIR/lib/profile-check.sh"
+# shellcheck source=lib/render.sh
+source "$SCRIPT_DIR/lib/render.sh"
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") <command> [arguments]
+
+Commands:
+  ls                          List profiles with where each comes from;
+                              a profile hidden by one of the same name is
+                              marked "shadowed"
+  check [<type>/<name>|<path>]
+                              Validate one profile, or with no argument every
+                              profile visible from this directory (exit 1 if
+                              any has errors)
+  new <type> <name> [--user|--local] [--from <profile>]
+                              Create a profile: cli, fs or net. --user writes
+                              ~/.config/sbx/profiles, --local writes
+                              ./.sbx/profiles. Never overwrites.
+  help                        Show this help
+
+Profiles are searched in:
+  1. ./.sbx/profiles/
+  2. \$HOME/.config/sbx/profiles/
+  3. $GLOBAL_DIR/
+EOF
+}
+
+# One profile's validation result. Prints a summary line and its messages;
+# returns 1 if the profile has errors.
+check_one() {   # <type> <path>
+    local type="$1" path="$2" origin name level msg errors=0 warnings=0 summary
+    local -a lines=()
+    origin=$(sbx_profile_origin "$path" "$PWD" "$CONFIG_DIR" "$GLOBAL_DIR")
+    name=$(sbx_sanitize_message "$(basename "$path" .json)")
+    while IFS=$'\t' read -r level msg; do
+        case "$level" in
+            error)
+                errors=$((errors + 1))
+                lines+=("  error:   $(sbx_sanitize_message "$msg")")
+                ;;
+            warning)
+                warnings=$((warnings + 1))
+                lines+=("  warning: $(sbx_sanitize_message "$msg")")
+                ;;
+        esac
+    done < <(sbx_profile_check "$type" "$path" "$origin")
+
+    summary=""
+    if [[ $errors -gt 0 ]]; then
+        summary="$errors error"
+        if [[ $errors -gt 1 ]]; then summary+="s"; fi
+    fi
+    if [[ $warnings -gt 0 ]]; then
+        if [[ -n "$summary" ]]; then summary+=", "; fi
+        summary+="$warnings warning"
+        if [[ $warnings -gt 1 ]]; then summary+="s"; fi
+    fi
+    if [[ -z "$summary" ]]; then
+        summary="ok"
+    fi
+    echo "$type/$name ($origin): $summary"
+    if [[ ${#lines[@]} -gt 0 ]]; then
+        printf '%s\n' "${lines[@]}"
+    fi
+    if [[ $errors -gt 0 ]]; then
+        return 1
+    fi
+    return 0
+}
+
+cmd_check() {
+    local rc=0 type name path dir f found=0
+    if [[ $# -gt 1 ]]; then
+        usage >&2
+        return 2
+    fi
+
+    if [[ $# -eq 0 ]]; then
+        for type in cli fs net; do
+            for dir in "./.sbx/profiles/$type" "$CONFIG_DIR/profiles/$type" "$GLOBAL_DIR/$type"; do
+                if [[ ! -d "$dir" ]]; then
+                    continue
+                fi
+                for f in "$dir"/*.json; do
+                    if [[ ! -e "$f" ]]; then
+                        continue
+                    fi
+                    found=1
+                    check_one "$type" "$f" || rc=1
+                done
+            done
+        done
+        if [[ $found -eq 0 ]]; then
+            echo "No profiles found."
+        fi
+        return $rc
+    fi
+
+    if [[ -f "$1" ]]; then
+        type=$(basename "$(dirname "$1")")
+        if ! sbx_profile_valid_type "$type"; then
+            echo "Error: cannot tell the type of '$(sbx_sanitize_message "$1")': its directory must be cli, fs or net. Use <type>/<name> instead." >&2
+            return 2
+        fi
+        check_one "$type" "$1" || rc=1
+        return $rc
+    fi
+
+    if [[ "$1" != */* ]]; then
+        echo "Error: check expects <type>/<name> or a path to a profile file." >&2
+        return 2
+    fi
+    type="${1%%/*}"
+    name="${1#*/}"
+    if ! sbx_profile_valid_type "$type"; then
+        echo "Error: the type must be cli, fs or net, got '$(sbx_sanitize_message "$type")'." >&2
+        return 2
+    fi
+    path=$(sbx_profile_resolve "$type" "$name" "$CONFIG_DIR" "$GLOBAL_DIR") || return 1
+    check_one "$type" "$path" || rc=1
+    return $rc
+}
+
+rc=0
+case "${1:-}" in
+    ls)
+        shift
+        if [[ $# -gt 0 ]]; then
+            usage >&2
+            exit 2
+        fi
+        sbx_profile_list "$CONFIG_DIR" "$GLOBAL_DIR"
+        ;;
+    check)
+        shift
+        cmd_check "$@" || rc=$?
+        exit "$rc"
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac
