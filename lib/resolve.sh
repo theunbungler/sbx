@@ -185,7 +185,11 @@ sbx_resolve() {
                 # an absent rw source is created by the launch, not skipped, and
                 # not worth a warning.
                 if [[ "$present" == "false" && "$perm" != "rw" ]]; then
-                    warnings+=("$from: mount source not present on this host, skipped: $perm $source")
+                    if [[ "$perm" == "record" ]]; then
+                        warnings+=("$from: mount source not present on this host; an empty working copy is bound instead: record $source")
+                    else
+                        warnings+=("$from: mount source not present on this host, skipped: $perm $source")
+                    fi
                 fi
             done < <(jq -c '.mounts[]?' "$p")
 

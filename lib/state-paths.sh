@@ -50,12 +50,25 @@ sbx_state_write_row() {   # <kind> <path> <detail> <dest> <note> <source>
         '{kind: $kind, path: $path, detail: $detail, dest: $dest, note: $note, source: $source}'
 }
 
+# The widest tmux.sock path the session-name claim loop in sbx can produce
+# (see the SOCK_PROBE check there): the loop appends -1, -2, ... on a name
+# collision, and -99 is the widest suffix it tries before giving up. Both
+# the launch's own too-long-socket check and --dry-run's "stops" entry
+# build this same path from this one function, so they cannot disagree
+# about what "too long" means.
+sbx_state_socket_probe() {   # <state_dir> <session_base>
+    printf '%s\n' "$1/sessions/$2-99/tmux.sock"
+}
+
 # Every host location a launch of this plan writes, for --dry-run. Reads
 # the disk (does a forked store exist yet? how big is the source it would
-# be seeded from?) and writes nothing. Session IDs and archive timestamps
-# are assigned at launch, so they appear as <session-id> and <stamp>.
-sbx_state_writes() {   # <plan json> <state_dir> <launch_dir>
-    local plan="$1" state="$2" launch="$3" slug base
+# be seeded from?) and writes nothing. The session name is already known
+# (sbx_state_session_base), so record/archive rows use it directly; the
+# only thing still unknown at this point is the archive's timestamp and
+# whether a name collision will append -N to the session directory (see
+# the caveat on that row below).
+sbx_state_writes() {   # <plan json> <state_dir> <launch_dir> [<xauthority file>]
+    local plan="$1" state="$2" launch="$3" xauth="${4:-}" slug base
     local profile source dest perm present from store size note record_seen=false
     local -a rows=()
     slug=$(sbx_copy_path_slug "$launch")
@@ -64,6 +77,9 @@ sbx_state_writes() {   # <plan json> <state_dir> <launch_dir>
     while IFS= read -r -d '' profile && IFS= read -r -d '' source &&
           IFS= read -r -d '' dest && IFS= read -r -d '' perm &&
           IFS= read -r -d '' present && IFS= read -r -d '' from; do
+        # This perm switch mirrors the one in sbx that actually performs
+        # the mounts (the FORKED_MOUNTS/RECORD_MOUNTS case statement); a
+        # change to what a perm does at launch belongs in both places.
         case "$perm" in
             forked)
                 # An absent source is skipped outright at launch: no store.
@@ -73,15 +89,19 @@ sbx_state_writes() {   # <plan json> <state_dir> <launch_dir>
                 store=$(sbx_state_forked_store "$state" "$launch" "$profile" "$dest")
                 if [[ -e "$store" ]]; then
                     note="exists"
-                else
-                    size=$(du -sh "$source" 2>/dev/null | cut -f1)
+                elif size=$(timeout 5 du -sxh "$source" 2>/dev/null); then
+                    size=$(cut -f1 <<< "$size")
                     note="will seed, ${size:-unknown size}"
+                elif [[ $? -eq 124 ]]; then
+                    note="will seed, size unknown"
+                else
+                    note="will seed, unknown size"
                 fi
                 rows+=("$(sbx_state_write_row persistent "$store" \
                     "forked store for $dest from $from; kept until --reseed" "$dest" "$note" "$source")")
                 ;;
             record)
-                rows+=("$(sbx_state_write_row temporary "$state/work/<session-id>/$(sbx_copy_mount_id "$dest")" \
+                rows+=("$(sbx_state_write_row temporary "$state/work/$base/$(sbx_copy_mount_id "$dest")" \
                     "record working copy of $source; removed at teardown" "$dest" "" "$source")")
                 record_seen=true
                 ;;
@@ -102,7 +122,7 @@ sbx_state_writes() {   # <plan json> <state_dir> <launch_dir>
         .mounts[] | .profile, nul, .source, nul, .dest, nul, .perm, nul, (.present | tostring), nul, .from, nul' <<< "$plan")
 
     if [[ "$record_seen" == "true" ]]; then
-        rows+=("$(sbx_state_write_row archived "$state/changes/$slug/<stamp>-<session-id>/" \
+        rows+=("$(sbx_state_write_row archived "$state/changes/$slug/<stamp>-$base/" \
             "files the session created or changed in record mounts; the newest SBX_KEEP_CHANGES (default 10) are kept" "" "" "")")
     fi
 
@@ -112,6 +132,18 @@ sbx_state_writes() {   # <plan json> <state_dir> <launch_dir>
     elif [[ "$(jq -r '.security.caps_keep or .security.docker_api' <<< "$plan")" == "true" ]]; then
         rows+=("$(sbx_state_write_row persistent "$state/virt/containers" \
             "podman image and container store" "" "" "")")
+    fi
+
+    # xpra's host writes: a display cookie merged into the host Xauthority
+    # (left in place — it is small, keyed by display, and other displays'
+    # entries share the file) and the display socket it creates for the
+    # session (see the GUI Setup block in sbx, which is what actually does
+    # this at launch).
+    if [[ "$(jq -r '.gui // false' <<< "$plan")" == "true" ]]; then
+        rows+=("$(sbx_state_write_row host "$xauth" \
+            "xpra adds a display cookie; left in place" "" "" "")")
+        rows+=("$(sbx_state_write_row temporary "/tmp/.X11-unix/X<N>" \
+            "xpra display socket; removed when the display stops" "" "" "")")
     fi
 
     rows+=("$(sbx_state_write_row temporary "$state/join/$base.{pid,json,lock}" \

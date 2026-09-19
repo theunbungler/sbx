@@ -30,7 +30,12 @@ sbx_sanitize_message() {   # <text>
 # cloned repository.
 # shellcheck disable=SC2016  # jq program: $vars are jq's, not the shell's
 SBX_RENDER_JQ='
-def clean: explode | map(select((. >= 32 and . < 127) or . > 159)) | implode;
+def clean: explode | map(select(
+    ((. >= 32 and . < 127) or . > 159)
+    and (. < 8203 or . > 8207)
+    and (. < 8234 or . > 8238)
+    and (. < 8294 or . > 8297)
+  )) | implode;
 def spaces($n): [range(0; $n)] | map(" ") | join("");
 def pad($n): . + spaces($n - length);
 def tilde:
@@ -53,9 +58,10 @@ def mark($ok): if $ok then "✓" else "✗" end;
 
     section("Mounts"; [ $d.mounts[] as $m
         | ($d.writes | map(select(.dest == $m.dest and .source == $m.source and .note != "")) | .[0]) as $w
-        | ((if ($m.present | not) and $m.perm != "rw" then "skip" else $m.perm end) | pad(7))
+        | ((if ($m.present | not) and $m.perm != "rw" and $m.perm != "record" then "skip" else $m.perm end) | pad(7))
           + " " + ($m.source | tilde) + " → " + ($m.dest | tilde)
-          + ( if ($m.present | not) and $m.perm != "rw" then "  (source absent)"
+          + ( if ($m.present | not) and $m.perm == "record" then "  (source absent; empty working copy)"
+              elif ($m.present | not) and $m.perm != "rw" then "  (source absent)"
               elif $w != null then "  (\($w.note))"
               else "" end )
           + "  " + $m.from ]),
@@ -66,9 +72,14 @@ def mark($ok): if $ok then "✓" else "✗" end;
           + (.[:-1] | map(.from) | unique | if length > 0 then "; overrides " + join(", ") else "" end)
           + ")" ]),
 
-    section("Path"; [ $d.path | select(length > 0) ]),
+    section("Path"; [ $d.path | select(length > 0) | ($d.session.dir + "bin:" + .) | tilde ]),
 
-    section("Passthru"; [ $d.passthrough | unique | select(length > 0) | join(", ") ]),
+    section("Passthru"; [ $d.passthrough | unique | select(length > 0)
+        | map(. as $n
+              | $n + (if (($d.passthrough_set // []) | index($n)) then
+                        (if ($d.env | any(.name == $n)) then " (overridden by env)" else "" end)
+                      else " (unset on host)" end))
+        | join(", ") ]),
 
     ( if ($d.errors | length) > 0 then empty
       elif ($d.netns | not) then section("Network"; ["none (no network namespace)"])
@@ -84,9 +95,10 @@ def mark($ok): if $ok then "✓" else "✗" end;
             | select(length > 0) | "host ports: " + join("; ") )
         ]) end ),
 
-    section("Writes"; [ $d.writes[]
-        | (.kind | pad(10)) + " " + (.path | tilde)
-          + "  (" + .detail + (if .note != "" then "; " + .note else "" end) + ")" ]),
+    ( if ($d.errors | length) > 0 then empty
+      else section("Writes"; [ $d.writes[]
+          | (.kind | pad(10)) + " " + (.path | tilde)
+            + "  (" + .detail + (if .note != "" then "; " + .note else "" end) + ")" ]) end ),
 
     section("Needs"; [
         ( [ ($d.needs.groups | to_entries[]
@@ -97,11 +109,11 @@ def mark($ok): if $ok then "✓" else "✗" end;
         ( $d.needs.install[] | "install: " + . )
       ]),
 
-    section("Confirm"; [ $d.confirm[] | tilde + " would prompt" ]),
+    section("Confirm"; [ $d.confirm[] | tilde + " would prompt (a launch without a terminal refuses instead)" ]),
     section("Warnings"; $d.warnings),
     section("Errors"; $d.errors),
-    section("Result"; [ if ($d.errors | length) == 0 and $d.needs.ok
-                        then "the launch would proceed" else "the launch would stop" end ])
+    section("Stops"; $d.stops // []),
+    section("Result"; [ if $d.proceed then "the launch would proceed" else "the launch would stop" end ])
   )
 | clean
 '

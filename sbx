@@ -676,11 +676,29 @@ prompt_project_profile() {
 # reported nothing but "bwrap: not found" after a session directory, an
 # xpra display and a pasta namespace had already been built.
 if [[ "$DRY_RUN" == "true" ]]; then
-    # Resolving needs the core tools (jq, realpath, envsubst) to exist at
-    # all. Everything else — the user-namespace probe, optional groups —
-    # is reported in the dry-run output instead of stopping it.
-    if [[ -n "$(sbx_deps_missing core)" ]]; then
-        sbx_deps_require core || exit 1
+    # Resolving needs only jq, realpath and envsubst to exist at all — those
+    # are the tools this script itself calls between here and the report.
+    # A missing bwrap, tmux or other core tool is not a reason to stop
+    # before the report: it belongs in the report's Needs, as a reason
+    # .proceed is false, same as a missing net/gui/podman tool.
+    DRY_RUN_CORE_REQUIRED=(jq realpath envsubst)
+    DRY_RUN_CORE_MISSING=()
+    for dry_tool in "${DRY_RUN_CORE_REQUIRED[@]}"; do
+        command -v "$dry_tool" >/dev/null 2>&1 || DRY_RUN_CORE_MISSING+=("$dry_tool")
+    done
+    if [[ ${#DRY_RUN_CORE_MISSING[@]} -gt 0 ]]; then
+        {
+            if [[ ${#DRY_RUN_CORE_MISSING[@]} -eq 1 ]]; then
+                echo "Error: sbx requires ${DRY_RUN_CORE_MISSING[0]}, which is not on PATH."
+            else
+                echo "Error: sbx requires ${DRY_RUN_CORE_MISSING[*]}, which are not on PATH."
+            fi
+            echo "  Install with:"
+            while IFS= read -r dry_hint_line; do
+                echo "    $dry_hint_line"
+            done < <(sbx_deps_install_hint "$(sbx_deps_family)" "${DRY_RUN_CORE_MISSING[@]}")
+        } >&2
+        exit 1
     fi
 else
     sbx_deps_require core || exit 1
@@ -718,6 +736,15 @@ plan_get() {
     jq -r "$1" <<< "$PLAN"
 }
 
+# The session name a launch of this directory would claim, and the widest
+# tmux.sock path that name could still need (see sbx_state_socket_probe in
+# lib/state-paths.sh). Computed here — before the "Dry run" branch below —
+# because both the dry run's "stops" check and the real launch's own
+# too-long-socket check (further down) read the same two values and must
+# never disagree about them.
+SESSION_BASE=$(sbx_state_session_base "$PWD")
+SOCK_PROBE=$(sbx_state_socket_probe "$STATE_DIR" "$SESSION_BASE")
+
 # --- Dry run ---
 # Everything below this point acts: prompts, creates state, launches. A dry
 # run stops here with the plan, the host locations it would write, and the
@@ -729,15 +756,42 @@ if [[ "$DRY_RUN" == "true" ]]; then
     fi
     mapfile -t DRY_GROUPS < <(plan_get '.deps[]')
     DRY_NEEDS=$(sbx_deps_status "${DRY_DEPS_ARGS[@]}" "${DRY_GROUPS[@]}")
-    DRY_WRITES=$(sbx_state_writes "$PLAN" "$STATE_DIR" "$PWD")
+    DRY_WRITES=$(sbx_state_writes "$PLAN" "$STATE_DIR" "$PWD" "${XAUTHORITY:-$HOME/.Xauthority}")
+
+    # Launch-time gates that are not profile errors: today, only the
+    # session-socket-path length check the real launch does further down
+    # (see SOCK_PROBE above). Kept separate from .errors because these are
+    # not about the profiles at all — a stop here would follow no matter
+    # which profiles were chosen.
+    DRY_STOPS=()
+    if [[ ${#SOCK_PROBE} -gt 100 ]]; then
+        DRY_STOPS+=("session socket path is too long (${#SOCK_PROBE} bytes, limit 100): $SOCK_PROBE. A Unix socket path this long cannot be bound. Use a shorter \$HOME.")
+    fi
+
+    # Passthrough names that are actually set in this environment — never
+    # their values (see the "passthrough values never appear" test).
+    mapfile -t DRY_PASSTHROUGH < <(plan_get '.passthrough[]')
+    DRY_PASSTHROUGH_SET=()
+    for dry_var in "${DRY_PASSTHROUGH[@]}"; do
+        if [[ -n "$dry_var" && -n "${!dry_var-}" ]]; then
+            DRY_PASSTHROUGH_SET+=("$dry_var")
+        fi
+    done
+
     DRY_DOC=$(jq -c --argjson needs "$DRY_NEEDS" --argjson writes "$DRY_WRITES" \
-        '. + {needs: $needs, writes: $writes}' <<< "$PLAN")
+        --argjson stops "$(sbx_resolve_strings "${DRY_STOPS[@]}")" \
+        --argjson passthrough_set "$(sbx_resolve_strings "${DRY_PASSTHROUGH_SET[@]}")" \
+        --arg session_name "$SESSION_BASE" --arg session_dir "$STATE_DIR/sessions/$SESSION_BASE/" \
+        '. + {needs: $needs, writes: $writes, stops: $stops, passthrough_set: $passthrough_set,
+              session: {name: $session_name, dir: $session_dir}}
+             | .proceed = (((.errors | length) == 0) and .needs.ok and ((.stops | length) == 0))' \
+        <<< "$PLAN")
     if [[ "$DRY_RUN_JSON" == "true" ]]; then
-        jq . <<< "$DRY_DOC"
+        jq -a . <<< "$DRY_DOC"
     else
         sbx_render_plan "$DRY_DOC" "$HOME"
     fi
-    if [[ "$(jq -r '(.errors | length) == 0 and .needs.ok' <<< "$DRY_DOC")" == "true" ]]; then
+    if [[ "$(jq -r '.proceed' <<< "$DRY_DOC")" == "true" ]]; then
         exit 0
     fi
     exit 1
@@ -803,15 +857,15 @@ fi
 
 # Session Initialization
 #
-# Naming rules live in lib/state-paths.sh, shared with --dry-run.
-SESSION_BASE=$(sbx_state_session_base "$PWD")
-
+# Naming rules live in lib/state-paths.sh, shared with --dry-run. SESSION_BASE
+# and SOCK_PROBE were already computed above (before the "Dry run" branch),
+# so this check and --dry-run's "stops" entry read the exact same values.
+#
 # A Unix socket path over ~108 bytes fails at bind() with "File name too
 # long", and the failure surfaces only as tmux refusing to connect long
 # after a session directory exists. Check the worst case — the widest
 # numeric suffix the claim loop can append — before claiming anything, so a
 # long $HOME produces one clear error instead of a mystery.
-SOCK_PROBE="$STATE_DIR/sessions/$SESSION_BASE-99/tmux.sock"
 if [[ ${#SOCK_PROBE} -gt 100 ]]; then
     echo "Error: session socket path is too long (${#SOCK_PROBE} bytes, limit 100):" >&2
     echo "  $SOCK_PROBE" >&2
@@ -1163,6 +1217,10 @@ while IFS= read -r -d '' profile_name && IFS= read -r -d '' source &&
     # Only profile-declared mounts are made tolerant; the base binds
     # (/usr, /etc, the session dir) stay strict, because a sandbox
     # missing those is broken rather than merely reduced.
+    #
+    # This perm switch is mirrored, read-only, by sbx_state_writes in
+    # lib/state-paths.sh (--dry-run's report of what a launch would write):
+    # a change to what a perm does here belongs there too.
     case "$perm" in
         ro)     BWRAP_ARGS+=(--ro-bind-try "$source" "$dest") ;;
         rw)     BWRAP_ARGS+=(--bind-try "$source" "$dest") ;;

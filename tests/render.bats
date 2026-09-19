@@ -13,11 +13,13 @@ doc() {   # [jq update]
       errors: [], warnings: [], confirm: [],
       deps: ["core"],
       security: {caps_keep:false, caps_profile:"", userns_full:false, userns_profile:"", docker_api:false},
-      mounts: [], passthrough: [], env: [],
+      mounts: [], passthrough: [], passthrough_set: [], env: [],
       path: "/usr/local/bin:/usr/bin:/bin", wd: "", gui: false,
       host_ports: {tcp: [], udp: []}, netns: false, net: {enabled: false},
       writes: [{kind:"temporary", path:"/home/u/.local/state/sbx/sessions/proj/", detail:"session directory", dest:"", note:""}],
-      needs: {groups:{core:[]}, userns:true, subids:null, install:[], ok:true}
+      needs: {groups:{core:[]}, userns:true, subids:null, install:[], ok:true},
+      session: {name:"proj", dir:"/home/u/.local/state/sbx/sessions/proj/"},
+      stops: [], proceed: true
     }' | jq -c "${1:-.}"
 }
 
@@ -71,12 +73,19 @@ line() {   # <prefix> -> the first output line starting with it
     render '.env = [{name:"A",value:"1",from:"fs/x"},{name:"PATH",value:"/p",from:"fs/x"},{name:"A",value:"2",from:"cli/c"}]'
     [ "$(line Env)" = "Env        A=2  (cli/c; overrides fs/x)" ]
     if printf '%s\n' "$output" | grep -q 'PATH=/p'; then return 1; fi
-    [ "$(line Path)" = "Path       /usr/local/bin:/usr/bin:/bin" ]
+    [ "$(line Path)" = "Path       ~/.local/state/sbx/sessions/proj/bin:/usr/local/bin:/usr/bin:/bin" ]
 }
 
 @test "passthrough is names only" {
-    render '.passthrough = ["TOKEN","TOKEN","KEY"]'
+    render '.passthrough = ["TOKEN","TOKEN","KEY"] | .passthrough_set = ["TOKEN","KEY"]'
     [ "$(line Passthru)" = "Passthru   KEY, TOKEN" ]
+}
+
+@test "passthrough notes an unset variable and one overridden by env" {
+    render '.passthrough = ["SET_VAR","UNSET_VAR","OVER_VAR"]
+      | .passthrough_set = ["SET_VAR","OVER_VAR"]
+      | .env = [{name:"OVER_VAR",value:"x",from:"fs/x"}]'
+    [ "$(line Passthru)" = "Passthru   OVER_VAR (overridden by env), SET_VAR, UNSET_VAR (unset on host)" ]
 }
 
 @test "network groups domains by ports and lists addresses and host ports" {
@@ -104,19 +113,32 @@ line() {   # <prefix> -> the first output line starting with it
 
 @test "writes, needs, confirm and result" {
     render '.needs = {groups:{core:[], net:["pasta"]}, userns:true, subids:false, install:["sudo pacman -S passt"], ok:false}
-      | .confirm = ["./.sbx/profiles/fs/t.json"]'
+      | .confirm = ["./.sbx/profiles/fs/t.json"]
+      | .proceed = false'
     [ "$(line Writes)" = "Writes     temporary  ~/.local/state/sbx/sessions/proj/  (session directory)" ]
     [ "$(line Needs)" = "Needs      core ✓ · net ✗ missing pasta · userns ✓ · subuid/subgid ✗" ]
     printf '%s\n' "$output" | grep -qxF "           install: sudo pacman -S passt"
-    [ "$(line Confirm)" = "Confirm    ./.sbx/profiles/fs/t.json would prompt" ]
+    [ "$(line Confirm)" = "Confirm    ./.sbx/profiles/fs/t.json would prompt (a launch without a terminal refuses instead)" ]
     [ "$(line Result)" = "Result     the launch would stop" ]
 }
 
 @test "errors are listed, the plan sections are omitted, and the launch would stop" {
-    render '.errors = ["/p.json: .mount: unknown field for a fs profile"]'
+    render '.errors = ["/p.json: .mount: unknown field for a fs profile"] | .proceed = false'
     [ "$(line Errors)" = "Errors     /p.json: .mount: unknown field for a fs profile" ]
     if printf '%s\n' "$output" | grep -q '^Security'; then return 1; fi
+    if printf '%s\n' "$output" | grep -q '^Writes'; then return 1; fi
     [ "$(line Result)" = "Result     the launch would stop" ]
+}
+
+@test "stops are listed after errors, and the launch would stop" {
+    render '.stops = ["session socket path is too long (120 bytes, limit 100): /x/tmux.sock."] | .proceed = false'
+    [ "$(line Stops)" = "Stops      session socket path is too long (120 bytes, limit 100): /x/tmux.sock." ]
+    [ "$(line Result)" = "Result     the launch would stop" ]
+}
+
+@test "an absent record mount renders as record, not skip, with its own note" {
+    render '.mounts = [{profile:"s",from:"fs/s",source:"/opt/missing",dest:"/opt/x",perm:"record",present:false}]'
+    [ "$(line Mounts)" = "Mounts     record  /opt/missing → /opt/x  (source absent; empty working copy)  fs/s" ]
 }
 
 @test "a clean plan would proceed" {
@@ -128,6 +150,12 @@ line() {   # <prefix> -> the first output line starting with it
     render '.warnings = ["bad[2K\rtextend"] | .env = [{name:"U",value:"héllo",from:"fs/x"}]'
     [ "$(line Warnings)" = "Warnings   bad[2Ktextend" ]
     [ "$(line Env)" = "Env        U=héllo  (fs/x)" ]
+}
+
+@test "bidi and zero-width characters are removed; visible unicode is kept" {
+    local hidden=$'​‪⁩'
+    render ".warnings = [\"bad${hidden}text\"]"
+    [ "$(line Warnings)" = "Warnings   badtext" ]
 }
 
 @test "home is abbreviated only as a whole path component" {

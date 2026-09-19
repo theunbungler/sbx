@@ -32,11 +32,17 @@ setup() {
     [ "$output" = "/s/forked/pi/-home-u-proj/_home_u_.pi" ]
 }
 
+@test "socket probe is the widest tmux.sock path the claim loop can produce" {
+    run sbx_state_socket_probe /s my-proj
+    [ "$output" = "/s/sessions/my-proj-99/tmux.sock" ]
+}
+
 # A minimal Phase 2 plan with the given mounts (JSON array) and security flags.
-plan() {   # <mounts json> [caps_keep] [userns_full] [docker_api]
+plan() {   # <mounts json> [caps_keep] [userns_full] [docker_api] [gui]
     jq -cn --argjson mounts "$1" \
         --argjson ck "${2:-false}" --argjson uf "${3:-false}" --argjson da "${4:-false}" \
-        '{mounts: $mounts, security: {caps_keep: $ck, userns_full: $uf, docker_api: $da}}'
+        --argjson gui "${5:-false}" \
+        '{mounts: $mounts, security: {caps_keep: $ck, userns_full: $uf, docker_api: $da}, gui: $gui}'
 }
 
 mount() {   # <perm> <source> <dest> <present>
@@ -75,8 +81,9 @@ setup_writes() {
     setup_writes
     run sbx_state_writes "$(plan "[$(mount record "$SRC/tree" /a true),$(mount record "$SRC/tree" /b true)]")" "$STATE" "$LAUNCH"
     [ "$(jq -r 'map(.kind) | join(",")' <<< "$output")" = "temporary,temporary,archived,temporary,temporary" ]
-    [ "$(jq -r '.[0].path' <<< "$output")" = "$STATE/work/<session-id>/_a" ]
-    [ "$(jq -r '.[2].path' <<< "$output")" = "$STATE/changes/$(sbx_copy_path_slug "$LAUNCH")/<stamp>-<session-id>/" ]
+    base=$(sbx_state_session_base "$LAUNCH")
+    [ "$(jq -r '.[0].path' <<< "$output")" = "$STATE/work/$base/_a" ]
+    [ "$(jq -r '.[2].path' <<< "$output")" = "$STATE/changes/$(sbx_copy_path_slug "$LAUNCH")/<stamp>-$base/" ]
 }
 
 @test "writes: rw and dev binds are host writes; an absent rw source is created at launch" {
@@ -117,6 +124,32 @@ setup_writes() {
     run sbx_state_writes "$(plan '[]')" "$STATE" "$LAUNCH"
     [ "$(jq -r '.[-2].path' <<< "$output")" = "$STATE/join/my-proj.{pid,json,lock}" ]
     [ "$(jq -r '.[-2].kind' <<< "$output")" = "temporary" ]
+}
+
+@test "writes: a slow forked-source du is bounded by a timeout" {
+    setup_writes
+    cat > "$BATS_TEST_TMPDIR/du" <<'EOF'
+#!/bin/bash
+sleep 6
+EOF
+    chmod +x "$BATS_TEST_TMPDIR/du"
+    local old_path="$PATH"
+    PATH="$BATS_TEST_TMPDIR:$PATH"
+    run sbx_state_writes "$(plan "[$(mount forked "$SRC/tree" /t true)]")" "$STATE" "$LAUNCH"
+    PATH="$old_path"
+    [ "$(jq -r '.[0].note' <<< "$output")" = "will seed, size unknown" ]
+}
+
+@test "writes: gui true adds the xauthority and X11 socket rows; gui false adds neither" {
+    setup_writes
+    run sbx_state_writes "$(plan '[]' false false false true)" "$STATE" "$LAUNCH" "$W/.Xauthority"
+    [ "$(jq -r '.[-4] | [.kind, .path, .detail] | join("|")' <<< "$output")" = "host|$W/.Xauthority|xpra adds a display cookie; left in place" ]
+    [ "$(jq -r '.[-3] | [.kind, .path, .detail] | join("|")' <<< "$output")" = "temporary|/tmp/.X11-unix/X<N>|xpra display socket; removed when the display stops" ]
+    [ "$(jq -r '.[-2].path' <<< "$output")" = "$STATE/join/my-proj.{pid,json,lock}" ]
+    [ "$(jq -r '.[-1].path' <<< "$output")" = "$STATE/sessions/my-proj/" ]
+
+    run sbx_state_writes "$(plan '[]')" "$STATE" "$LAUNCH" "$W/.Xauthority"
+    if [[ "$output" == *"Xauthority"* || "$output" == *"X11-unix"* ]]; then return 1; fi
 }
 
 @test "writes: computing the list creates nothing" {

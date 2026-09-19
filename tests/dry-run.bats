@@ -81,6 +81,51 @@ nothing_created() {
     nothing_created
 }
 
+# M5: a missing NON-required core tool (anything but jq/realpath/envsubst)
+# must not stop the dry run before the report — it belongs in Needs, and
+# .proceed is what goes false, not an early exit.
+@test "a missing non-required core tool still produces the report, with exit 1" {
+    mkdir -p "$ROOT/bin"
+    cp -a "$BASE_BIN/." "$ROOT/bin/"
+    rm "$ROOT/bin/tmux"
+    run env PATH="$ROOT/bin" SBX_OS_RELEASE="$ROOT/arch" \
+        bash -c 'cd "$1" && shift && "$@" < /dev/null 2>&1' _ "$PROJ" "$SBX" --dry-run --fs sandbox
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"core ✗ missing tmux"* ]]
+    [[ "$output" == *"Result     the launch would stop"* ]]
+    nothing_created
+}
+
+# I1: jq's default output leaves C1 controls (U+0080-U+009F) and DEL
+# unescaped in UTF-8 output; some terminals act on those bytes.
+@test "--json escapes C1 controls and DEL instead of printing them raw" {
+    printf '{"env":{"BAD":"a\xc2\x9bb\x7fc"}}' > "$HOME/.config/sbx/profiles/fs/badenv.json"
+    run bash -c 'cd "$1" && shift && "$@" < /dev/null 2>/dev/null' _ "$PROJ" "$SBX" --dry-run --json --fs badenv
+    [ "$status" -eq 0 ]
+    esc_c1=$(printf '\\u009b')
+    esc_del=$(printf '\\u007f')
+    [[ "$output" == *"$esc_c1"* ]]
+    [[ "$output" == *"$esc_del"* ]]
+    if [[ "$output" == *$'\xc2\x9b'* ]]; then return 1; fi
+    if [[ "$output" == *$'\x7f'* ]]; then return 1; fi
+}
+
+# I2: a launch this HOME would actually refuse (session socket path over
+# the 100-byte limit) must be reported as a stop, not "would proceed".
+@test "a HOME long enough to exceed the socket limit is reported as a stop" {
+    local longhome="$ROOT/$(printf 'a%.0s' {1..80})/h"
+    mkdir -p "$longhome"
+    run env HOME="$longhome" \
+        bash -c 'cd "$1" && shift && "$@" < /dev/null 2>&1' _ "$PROJ" "$SBX" --dry-run --fs sandbox
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"session socket path is too long"* ]]
+    [[ "$output" == *"the launch would stop"* ]]
+    if [[ -e "$longhome/.local/state/sbx" ]]; then
+        echo "dry run created $longhome/.local/state/sbx:" >&2
+        return 1
+    fi
+}
+
 @test "a forked mount shows will seed, then exists" {
     cat > "$HOME/.config/sbx/profiles/cli/keep.json" <<EOF
 {"mounts":[{"source":"$ROOT/src","dest":"/data","perm":"forked"}]}
@@ -126,7 +171,7 @@ EOF
     nothing_created
 }
 
-@test "a real launch still initializes state" {
+@test "a --list-sessions run still initializes state" {
     run bash -c 'cd "$1" && shift && "$@" < /dev/null 2>&1' _ "$PROJ" "$SBX" --list-sessions
     [ -d "$HOME/.local/state/sbx" ]
 }

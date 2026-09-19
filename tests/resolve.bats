@@ -54,6 +54,13 @@ r() { jq -r "$1" <<< "$PLAN"; }
     if [[ "$(r '.warnings[]')" == *"newrw"* ]]; then return 1; fi
 }
 
+@test "an absent record source warns truthfully: an empty working copy is bound" {
+    local fs
+    fs=$(user fs r '{"mounts":[{"source":"'"$SRC"'/gone","dest":"/g","perm":"record"}]}')
+    resolve --fs "$fs"
+    [[ "$(r '.warnings[]')" == *"fs/r: mount source not present on this host; an empty working copy is bound instead: record $SRC/gone"* ]]
+}
+
 @test "resolving creates nothing" {
     local fs
     fs=$(user fs m '{"mounts":[{"source":"'"$SRC"'/newrw","dest":"/n","perm":"rw"}]}')
