@@ -10,6 +10,7 @@ state as of 2026-09-19.
 - Phase 1 plan (done): `docs/superpowers/plans/2026-09-16-setup-ux-phase1-deps.md`
 - Phase 2 plan (done): `docs/superpowers/plans/2026-09-17-setup-ux-phase2-resolve.md`
 - Phase 3 plan (done): `docs/superpowers/plans/2026-09-18-setup-ux-phase3-dry-run.md`
+- Phase 4 plan (done): `docs/superpowers/plans/2026-09-19-setup-ux-phase4-sbx-profile.md`
 
 ## Where the work stands
 
@@ -30,14 +31,21 @@ user has chosen to keep the branch as-is rather than merge or open a PR.
   (exit 2) instead of becoming the payload command, and the dry run shows env
   values and PATH unexpanded (`raw`, `path_raw`) so host secrets are not
   printed.
-- **Phases 4, 5 — designed in the spec, not started, no plan files yet.**
+- **Phase 4 (`sbx-profile ls|check|new`) — complete.** A separate script
+  beside `sbx`. `ls` marks shadowed profiles (so does `sbx --list-profiles`);
+  `check` validates every visible profile or one, path shown once per
+  profile; `new` writes a template that grants nothing or a `--from` copy,
+  validates first, never overwrites (noclobber), never writes the global
+  directory, refuses a symlinked `./.sbx` for `--local`, and refuses to copy
+  a project profile that sets restricted fields.
+- **Phase 5 — designed in the spec, not started, no plan file yet.**
 
-Suite: 302/302 at the end of Phase 3; `shellcheck -S error sbx lib/*.sh`
+Suite: 344/344 at the end of Phase 4; `shellcheck -S error sbx sbx-profile lib/*.sh`
 silent. Before starting anything:
 
     git status && git log --oneline -3
     bats tests/snapshot.bats        # must pass WITHOUT SBX_UPDATE_SNAPSHOTS
-    bats tests/                     # 302/302
+    bats tests/                     # 344/344
 
 Never regenerate the snapshot goldens to make a diff go away.
 
@@ -52,6 +60,11 @@ Never regenerate the snapshot goldens to make a diff go away.
   against a launch directory's `.git/config` (e.g. `core.fsmonitor`). Both
   of these are documented in the README threat model under "What it does
   not protect against"; keep that section accurate if either changes.
+- **Profiles load by NAME ONLY** from `./.sbx/profiles`,
+  `~/.config/sbx/profiles` and the global `profiles/` directory. The launch
+  directory is never searched and `--fs/--net/--cli` no longer accept file
+  paths (the user's decision, 2026-09-19). `sbx-profile check <path>` still
+  validates any file, because it loads nothing.
 
 ## How this work has been run
 
@@ -77,21 +90,19 @@ Practical notes that mattered:
 
 ## What comes next, in order
 
-1. **Phase 4 (`sbx-profile new|check|ls`)** — write the plan first. The spec
-   section covers it; its "next step" line should suggest
-   `sbx --dry-run --<type> <name>`. The dry-run orchestration currently lives
-   inline in `sbx`'s `--- Dry run ---` block; the Phase 3 reviewer suggested
-   moving it into a library function (e.g. `sbx_dry_run_doc <plan>
-   <state_dir> <launch_dir>` returning the document with `.proceed`) so
-   `sbx-profile` can reuse it. The user's own profiles still need attention:
-   `~/.config/sbx/profiles/cli/pi.json` uses the removed `"perm": "copy"` and
-   `fs/media.json` is invalid JSON; the user was offered a direct fix and has
-   not answered.
-2. **Phase 5 (`--learn-net`)** — needs a feasibility spike FIRST: whether nft
+1. **Phase 5 (`--learn-net`)** — needs a feasibility spike FIRST: whether nft
    can add `ip daddr . dport` to a dynamic set from the output hook inside
    pasta's network namespace. The Phase 3 reviewer suggested a plan field
    (e.g. `plan.learn`) so `sbx_state_writes` adds the learn row and the
-   render shows an OPEN network marker from the plan.
+   render shows an OPEN network marker from the plan. Phase 5 also owns
+   `sbx-profile new --from-learn <dir|latest>` (moved out of Phase 4): add
+   it as a third content source in `cmd_new` feeding the same
+   validate-then-noclobber path, mutually exclusive with `--from`, net only;
+   resolve `latest`/`<dir>` only under sbx's state directory; and treat
+   `suggested.json` as adversarial (show every `allow`/`ports` entry before
+   writing, cap list sizes). The user's own profiles still need attention:
+   `~/.config/sbx/profiles/cli/pi.json` uses the removed `"perm": "copy"` and
+   `fs/media.json` is invalid JSON (`sbx-profile check` shows both).
 
 ## Deferred items (triaged "fine to defer" by the final reviews)
 
@@ -111,6 +122,9 @@ Practical notes that mattered:
   are fixed table literals).
 - A launch that fails during argument parsing, and plain `--help`, no longer
   create the state directory (ruled harmless).
+- `sbx_profile_list` strips only C0/DEL from names (not C1/bidi like the
+  render's `clean`); `--from` a non-object JSON value says "not valid JSON";
+  the restricted-field list lives in two places, pinned equal by a test.
 
 ## Open items that need another machine
 
