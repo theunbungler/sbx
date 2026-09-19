@@ -47,15 +47,11 @@ Never regenerate the snapshot goldens to make a diff go away.
   trusted without a prompt; a git-tracked one prompts. The user chose this
   knowing that code inside a sandbox with `fs/sandbox` (launch dir mounted
   rw) can write an untracked profile that the next launch uses without
-  asking. Do not change it without asking. Note: the README threat model
-  still says "Project-supplied profiles require confirmation", which is only
-  true for tracked ones — the user has not yet said whether to reword it.
-- **OPEN, needs the user's answer:** `sbx` runs `git ls-files` (and `git
-  remote` in the prompt) in the launch directory, so a `.git/config` with
-  `core.fsmonitor` runs a command on the host during a launch or dry run.
-  Hardening (`git -c core.fsmonitor=false -c core.hooksPath=/dev/null`,
-  `GIT_CONFIG_NOSYSTEM=1`) would not change who is trusted. The user's
-  "keep as is" answer did not clearly cover this; it has been left untouched.
+  asking. Do not change it without asking.
+- **No git hardening.** The user declined hardening `sbx`'s `git` calls
+  against a launch directory's `.git/config` (e.g. `core.fsmonitor`). Both
+  of these are documented in the README threat model under "What it does
+  not protect against"; keep that section accurate if either changes.
 
 ## How this work has been run
 
@@ -81,8 +77,7 @@ Practical notes that mattered:
 
 ## What comes next, in order
 
-1. **Get the user's answer on the git `fsmonitor` hardening** (above).
-2. **Phase 4 (`sbx-profile new|check|ls`)** — write the plan first. The spec
+1. **Phase 4 (`sbx-profile new|check|ls`)** — write the plan first. The spec
    section covers it; its "next step" line should suggest
    `sbx --dry-run --<type> <name>`. The dry-run orchestration currently lives
    inline in `sbx`'s `--- Dry run ---` block; the Phase 3 reviewer suggested
@@ -92,7 +87,7 @@ Practical notes that mattered:
    `~/.config/sbx/profiles/cli/pi.json` uses the removed `"perm": "copy"` and
    `fs/media.json` is invalid JSON; the user was offered a direct fix and has
    not answered.
-3. **Phase 5 (`--learn-net`)** — needs a feasibility spike FIRST: whether nft
+2. **Phase 5 (`--learn-net`)** — needs a feasibility spike FIRST: whether nft
    can add `ip daddr . dport` to a dynamic set from the output hook inside
    pasta's network namespace. The Phase 3 reviewer suggested a plan field
    (e.g. `plan.learn`) so `sbx_state_writes` adds the learn row and the

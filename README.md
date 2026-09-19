@@ -35,8 +35,11 @@ What that buys you, in a session without `"caps": "keep"`:
 - **sbx's own state and config are masked**, so a sandbox cannot reach
   sibling sessions, persistent cli stores, or the profiles that configure the
   next launch.
-- **Project-supplied profiles require confirmation**, and may never request
-  `caps`, `userns`, or `docker_api`.
+- **Project-supplied profiles that git tracks require confirmation.** A
+  profile under `./.sbx/profiles` that the repository tracks is shown and
+  must be approved before use (or trusted with `SBX_TRUST_PROJECT_PROFILES=1`).
+  No project profile, tracked or not, may request `caps`, `userns`,
+  `docker_api` or `host_ports`.
 
 ### What it does not protect against
 
@@ -53,6 +56,19 @@ What that buys you, in a session without `"caps": "keep"`:
 - **`"ports": ["*"]`** in `net/anthropic.json` and `net/gemini.json` — any
   allowed IP is reachable on any port. Narrowing to 443 would break `git push`
   over SSH to `github.com`.
+- **Untracked project profiles.** A profile under `./.sbx/profiles` that git
+  does not track is treated as your own scratch config and used without a
+  prompt. If a session mounts the launch directory read-write (as
+  `fs/sandbox` does), code inside it can write such a profile, and the next
+  launch from that directory will use it without asking. `--dry-run` shows
+  each profile's origin, so a `(project)` profile you did not write is
+  visible before you launch.
+- **The launch directory's git configuration.** sbx runs `git` in the launch
+  directory to check whether a project profile is tracked, so that
+  repository's `.git/config` applies — including settings such as
+  `core.fsmonitor` that run a command on the host. Launch only from
+  directories whose `.git/config` you trust; like an untracked profile, a
+  session with the launch directory mounted read-write can change it.
 
 ## Checking your setup
 
