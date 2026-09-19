@@ -30,12 +30,28 @@ setup() {
     [ "$output" = "$GLOBAL/cli/dev.json" ]
 }
 
-@test "resolve accepts a direct file path, with or without .json" {
+@test "resolve rejects anything that isn't a bare name" {
     echo '{}' > "$W/direct.json"
+    local msg="is not a profile name. Profiles are loaded by name from ./.sbx/profiles, ~/.config/sbx/profiles or the global profiles directory."
     run sbx_profile_resolve fs "$W/direct.json" "$CFG" "$GLOBAL"
-    [ "$output" = "$(realpath "$W/direct.json")" ]
-    run sbx_profile_resolve fs "$W/direct" "$CFG" "$GLOBAL"
-    [ "$output" = "$(realpath "$W/direct.json")" ]
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"$msg"* ]]
+    run sbx_profile_resolve fs "shared.json" "$CFG" "$GLOBAL"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"$msg"* ]]
+    run sbx_profile_resolve fs "/etc/passwd" "$CFG" "$GLOBAL"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"$msg"* ]]
+    run sbx_profile_resolve fs "a/b/c" "$CFG" "$GLOBAL"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"$msg"* ]]
+}
+
+@test "resolve never picks up a same-named file in the launch directory" {
+    echo '{"description":"launch-dir decoy"}' > "$PROJ/web.json"
+    run sbx_profile_resolve net web "$CFG" "$GLOBAL"
+    [ "$status" -eq 0 ]
+    [ "$output" = "$CFG/profiles/net/web.json" ]
 }
 
 @test "resolve fails with the existing message" {
@@ -67,6 +83,15 @@ setup() {
     echo '{}' > "$W/outside/evil.json"
     ln -s "$W/outside/evil.json" "$PROJ/.sbx/profiles/fs/evil.json"
     run sbx_profile_origin ./.sbx/profiles/fs/evil.json "$PROJ" "$CFG" "$GLOBAL"
+    [ "$output" = "project" ]
+}
+
+@test "a symlinked type directory under .sbx/profiles still classifies as project" {
+    mkdir -p "$W/elsewhere"
+    echo '{}' > "$W/elsewhere/x.json"
+    rm -rf "$PROJ/.sbx/profiles/fs"
+    ln -s "$W/elsewhere" "$PROJ/.sbx/profiles/fs"
+    run sbx_profile_origin "$PROJ/.sbx/profiles/fs/x.json" "$PROJ" "$CFG" "$GLOBAL"
     [ "$output" = "project" ]
 }
 

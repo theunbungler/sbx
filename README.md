@@ -127,11 +127,13 @@ Profiles are JSON files organized into three categories — **CLI**, **Filesyste
 
 ### Profile Locations
 
-`sbx` searches for profiles in the following directories (in order):
+Profiles are loaded by **name only**, from these three locations (in order):
 
 1. `./.sbx/profiles/` (Local to the current directory)
 2. `$HOME/.config/sbx/profiles/` (User-specific configuration)
 3. Global profiles in the profiles directory with sbx
+
+The launch directory itself is never searched — a file sitting next to where you run `sbx` is not a profile just because it has the right name, and `--fs`/`--net`/`--cli` do not accept a file path, only `<name>` or `<type>/<name>`.
 
 `sbx-profile ls` shows which one wins when the same name exists in several places.
 

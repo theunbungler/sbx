@@ -222,12 +222,14 @@ teardown() {
     [ -f "$ROOT/elsewhere/fs/sym.json" ]
 }
 
-@test "--from sanitizes an escape-laden source path in error messages" {
-    mkdir -p .sbx/profiles/fs
-    printf 'not json' > $'.sbx/profiles/fs/\x1b[2Kbad.json'
+@test "--from sanitizes an escape-laden source name in error messages" {
+    # An escape-laden --from argument fails the name check in
+    # sbx_profile_resolve before any file is ever looked at; the escape
+    # must not leak into the (sanitized) error either way.
     run "$SBXP" new fs y --user --from $'fs/\x1b[2Kbad'
     [ "$status" -eq 1 ]
     if [[ "$output" == *$'\033'* ]]; then return 1; fi
     [[ "$output" == *"[2Kbad"* ]]
-    [[ "$output" == *"is not valid JSON"* ]]
+    [[ "$output" == *"is not a profile name"* ]]
+    if [[ -e "$HOME/.config/sbx/profiles/fs/y.json" ]]; then return 1; fi
 }

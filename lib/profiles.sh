@@ -7,23 +7,27 @@
 # an argument.
 
 # Find a profile by name. Precedence is project (./.sbx/profiles, relative
-# to the current directory), then user, then global. A name that is itself
-# a file path is used directly.
+# to the current directory), then user, then global. A profile argument is
+# a NAME, never a file path: the launch directory itself is never searched
+# and a path (with a '/' beyond an optional type prefix, "..", an absolute
+# path, or a ".json" suffix) is rejected outright, before any lookup, with
+# the same failure behavior (message on stderr, return 1) callers under
+# `set -e` already rely on for "not found".
 sbx_profile_resolve() {   # <type> <name> <config_dir> <global_dir>
-    local type="$1" name="$2" config_dir="$3" global_dir="$4" p
-
-    if [[ -f "$name" ]]; then
-        realpath "$name"
-        return 0
-    fi
-    if [[ -f "$name.json" ]]; then
-        realpath "$name.json"
-        return 0
-    fi
+    local type="$1" arg="$2" config_dir="$3" global_dir="$4" name="$2" p clean
 
     # Strip the type prefix if it was included (e.g., "cli/dev" -> "dev")
     if [[ "$name" == "$type/"* ]]; then
         name="${name#"$type"/}"
+    fi
+
+    if [[ "$name" == *.json ]] || ! sbx_profile_valid_name "$name"; then
+        clean=$(LC_ALL=C tr -cd '\11\40-\176' <<< "$arg")
+        if [[ ${#clean} -gt 500 ]]; then
+            clean="${clean:0:500}..."
+        fi
+        echo "Error: '$clean' is not a profile name. Profiles are loaded by name from ./.sbx/profiles, ~/.config/sbx/profiles or the global profiles directory." >&2
+        return 1
     fi
 
     for p in "./.sbx/profiles/$type/$name.json" \
@@ -46,29 +50,35 @@ sbx_profile_resolve() {   # <type> <name> <config_dir> <global_dir>
 # that is itself a symlink (e.g. ./.sbx/profiles/fs/evil.json -> /elsewhere)
 # resolves outside <launch_dir>/.sbx via realpath -m, which would otherwise
 # read it as "path" origin and skip both the restricted-field validation
-# and the trust prompt. sbx_profile_resolve only ever finds a project
-# profile under the literal "./.sbx/" prefix, so matching that lexical
-# form as well closes the symlink escape without following the link.
+# and the trust prompt. Two more tests close that: a purely LEXICAL test
+# (realpath -m -s, which normalizes "." and ".." but never follows a
+# symlink) of $1 against a lexical .sbx — this is what catches a symlinked
+# ancestor directory anywhere in the path (e.g. .sbx/profiles/fs itself
+# being a symlink to /elsewhere), because it never resolves any component,
+# symlinked or not — and a test of the fully-resolved $1 against that same
+# lexical .sbx, which catches a symlink only in the path's final component
+# (e.g. .sbx/profiles/fs/evil.json -> /elsewhere/x.json), since resolving
+# only trips on the last component in that case. Neither test alone covers
+# both shapes; together they do, without ever resolving .sbx itself (which
+# would let a symlinked ancestor OUTSIDE .sbx smuggle an unrelated
+# directory in under the same lexical prefix — not defended against here,
+# since <launch_dir> is assumed to be a real directory, not attacker input).
+# The literal "./.sbx/" prefix match on $1 is kept for the plain relative
+# form sbx_profile_resolve always passes.
 #
-# That lexical match only helps a caller who passes the relative
-# "./.sbx/..." form, though (as sbx_profile_resolve does). A caller who
-# passes an absolute path to the same symlinked file — e.g.
-# "$PWD/.sbx/profiles/fs/evil.json" — has no such prefix, and realpath -m
-# on the full path still follows the symlink's final component out of
-# .sbx, misclassifying it as "path" and skipping the restricted-field
-# check either way. So there's a third test: resolve the path's PARENT
-# directory only (dirname), never following the final component, and
-# check whether THAT lies at or under <launch_dir>/.sbx. A symlink can
-# only escape via its own final component, not via its containing
-# directory, so this catches the absolute-path case without being fooled
-# by a symlinked ancestor directory.
+# With names-only resolution (see sbx_profile_resolve), a launch only ever
+# passes the "./.sbx/...", "$config_dir/profiles/..." or "$global_dir/..."
+# forms produced by that lookup, so the lexical/symlink distinction here
+# only matters for a path a human hands to `sbx-profile check <path>`
+# directly.
 sbx_profile_origin() {   # <path> <launch_dir> <config_dir> <global_dir>
-    local abs sbx_abs parent_abs
+    local abs abs_lexical sbx_lexical
     abs=$(realpath -m "$1")
-    sbx_abs=$(realpath -m "$2/.sbx")
-    parent_abs=$(realpath -m "$(dirname "$1")")
-    if [[ "$abs" == "$sbx_abs/"* || "$1" == "./.sbx/"* || \
-          "$parent_abs" == "$sbx_abs" || "$parent_abs" == "$sbx_abs/"* ]]; then
+    abs_lexical=$(realpath -m -s "$1")
+    sbx_lexical=$(realpath -m -s "$2/.sbx")
+    if [[ "$abs_lexical" == "$sbx_lexical" || "$abs_lexical" == "$sbx_lexical/"* || \
+          "$abs" == "$sbx_lexical" || "$abs" == "$sbx_lexical/"* || \
+          "$1" == "./.sbx/"* ]]; then
         echo project
     elif [[ "$abs" == "$(realpath -m "$3/profiles")/"* ]]; then
         echo user
@@ -125,9 +135,12 @@ sbx_profile_valid_type() {   # <type>
 }
 
 # A profile name is one path component, so creating one can never write
-# outside its directory.
+# outside its directory. Capped at 200 characters so a write failure
+# further down is never blamed on a filesystem name-length limit instead
+# of on the name itself.
 sbx_profile_valid_name() {   # <name>
-    [[ "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]]
+    local name="$1"
+    [[ ${#name} -le 200 && "$name" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]]
 }
 
 # The starting content for a new profile: valid, and granting nothing, so
