@@ -143,6 +143,187 @@ cmd_check() {
     return $rc
 }
 
+field_guide() {   # <type>
+    case "$1" in
+        cli)
+            echo '  env          variables to set, e.g. {"EDITOR": "vim"}'
+            echo '  passthrough  host variables to forward by name, e.g. ["ANTHROPIC_API_KEY"]'
+            echo '  path         directories to put first on PATH'
+            echo '  mounts       [{"source": "...", "dest": "...", "perm": "ro|rw|dev|forked|record"}]'
+            ;;
+        fs)
+            echo '  mounts       [{"source": "...", "dest": "...", "perm": "ro|rw|dev|forked|record"}]'
+            echo '  env          variables to set, e.g. {"EDITOR": "vim"}'
+            ;;
+        net)
+            echo '  allow        hostnames, *.domains or CIDRs, e.g. ["github.com", "*.example.com"]'
+            echo '  ports        allowed ports, e.g. [443] or ["*"]'
+            echo '  dns          upstream resolver, a bare IPv4 address'
+            ;;
+    esac
+}
+
+cmd_new() {
+    local type name location="" from="" dir final answer content src src_type src_name
+    local tmp level msg errors=0 relation loc other shown
+    local -a pos=() restricted=() messages=()
+    local nflags=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --user)  location=user; nflags=$((nflags + 1)); shift ;;
+            --local) location=project; nflags=$((nflags + 1)); shift ;;
+            --from)
+                if [[ $# -lt 2 ]]; then
+                    usage >&2
+                    return 2
+                fi
+                from="$2"
+                shift 2
+                ;;
+            -*)
+                echo "Error: unknown option '$(sbx_sanitize_message "$1")' for new." >&2
+                return 2
+                ;;
+            *)  pos+=("$1"); shift ;;
+        esac
+    done
+    if [[ ${#pos[@]} -ne 2 ]]; then
+        usage >&2
+        return 2
+    fi
+    if [[ $nflags -gt 1 ]]; then
+        echo "Error: choose one of --user or --local." >&2
+        return 2
+    fi
+    type="${pos[0]}"
+    name="${pos[1]}"
+    if ! sbx_profile_valid_type "$type"; then
+        echo "Error: the type must be cli, fs or net, got '$(sbx_sanitize_message "$type")'." >&2
+        return 2
+    fi
+    if ! sbx_profile_valid_name "$name"; then
+        echo "Error: a profile name is letters, digits, '.', '_' and '-', not starting with '.' or '-'; got '$(sbx_sanitize_message "$name")'." >&2
+        return 2
+    fi
+
+    if [[ -z "$location" ]]; then
+        if [[ -t 0 ]]; then
+            printf 'Write %s/%s to (u)ser ~/.config/sbx/profiles or (l)ocal ./.sbx/profiles? [u/l] ' "$type" "$name" >&2
+            answer=""
+            read -r answer || true
+            case "${answer,,}" in
+                u|user)  location=user ;;
+                l|local) location=project ;;
+                *)
+                    echo "Aborted." >&2
+                    return 1
+                    ;;
+            esac
+        else
+            echo "Error: say where to write the profile: --user (~/.config/sbx/profiles) or --local (./.sbx/profiles)." >&2
+            return 2
+        fi
+    fi
+
+    if [[ "$location" == "user" ]]; then
+        dir="$CONFIG_DIR/profiles/$type"
+    else
+        dir="./.sbx/profiles/$type"
+    fi
+    final="$dir/$name.json"
+    if [[ -e "$final" ]]; then
+        echo "Error: $final already exists; sbx-profile never overwrites a profile. Remove it first to replace it." >&2
+        return 1
+    fi
+
+    if [[ -n "$from" ]]; then
+        src_type="$type"
+        src_name="$from"
+        if [[ "$from" == */* ]]; then
+            src_type="${from%%/*}"
+            src_name="${from#*/}"
+        fi
+        if [[ "$src_type" != "$type" ]]; then
+            echo "Error: --from must name a $type profile." >&2
+            return 2
+        fi
+        src=$(sbx_profile_resolve "$type" "$src_name" "$CONFIG_DIR" "$GLOBAL_DIR") || return 1
+        if [[ "$location" == "project" ]]; then
+            mapfile -t restricted < <(sbx_profile_restricted_fields "$src" 2>/dev/null)
+            if [[ ${#restricted[@]} -gt 0 ]]; then
+                echo "Error: $src sets ${restricted[*]}, which a project profile may not set. Create it with --user instead." >&2
+                return 1
+            fi
+        fi
+        if ! content=$(jq --indent 4 --arg d "$name (copied from $type/$(basename "$src" .json))" \
+                '.description = $d' "$src" 2>/dev/null); then
+            echo "Error: $src is not valid JSON." >&2
+            return 1
+        fi
+    else
+        content=$(sbx_profile_template "$type" "$name")
+    fi
+
+    # Validate before anything is written, from a temporary file outside
+    # the destination, as the kind of profile it is about to become.
+    tmp=$(mktemp)
+    printf '%s\n' "$content" > "$tmp"
+    while IFS=$'\t' read -r level msg; do
+        msg="${msg//"$tmp"/"$final"}"
+        case "$level" in
+            error)
+                errors=$((errors + 1))
+                messages+=("  error:   $(sbx_sanitize_message "$msg")")
+                ;;
+            warning)
+                messages+=("  warning: $(sbx_sanitize_message "$msg")")
+                ;;
+        esac
+    done < <(sbx_profile_check "$type" "$tmp" "$location")
+    rm -f "$tmp"
+    if [[ ${#messages[@]} -gt 0 ]]; then
+        printf '%s\n' "${messages[@]}"
+    fi
+    if [[ $errors -gt 0 ]]; then
+        echo "Error: not written: the new profile does not validate." >&2
+        return 1
+    fi
+
+    mkdir -p "$dir"
+    # noclobber: a file that appeared since the check above is still never
+    # overwritten.
+    if ! ( set -o noclobber; printf '%s\n' "$content" > "$final" ) 2>/dev/null; then
+        echo "Error: $final already exists; sbx-profile never overwrites a profile. Remove it first to replace it." >&2
+        return 1
+    fi
+
+    shown="$final"
+    if [[ "$shown" == "$HOME/"* ]]; then
+        shown="~/${shown#"$HOME"/}"
+    fi
+    echo "Created $shown"
+    field_guide "$type"
+    echo 'See "Constructing Profiles" in the README for every field.'
+    echo "Next: sbx --dry-run --$type $name"
+
+    while read -r relation loc other; do
+        case "$relation" in
+            shadows)
+                echo "Note: this profile hides the $loc profile $other."
+                ;;
+            shadowed-by)
+                echo "Warning: the $loc profile $other takes precedence; from this directory sbx will use that one, not this." >&2
+                ;;
+        esac
+    done < <(sbx_profile_shadowing "$type" "$name" "$location" "$CONFIG_DIR" "$GLOBAL_DIR")
+
+    if [[ "$location" == "project" ]]; then
+        echo "Note: sbx uses an untracked ./.sbx profile without asking; once git tracks it, launches from this directory will ask before using it."
+    fi
+    return 0
+}
+
 rc=0
 case "${1:-}" in
     ls)
@@ -156,6 +337,11 @@ case "${1:-}" in
     check)
         shift
         cmd_check "$@" || rc=$?
+        exit "$rc"
+        ;;
+    new)
+        shift
+        cmd_new "$@" || rc=$?
         exit "$rc"
         ;;
     -h|--help|help)

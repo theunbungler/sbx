@@ -133,6 +133,8 @@ Profiles are JSON files organized into three categories — **CLI**, **Filesyste
 2. `$HOME/.config/sbx/profiles/` (User-specific configuration)
 3. Global profiles in the profiles directory with sbx
 
+`sbx-profile ls` shows which one wins when the same name exists in several places.
+
 
 ### CLI Profiles (`profiles/cli/<name>.json`)
 
@@ -306,10 +308,24 @@ A profile that still carries `workingDirectory` is not honored; sbx warns and na
 
 ### Creating Custom Profiles
 
-1. Pick a profile type (`cli`, `fs`, or `net`).
-2. Choose a location (see [Profile Locations](#profile-locations) above). Project-local profiles (`.sbx/profiles/`) are useful for team-shared config, while user-level (`~/.config/sbx/profiles/`) ones are for personal preferences.
-3. Create a JSON file at `<location>/<type>/<name>.json`.
-4. Verify it appears with `./sbx --list-profiles`.
+Use `sbx-profile`:
+
+    ./sbx-profile new net myapi --user              # ~/.config/sbx/profiles/net/myapi.json
+    ./sbx-profile new fs work --local               # ./.sbx/profiles/fs/work.json
+    ./sbx-profile new net web2 --user --from web    # start from an existing profile
+    ./sbx-profile check                             # validate every profile you can see
+    ./sbx-profile ls                                # list them, marking shadowed ones
+
+`new` writes a minimal profile that grants nothing (or a copy of `--from`),
+validates it before writing, never overwrites an existing file, and never
+writes the global directory. Without `--user` or `--local` it asks where to
+write when run from a terminal, and refuses otherwise. `--local --from` is
+refused for a profile that sets `caps`, `userns`, `docker_api` or
+`host_ports`, which a project profile may not set. It then prints a short
+guide to the type's fields and the `sbx --dry-run` command to preview it.
+
+A profile under `./.sbx` that git does not track is used without a prompt;
+once git tracks it, launches ask before using it (see Threat model).
 
 ### Profile validation
 

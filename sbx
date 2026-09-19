@@ -122,6 +122,7 @@ Usage: $(basename "$0") [options] [command]
 
 Options:
   --list-profiles        Show available profiles
+                         (sbx-profile ls / check / new manage profile files)
   --list-sessions        Show active sessions
   --doctor [--json]      Check dependencies and host setup, with install commands
   --changes [<id>]       Show what a record mount changed (default: latest)

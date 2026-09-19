@@ -108,3 +108,89 @@ teardown() {
     [ "$status" -eq 0 ]
     [[ "$output" == *"new <type> <name>"* ]]
 }
+
+@test "new --user writes the template and says what to do next" {
+    run "$SBXP" new net api --user
+    [ "$status" -eq 0 ]
+    [ "$(jq -c . "$HOME/.config/sbx/profiles/net/api.json")" = '{"description":"api","dns":"1.1.1.1","allow":[],"ports":[443]}' ]
+    [[ "$output" == *"Created ~/.config/sbx/profiles/net/api.json"* ]]
+    [[ "$output" == *"allow        hostnames"* ]]
+    [[ "$output" == *"Next: sbx --dry-run --net api"* ]]
+}
+
+@test "new --local writes under ./.sbx and explains the trust rule" {
+    run "$SBXP" new fs work --local
+    [ "$status" -eq 0 ]
+    [ -f "$PROJ/.sbx/profiles/fs/work.json" ]
+    [[ "$output" == *"untracked ./.sbx profile without asking"* ]]
+}
+
+@test "without a location flag: an error off a terminal, a prompt on one" {
+    run bash -c "cd '$PROJ' && '$SBXP' new fs x < /dev/null 2>&1"
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"--user"*"--local"* ]]
+    if [[ -e "$PROJ/.sbx" || -e "$HOME/.config/sbx/profiles/fs/x.json" ]]; then return 1; fi
+    run bash -c "cd '$PROJ' && printf 'l\n' | script -qec \"'$SBXP' new fs x\" /dev/null"
+    [ "$status" -eq 0 ]
+    [ -f "$PROJ/.sbx/profiles/fs/x.json" ]
+}
+
+@test "new never overwrites" {
+    "$SBXP" new fs keep --user > /dev/null
+    echo '{"description":"mine"}' > "$HOME/.config/sbx/profiles/fs/keep.json"
+    run "$SBXP" new fs keep --user
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"already exists"* ]]
+    [ "$(jq -r .description "$HOME/.config/sbx/profiles/fs/keep.json")" = "mine" ]
+}
+
+@test "--from copies a profile under a new description" {
+    run "$SBXP" new net web2 --user --from web
+    [ "$status" -eq 0 ]
+    [ "$(jq -r .description "$HOME/.config/sbx/profiles/net/web2.json")" = "web2 (copied from net/web)" ]
+    [ "$(jq -c .allow "$HOME/.config/sbx/profiles/net/web2.json")" = "$(jq -c .allow "$REPO/profiles/net/web.json")" ]
+    [[ "$output" == *"warning: "* ]]
+}
+
+@test "--local --from refuses a profile with restricted fields" {
+    run "$SBXP" new fs pod --local --from fs/podman
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"sets caps docker_api, which a project profile may not set"* ]]
+    if [[ -e "$PROJ/.sbx" ]]; then return 1; fi
+}
+
+@test "--from must match the type" {
+    run "$SBXP" new fs x --user --from net/web
+    [ "$status" -eq 2 ]
+}
+
+@test "shadowing is reported both ways" {
+    run "$SBXP" new fs sandbox --user
+    [[ "$output" == *"Note: this profile hides the global profile"* ]]
+    mkdir -p .sbx/profiles/fs
+    echo '{}' > .sbx/profiles/fs/mine.json
+    run bash -c "cd '$PROJ' && '$SBXP' new fs mine --user 2>&1"
+    [[ "$output" == *"Warning: the project profile ./.sbx/profiles/fs/mine.json takes precedence"* ]]
+}
+
+@test "bad types and names are refused and write nothing" {
+    run "$SBXP" new ssh x --user
+    [ "$status" -eq 2 ]
+    run "$SBXP" new fs ../evil --user
+    [ "$status" -eq 2 ]
+    run "$SBXP" new fs x --user --local
+    [ "$status" -eq 2 ]
+    run "$SBXP" new fs x --user --bogus
+    [ "$status" -eq 2 ]
+    if [[ -e "$HOME/.config/sbx/evil.json" || -e "$HOME/.config/sbx/profiles/fs/x.json" ]]; then return 1; fi
+}
+
+@test "every created profile validates" {
+    local type
+    for type in cli fs net; do
+        "$SBXP" new "$type" "t$type" --user > /dev/null
+        run "$SBXP" check "$type/t$type"
+        [ "$status" -eq 0 ]
+        [[ "$output" == *"$type/t$type (user): ok"* ]]
+    done
+}
