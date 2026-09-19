@@ -93,6 +93,16 @@ r() { jq -r "$1" <<< "$PLAN"; }
     [ "$(r '.env[0].value')" = "hunter2" ]
 }
 
+@test "path_raw carries the unexpanded PATH env value and cli path entries, composed like path" {
+    local fs cli
+    export SBX_RESOLVE_PATHSECRET=hunter2path
+    fs=$(user fs pe '{"env":{"PATH":"$SBX_RESOLVE_PATHSECRET:/usr/bin"}}')
+    cli=$(user cli pc '{"path":["$SBX_RESOLVE_PATHSECRET/bin"]}')
+    resolve --fs "$fs" --cli "$cli"
+    [ "$(r .path)" = "hunter2path/bin:hunter2path:/usr/bin:/usr/local/bin:/usr/bin:/bin" ]
+    [ "$(r .path_raw)" = '$SBX_RESOLVE_PATHSECRET/bin:$SBX_RESOLVE_PATHSECRET:/usr/bin:/usr/local/bin:/usr/bin:/bin' ]
+}
+
 @test "passthrough carries names, never values" {
     local fs
     export SBX_RESOLVE_SECRET=hunter2

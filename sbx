@@ -789,7 +789,8 @@ if [[ "$DRY_RUN" == "true" ]]; then
         '. + {needs: $needs, writes: $writes, stops: $stops, passthrough_set: $passthrough_set,
               session: {name: $session_name, dir: $session_dir}}
              | .proceed = (((.errors | length) == 0) and .needs.ok and ((.stops | length) == 0))
-             | .env |= map(del(.value))' \
+             | .env |= map(del(.value))
+             | del(.path)' \
         <<< "$PLAN")
     if [[ "$DRY_RUN_JSON" == "true" ]]; then
         jq -a . <<< "$DRY_DOC"

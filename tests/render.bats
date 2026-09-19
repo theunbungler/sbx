@@ -14,7 +14,7 @@ doc() {   # [jq update]
       deps: ["core"],
       security: {caps_keep:false, caps_profile:"", userns_full:false, userns_profile:"", docker_api:false},
       mounts: [], passthrough: [], passthrough_set: [], env: [],
-      path: "/usr/local/bin:/usr/bin:/bin", wd: "", gui: false,
+      path: "/usr/local/bin:/usr/bin:/bin", path_raw: "/usr/local/bin:/usr/bin:/bin", wd: "", gui: false,
       host_ports: {tcp: [], udp: []}, netns: false, net: {enabled: false},
       writes: [{kind:"temporary", path:"/home/u/.local/state/sbx/sessions/proj/", detail:"session directory", dest:"", note:""}],
       needs: {groups:{core:[]}, userns:true, subids:null, install:[], ok:true},
@@ -74,6 +74,12 @@ line() {   # <prefix> -> the first output line starting with it
     [ "$(line Env)" = "Env        A=\$A  (cli/c; overrides fs/x)" ]
     if printf '%s\n' "$output" | grep -q 'PATH=/p'; then return 1; fi
     [ "$(line Path)" = "Path       ~/.local/state/sbx/sessions/proj/bin:/usr/local/bin:/usr/bin:/bin" ]
+}
+
+@test "the Path line shows path_raw, not the expanded path" {
+    render '.path = "hunter2secret:/usr/bin" | .path_raw = "$SBX_SECRET:/usr/bin"'
+    [ "$(line Path)" = 'Path       ~/.local/state/sbx/sessions/proj/bin:$SBX_SECRET:/usr/bin' ]
+    if [[ "$output" == *hunter2secret* ]]; then return 1; fi
 }
 
 @test "passthrough is names only" {

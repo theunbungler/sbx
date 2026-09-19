@@ -162,6 +162,18 @@ EOF
     if [[ "$output" == *hunter2* ]]; then return 1; fi
 }
 
+@test "the PATH env value is shown unexpanded, in text and --json, so host secrets are never printed" {
+    echo '{"env":{"PATH":"$SBX_DRY_PATHSECRET:/usr/bin"}}' > "$HOME/.config/sbx/profiles/fs/envpath.json"
+    export SBX_DRY_PATHSECRET=hunter2path
+    dry --fs envpath
+    [[ "$output" == *'$SBX_DRY_PATHSECRET:/usr/bin'* ]]
+    if [[ "$output" == *hunter2path* ]]; then return 1; fi
+
+    run bash -c 'cd "$1" && shift && "$@" < /dev/null 2>/dev/null' _ "$PROJ" "$SBX" --dry-run --json --fs envpath
+    [ "$status" -eq 0 ]
+    if [[ "$output" == *hunter2path* ]]; then return 1; fi
+}
+
 @test "a tracked project profile does not prompt" {
     mkdir -p "$PROJ/.sbx/profiles/fs"
     echo '{"description":"t"}' > "$PROJ/.sbx/profiles/fs/t.json"

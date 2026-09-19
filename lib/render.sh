@@ -72,7 +72,7 @@ def mark($ok): if $ok then "✓" else "✗" end;
           + (.[:-1] | map(.from) | unique | if length > 0 then "; overrides " + join(", ") else "" end)
           + ")" ]),
 
-    section("Path"; [ $d.path | select(length > 0) | ($d.session.dir + "bin:" + .) | tilde ]),
+    section("Path"; [ $d.path_raw | select(length > 0) | ($d.session.dir + "bin:" + .) | tilde ]),
 
     section("Passthru"; [ $d.passthrough | unique | select(length > 0)
         | map(. as $n

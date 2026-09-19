@@ -113,7 +113,7 @@ sbx_resolve() {
 
     local caps_keep=false caps_profile="" userns_full=false userns_profile="" docker_api=false
     local -a mounts=() passthrough=() env=() tcp=() udp=()
-    local sandbox_path="" netns=false net_json='{"enabled":false}'
+    local sandbox_path="" sandbox_path_raw="" netns=false net_json='{"enabled":false}'
     local -a deps=(core)
 
     if [[ ${#errors[@]} -eq 0 ]]; then
@@ -210,6 +210,7 @@ sbx_resolve() {
                     '{name: $name, value: $value, raw: $raw, from: $from}')")
                 if [[ "$key" == "PATH" ]]; then
                     sandbox_path="$value"
+                    sandbox_path_raw="$raw"
                 fi
             done < <(jq -j 'def nul: [0] | implode; .env // {} | to_entries[] | .key, nul, (.value | tostring), nul' "$p")
         done
@@ -217,9 +218,11 @@ sbx_resolve() {
         # A cli profile's path entries go in front of any PATH an env block
         # set, and the default always closes the list.
         local default_path="/usr/local/bin:/usr/bin:/bin"
+        local extra_raw=""
         extra=""
         if [[ -n "$cli" ]]; then
             extra=$(jq -r '.path[]?' "$cli" | envsubst | paste -sd: -)
+            extra_raw=$(jq -r '.path[]?' "$cli" | paste -sd: -)
         fi
         if [[ -n "$extra" ]]; then
             if [[ -n "$sandbox_path" ]]; then
@@ -229,6 +232,15 @@ sbx_resolve() {
             fi
         elif [[ -z "$sandbox_path" ]]; then
             sandbox_path="$default_path"
+        fi
+        if [[ -n "$extra_raw" ]]; then
+            if [[ -n "$sandbox_path_raw" ]]; then
+                sandbox_path_raw="$extra_raw:$sandbox_path_raw:$default_path"
+            else
+                sandbox_path_raw="$extra_raw:$default_path"
+            fi
+        elif [[ -z "$sandbox_path_raw" ]]; then
+            sandbox_path_raw="$default_path"
         fi
 
         # --- Host-service access ---
@@ -294,6 +306,7 @@ sbx_resolve() {
 
     if [[ ${#errors[@]} -gt 0 ]]; then
         sandbox_path=""
+        sandbox_path_raw=""
     fi
 
     jq -n \
@@ -308,7 +321,7 @@ sbx_resolve() {
         --argjson mounts "$(sbx_resolve_objects "${mounts[@]}")" \
         --argjson passthrough "$(sbx_resolve_strings "${passthrough[@]}")" \
         --argjson env "$(sbx_resolve_objects "${env[@]}")" \
-        --arg path "$sandbox_path" --arg wd "$wd" --argjson gui "$gui" \
+        --arg path "$sandbox_path" --arg path_raw "$sandbox_path_raw" --arg wd "$wd" --argjson gui "$gui" \
         --argjson tcp "$(sbx_resolve_strings "${tcp[@]}" | jq -c 'map(tonumber)')" \
         --argjson udp "$(sbx_resolve_strings "${udp[@]}" | jq -c 'map(tonumber)')" \
         --argjson netns "$netns" --argjson net "$net_json" \
@@ -316,7 +329,7 @@ sbx_resolve() {
           security: {caps_keep: $caps_keep, caps_profile: $caps_profile,
                      userns_full: $userns_full, userns_profile: $userns_profile,
                      docker_api: $docker_api},
-          mounts: $mounts, passthrough: $passthrough, env: $env, path: $path,
+          mounts: $mounts, passthrough: $passthrough, env: $env, path: $path, path_raw: $path_raw,
           wd: $wd, gui: $gui, host_ports: {tcp: $tcp, udp: $udp},
           netns: $netns, net: $net}'
 }
