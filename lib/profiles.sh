@@ -65,7 +65,8 @@ sbx_profile_origin() {   # <path> <launch_dir> <config_dir> <global_dir>
 
 sbx_profile_list() {   # <config_dir> <global_dir>
     local config_dir="$1" global_dir="$2"
-    local type src label path files profile found
+    local type src label path files profile found shown
+    local -A seen
     local sources=(
         "Project:./.sbx/profiles"
         "User:$config_dir/profiles"
@@ -77,6 +78,7 @@ sbx_profile_list() {   # <config_dir> <global_dir>
         echo ""
         echo "${type^^} Profiles:"
         found=0
+        seen=()
         for src in "${sources[@]}"; do
             label="${src%%:*}"
             path="${src#*:}"
@@ -84,7 +86,13 @@ sbx_profile_list() {   # <config_dir> <global_dir>
                 files=$(find "$path/$type" -name "*.json" | sed "s|$path/$type/||" | sed 's/\.json$//' | sort)
                 if [[ -n "$files" ]]; then
                     while IFS= read -r profile; do
-                        echo "  $profile ($label)"
+                        shown=$(LC_ALL=C tr -d '\000-\037\177' <<< "$profile")
+                        if [[ -n "${seen[$profile]:-}" ]]; then
+                            echo "  $shown ($label, shadowed by ${seen[$profile]})"
+                        else
+                            echo "  $shown ($label)"
+                            seen[$profile]="$label"
+                        fi
                         found=1
                     done <<< "$files"
                 fi
@@ -94,4 +102,57 @@ sbx_profile_list() {   # <config_dir> <global_dir>
             echo "  (none)"
         fi
     done
+}
+
+sbx_profile_valid_type() {   # <type>
+    [[ "$1" == "cli" || "$1" == "fs" || "$1" == "net" ]]
+}
+
+# A profile name is one path component, so creating one can never write
+# outside its directory.
+sbx_profile_valid_name() {   # <name>
+    [[ "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]]
+}
+
+# The starting content for a new profile: valid, and granting nothing, so
+# a template left unedited can never open access by accident.
+sbx_profile_template() {   # <type> <description>
+    case "$1" in
+        cli) jq -n --indent 4 --arg d "$2" '{description: $d, env: {}, passthrough: [], mounts: []}' ;;
+        fs)  jq -n --indent 4 --arg d "$2" '{description: $d, mounts: []}' ;;
+        net) jq -n --indent 4 --arg d "$2" '{description: $d, dns: "1.1.1.1", allow: [], ports: [443]}' ;;
+        *)   return 1 ;;
+    esac
+}
+
+# Fields a project profile may not set. Same list as `restricted` in
+# lib/profile-check.sh — keep the two in step.
+sbx_profile_restricted_fields() {   # <file>
+    jq -r '["caps", "userns", "docker_api", "host_ports"][] as $f | select(has($f)) | $f' "$1"
+}
+
+# Other locations holding the same <type>/<name>, relative to <location>.
+# Precedence is project, then user, then global (see sbx_profile_resolve).
+sbx_profile_shadowing() {   # <type> <name> <location> <config_dir> <global_dir>
+    local type="$1" name="$2" location="$3" config_dir="$4" global_dir="$5" i mine=-1
+    local -a labels=(project user global)
+    local -a paths=("./.sbx/profiles/$type/$name.json"
+                    "$config_dir/profiles/$type/$name.json"
+                    "$global_dir/$type/$name.json")
+    for i in 0 1 2; do
+        if [[ "${labels[$i]}" == "$location" ]]; then
+            mine=$i
+        fi
+    done
+    for i in 0 1 2; do
+        if [[ $i -eq $mine || ! -f "${paths[$i]}" ]]; then
+            continue
+        fi
+        if [[ $i -lt $mine ]]; then
+            echo "shadowed-by ${labels[$i]} ${paths[$i]}"
+        else
+            echo "shadows ${labels[$i]} ${paths[$i]}"
+        fi
+    done
+    return 0
 }

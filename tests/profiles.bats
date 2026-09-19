@@ -84,3 +84,57 @@ setup() {
     [[ "$output" == *"  base (Global)"* ]]
     [[ "$output" == *"  web (User)"* ]]
 }
+
+@test "valid types and names" {
+    sbx_profile_valid_type cli
+    sbx_profile_valid_type fs
+    sbx_profile_valid_type net
+    if sbx_profile_valid_type ssh; then return 1; fi
+    sbx_profile_valid_name my-profile_1.2
+    sbx_profile_valid_name _x
+    for bad in "" ../evil a/b .hidden -dash "sp ace"; do
+        if sbx_profile_valid_name "$bad"; then echo "accepted '$bad'" >&2; return 1; fi
+    done
+}
+
+@test "templates are valid and grant nothing" {
+    source "$BATS_TEST_DIRNAME/../lib/profile-check.sh"
+    local type out
+    for type in cli fs net; do
+        sbx_profile_template "$type" "a $type profile" > "$W/t.json"
+        out=$(sbx_profile_check "$type" "$W/t.json" project)
+        if [[ -n "$out" ]]; then echo "$type template: $out" >&2; return 1; fi
+    done
+    [ "$(sbx_profile_template cli d | jq -c .)" = '{"description":"d","env":{},"passthrough":[],"mounts":[]}' ]
+    [ "$(sbx_profile_template fs d | jq -c .)" = '{"description":"d","mounts":[]}' ]
+    [ "$(sbx_profile_template net d | jq -c .)" = '{"description":"d","dns":"1.1.1.1","allow":[],"ports":[443]}' ]
+    run sbx_profile_template ssh d
+    [ "$status" -eq 1 ]
+}
+
+@test "restricted fields are listed in order" {
+    echo '{"host_ports":[1],"caps":"keep","description":"x","docker_api":false}' > "$W/r.json"
+    run sbx_profile_restricted_fields "$W/r.json"
+    [ "$output" = "$(printf 'caps\ndocker_api\nhost_ports')" ]
+    echo '{"description":"x"}' > "$W/r.json"
+    run sbx_profile_restricted_fields "$W/r.json"
+    [ -z "$output" ]
+}
+
+@test "shadowing relative to each location" {
+    run sbx_profile_shadowing fs shared user "$CFG" "$GLOBAL"
+    [ "${lines[0]}" = "shadowed-by project ./.sbx/profiles/fs/shared.json" ]
+    [ "${lines[1]}" = "shadows global $GLOBAL/fs/shared.json" ]
+    run sbx_profile_shadowing fs base project "$CFG" "$GLOBAL"
+    [ "$output" = "shadows global $GLOBAL/fs/base.json" ]
+    run sbx_profile_shadowing fs nothing user "$CFG" "$GLOBAL"
+    [ -z "$output" ]
+}
+
+@test "list marks shadowed profiles" {
+    run sbx_profile_list "$CFG" "$GLOBAL"
+    [[ "$output" == *"  shared (Project)"* ]]
+    [[ "$output" == *"  shared (User, shadowed by Project)"* ]]
+    [[ "$output" == *"  shared (Global, shadowed by Project)"* ]]
+    [[ "$output" == *"  mine (User)"* ]]
+}

@@ -16,6 +16,7 @@ def known:
   { cli: ["description","env","path","mounts","passthrough","caps","userns","docker_api","workingDirectory"],
     fs:  ["description","mounts","env","passthrough","caps","userns","docker_api","workingDirectory"],
     net: ["description","dns","allow","ports","host_ports"] };
+# Same list as sbx_profile_restricted_fields in lib/profiles.sh — keep the two in step.
 def restricted: ["caps","userns","docker_api","host_ports"];
 def err($p; $m): {level: "error", path: $p, message: $m};
 def warn($p; $m): {level: "warning", path: $p, message: $m};
