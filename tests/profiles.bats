@@ -70,6 +70,20 @@ setup() {
     [ "$output" = "project" ]
 }
 
+@test "an absolute path to a symlinked project profile still classifies as project" {
+    mkdir -p "$W/outside"
+    echo '{}' > "$W/outside/evil.json"
+    ln -s "$W/outside/evil.json" "$PROJ/.sbx/profiles/fs/evil.json"
+    run sbx_profile_origin "$PROJ/.sbx/profiles/fs/evil.json" "$PROJ" "$CFG" "$GLOBAL"
+    [ "$output" = "project" ]
+    # the sibling-prefix collision must still classify as "path" even
+    # when passed as an absolute path, not just relative.
+    mkdir -p "$W/proj/.sbxevil"
+    echo '{}' > "$W/proj/.sbxevil/x.json"
+    run sbx_profile_origin "$W/proj/.sbxevil/x.json" "$PROJ" "$CFG" "$GLOBAL"
+    [ "$output" = "path" ]
+}
+
 @test "an ordinary project profile still classifies as project" {
     run sbx_profile_origin ./.sbx/profiles/fs/shared.json "$PROJ" "$CFG" "$GLOBAL"
     [ "$output" = "project" ]

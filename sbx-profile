@@ -123,6 +123,11 @@ cmd_check() {
         return $rc
     fi
 
+    if [[ -d "$1" ]]; then
+        echo "Error: '$(sbx_sanitize_message "$1")' is a directory, not a profile file." >&2
+        return 2
+    fi
+
     if [[ "$1" != */* ]]; then
         echo "Error: check expects <type>/<name> or a path to a profile file." >&2
         return 2
@@ -130,7 +135,7 @@ cmd_check() {
     type="${1%%/*}"
     name="${1#*/}"
     if ! sbx_profile_valid_type "$type"; then
-        echo "Error: the type must be cli, fs or net, got '$(sbx_sanitize_message "$type")'." >&2
+        echo "Error: no profile file at '$(sbx_sanitize_message "$1")'." >&2
         return 2
     fi
     path=$(sbx_profile_resolve "$type" "$name" "$CONFIG_DIR" "$GLOBAL_DIR") || return 1

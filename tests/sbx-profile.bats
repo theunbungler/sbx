@@ -65,6 +65,29 @@ teardown() {
     [[ "$output" == *"must be cli, fs or net"* ]]
 }
 
+@test "check treats a symlinked project profile as project even by absolute path" {
+    mkdir -p .sbx/profiles/fs "$ROOT/outside"
+    echo '{"caps":"drop"}' > "$ROOT/outside/evil.json"
+    ln -s "$ROOT/outside/evil.json" .sbx/profiles/fs/evil.json
+    run "$SBXP" check "$PWD/.sbx/profiles/fs/evil.json"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"fs/evil (project)"* ]]
+    [[ "$output" == *"project profiles may not set caps"* ]]
+}
+
+@test "check <path> reports a clear error for a directory argument" {
+    mkdir -p "$ROOT/somedir"
+    run "$SBXP" check "$ROOT/somedir"
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"is a directory, not a profile file"* ]]
+}
+
+@test "check <path> reports a clear error for a nonexistent, non type/name path" {
+    run "$SBXP" check "$ROOT/nope/missing.json"
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"no profile file at"* ]]
+}
+
 @test "check sanitizes profile-authored text" {
     printf '{"workingDirectory":"/x\\u001b[2Kbad"}\n' > "$HOME/.config/sbx/profiles/fs/esc.json"
     run "$SBXP" check fs/esc

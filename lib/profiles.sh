@@ -49,10 +49,26 @@ sbx_profile_resolve() {   # <type> <name> <config_dir> <global_dir>
 # and the trust prompt. sbx_profile_resolve only ever finds a project
 # profile under the literal "./.sbx/" prefix, so matching that lexical
 # form as well closes the symlink escape without following the link.
+#
+# That lexical match only helps a caller who passes the relative
+# "./.sbx/..." form, though (as sbx_profile_resolve does). A caller who
+# passes an absolute path to the same symlinked file — e.g.
+# "$PWD/.sbx/profiles/fs/evil.json" — has no such prefix, and realpath -m
+# on the full path still follows the symlink's final component out of
+# .sbx, misclassifying it as "path" and skipping the restricted-field
+# check either way. So there's a third test: resolve the path's PARENT
+# directory only (dirname), never following the final component, and
+# check whether THAT lies at or under <launch_dir>/.sbx. A symlink can
+# only escape via its own final component, not via its containing
+# directory, so this catches the absolute-path case without being fooled
+# by a symlinked ancestor directory.
 sbx_profile_origin() {   # <path> <launch_dir> <config_dir> <global_dir>
-    local abs
+    local abs sbx_abs parent_abs
     abs=$(realpath -m "$1")
-    if [[ "$abs" == "$(realpath -m "$2/.sbx")/"* || "$1" == "./.sbx/"* ]]; then
+    sbx_abs=$(realpath -m "$2/.sbx")
+    parent_abs=$(realpath -m "$(dirname "$1")")
+    if [[ "$abs" == "$sbx_abs/"* || "$1" == "./.sbx/"* || \
+          "$parent_abs" == "$sbx_abs" || "$parent_abs" == "$sbx_abs/"* ]]; then
         echo project
     elif [[ "$abs" == "$(realpath -m "$3/profiles")/"* ]]; then
         echo user
