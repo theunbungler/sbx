@@ -189,3 +189,31 @@ EOF
     [[ "$output" == *"Usage:"* ]]
     nothing_created
 }
+
+@test "an unrecognized --option is rejected before it can become the payload" {
+    run bash -c 'cd "$1" && shift && "$@" < /dev/null 2>&1' _ "$PROJ" "$SBX" --dryrun --fs sandbox
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"unknown option '--dryrun'"* ]]
+    nothing_created
+}
+
+@test "--json before --dry-run is not a recognized option and is rejected" {
+    run bash -c 'cd "$1" && shift && "$@" < /dev/null 2>&1' _ "$PROJ" "$SBX" --json --dry-run --fs sandbox
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"unknown option '--json'"* ]]
+    nothing_created
+}
+
+@test "a payload after -- that starts with -- is not rejected" {
+    dry --fs sandbox -- --version
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Result     the launch would proceed"* ]]
+    nothing_created
+}
+
+@test "a payload command word followed by a --flag is not rejected" {
+    dry --fs sandbox mytool --flag
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Result     the launch would proceed"* ]]
+    nothing_created
+}
