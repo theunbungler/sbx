@@ -1,0 +1,10 @@
+{
+    "id": "proj",
+    "cwd": "@ROOT@/proj",
+    "pid": @PID@,
+    "fs_profiles": [
+  "@ROOT@/h/.config/sbx/profiles/fs/snapmounts.json"
+],
+    "net_profiles": [],
+    "cli_profile": "@ROOT@/h/.config/sbx/profiles/cli/snapcli.json"
+}

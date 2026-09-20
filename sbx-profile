@@ -1,0 +1,433 @@
+#!/bin/bash
+# sbx-profile — list, check and create sbx profiles.
+#
+# Works on profile files only. Everything that takes launch flags,
+# including previewing a launch (sbx --dry-run), stays in sbx.
+
+set -e
+
+CONFIG_DIR="$HOME/.config/sbx"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GLOBAL_DIR="$SCRIPT_DIR/profiles"
+
+# shellcheck source=lib/profiles.sh
+source "$SCRIPT_DIR/lib/profiles.sh"
+# shellcheck source=lib/profile-check.sh
+source "$SCRIPT_DIR/lib/profile-check.sh"
+# shellcheck source=lib/render.sh
+source "$SCRIPT_DIR/lib/render.sh"
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") <command> [arguments]
+
+Commands:
+  ls                          List profiles with where each comes from;
+                              a profile hidden by one of the same name is
+                              marked "shadowed"
+  check [<type>/<name>|<path>]
+                              Validate one profile, or with no argument every
+                              profile visible from this directory (exit 1 if
+                              any has errors). Schema only: use
+                              sbx --dry-run to see launch-time facts, such
+                              as an absent mount source or whether a
+                              project profile will prompt.
+  new <type> <name> [--user|--local] [--from <profile>]
+                              Create a profile: cli, fs or net. --user writes
+                              ~/.config/sbx/profiles, --local writes
+                              ./.sbx/profiles. Never overwrites.
+  help                        Show this help
+
+Profiles are searched in:
+  1. ./.sbx/profiles/
+  2. \$HOME/.config/sbx/profiles/
+  3. $GLOBAL_DIR/
+EOF
+}
+
+# One profile's validation result. Prints a summary line and its messages;
+# returns 1 if the profile has errors.
+check_one() {   # <type> <path> [shadowed-by-location]
+    local type="$1" path="$2" shadowed_by="${3:-}" origin name level msg prefix
+    local errors=0 warnings=0 summary shown
+    local -a lines=()
+    origin=$(sbx_profile_origin "$path" "$PWD" "$CONFIG_DIR" "$GLOBAL_DIR")
+    name=$(sbx_sanitize_message "$(basename "$path" .json)")
+    shown="$path"
+    if [[ "$shown" == "$HOME/"* ]]; then
+        shown="~/${shown#"$HOME"/}"
+    fi
+    shown=$(sbx_sanitize_message "$shown")
+    prefix="$path: "
+    while IFS=$'\t' read -r level msg; do
+        msg="${msg#"$prefix"}"
+        case "$level" in
+            error)
+                errors=$((errors + 1))
+                lines+=("  error:   $(sbx_sanitize_message "$msg")")
+                ;;
+            warning)
+                warnings=$((warnings + 1))
+                lines+=("  warning: $(sbx_sanitize_message "$msg")")
+                ;;
+        esac
+    done < <(sbx_profile_check "$type" "$path" "$origin")
+
+    summary=""
+    if [[ $errors -gt 0 ]]; then
+        summary="$errors error"
+        if [[ $errors -gt 1 ]]; then summary+="s"; fi
+    fi
+    if [[ $warnings -gt 0 ]]; then
+        if [[ -n "$summary" ]]; then summary+=", "; fi
+        summary+="$warnings warning"
+        if [[ $warnings -gt 1 ]]; then summary+="s"; fi
+    fi
+    if [[ -z "$summary" ]]; then
+        summary="ok"
+    fi
+    if [[ -n "$shadowed_by" ]]; then
+        echo "$type/$name ($origin, $shown, shadowed by $shadowed_by): $summary"
+    else
+        echo "$type/$name ($origin, $shown): $summary"
+    fi
+    if [[ ${#lines[@]} -gt 0 ]]; then
+        printf '%s\n' "${lines[@]}"
+    fi
+    if [[ $errors -gt 0 ]]; then
+        return 1
+    fi
+    return 0
+}
+
+cmd_check() {
+    local rc=0 type name path dir f found=0 loc entry name_only shadowed_by relation loc2 other
+    if [[ $# -gt 1 ]]; then
+        usage >&2
+        return 2
+    fi
+
+    if [[ $# -eq 0 ]]; then
+        for type in cli fs net; do
+            for entry in "project:./.sbx/profiles/$type" \
+                         "user:$CONFIG_DIR/profiles/$type" \
+                         "global:$GLOBAL_DIR/$type"; do
+                loc="${entry%%:*}"
+                dir="${entry#*:}"
+                if [[ ! -d "$dir" ]]; then
+                    continue
+                fi
+                for f in "$dir"/*.json; do
+                    if [[ ! -e "$f" ]]; then
+                        continue
+                    fi
+                    found=1
+                    name_only=$(basename "$f" .json)
+                    # A profile shadowed by one of the same name elsewhere
+                    # is never the one a launch actually uses, so its
+                    # errors don't gate the exit status — but its
+                    # messages are still worth seeing.
+                    shadowed_by=""
+                    while read -r relation loc2 other; do
+                        if [[ "$relation" == "shadowed-by" ]]; then
+                            shadowed_by="$loc2"
+                        fi
+                    done < <(sbx_profile_shadowing "$type" "$name_only" "$loc" "$CONFIG_DIR" "$GLOBAL_DIR")
+                    if [[ -n "$shadowed_by" ]]; then
+                        check_one "$type" "$f" "$shadowed_by" || true
+                    else
+                        check_one "$type" "$f" || rc=1
+                    fi
+                done
+            done
+        done
+        if [[ $found -eq 0 ]]; then
+            echo "No profiles found."
+        fi
+        return $rc
+    fi
+
+    if [[ -f "$1" ]]; then
+        type=$(basename "$(dirname "$1")")
+        if ! sbx_profile_valid_type "$type"; then
+            echo "Error: cannot tell the type of '$(sbx_sanitize_message "$1")': its directory must be cli, fs or net. Use <type>/<name> instead." >&2
+            return 2
+        fi
+        check_one "$type" "$1" || rc=1
+        return $rc
+    fi
+
+    if [[ -d "$1" ]]; then
+        echo "Error: '$(sbx_sanitize_message "$1")' is a directory, not a profile file." >&2
+        return 2
+    fi
+
+    if [[ "$1" != */* ]]; then
+        echo "Error: check expects <type>/<name> or a path to a profile file." >&2
+        return 2
+    fi
+    type="${1%%/*}"
+    name="${1#*/}"
+    if ! sbx_profile_valid_type "$type"; then
+        echo "Error: no profile file at '$(sbx_sanitize_message "$1")'." >&2
+        return 2
+    fi
+    path=$(sbx_profile_resolve "$type" "$name" "$CONFIG_DIR" "$GLOBAL_DIR") || return 1
+    check_one "$type" "$path" || rc=1
+    return $rc
+}
+
+field_guide() {   # <type>
+    case "$1" in
+        cli)
+            echo '  env          variables to set, e.g. {"EDITOR": "vim"}'
+            echo '  passthrough  host variables to forward by name, e.g. ["ANTHROPIC_API_KEY"]'
+            echo '  path         directories to put first on PATH'
+            echo '  mounts       [{"source": "...", "dest": "...", "perm": "ro|rw|dev|forked|record"}]'
+            ;;
+        fs)
+            echo '  mounts       [{"source": "...", "dest": "...", "perm": "ro|rw|dev|forked|record"}]'
+            echo '  env          variables to set, e.g. {"EDITOR": "vim"}'
+            ;;
+        net)
+            echo '  allow        hostnames, *.domains or CIDRs, e.g. ["github.com", "*.example.com"]'
+            echo '  ports        allowed ports, e.g. [443] or ["*"]'
+            echo '  dns          upstream resolver, a bare IPv4 address'
+            ;;
+    esac
+}
+
+cmd_new() {
+    local type name location="" from="" dir final answer content src src_type src_name src_origin
+    local tmp level msg errors=0 relation loc other shown src_shown
+    local -a pos=() restricted=() messages=()
+    local -A loc_seen=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --user)  location=user; loc_seen[user]=1; shift ;;
+            --local) location=project; loc_seen[project]=1; shift ;;
+            --from)
+                if [[ $# -lt 2 ]]; then
+                    usage >&2
+                    return 2
+                fi
+                from="$2"
+                shift 2
+                ;;
+            -*)
+                echo "Error: unknown option '$(sbx_sanitize_message "$1")' for new." >&2
+                return 2
+                ;;
+            *)  pos+=("$1"); shift ;;
+        esac
+    done
+    if [[ ${#pos[@]} -ne 2 ]]; then
+        usage >&2
+        return 2
+    fi
+    if [[ ${#loc_seen[@]} -gt 1 ]]; then
+        echo "Error: choose one of --user or --local." >&2
+        return 2
+    fi
+    type="${pos[0]}"
+    name="${pos[1]}"
+    if ! sbx_profile_valid_type "$type"; then
+        echo "Error: the type must be cli, fs or net, got '$(sbx_sanitize_message "$type")'." >&2
+        return 2
+    fi
+    if ! sbx_profile_valid_name "$name"; then
+        echo "Error: a profile name is letters, digits, '.', '_' and '-', not starting with '.' or '-'; got '$(sbx_sanitize_message "$name")'." >&2
+        return 2
+    fi
+
+    if [[ -z "$location" ]]; then
+        if [[ -t 0 ]]; then
+            printf 'Write %s/%s to (u)ser ~/.config/sbx/profiles or (l)ocal ./.sbx/profiles? [u/l] ' "$type" "$name" >&2
+            answer=""
+            read -r answer || true
+            case "${answer,,}" in
+                u|user)  location=user ;;
+                l|local) location=project ;;
+                *)
+                    echo "Aborted." >&2
+                    return 1
+                    ;;
+            esac
+        else
+            echo "Error: say where to write the profile: --user (~/.config/sbx/profiles) or --local (./.sbx/profiles)." >&2
+            return 2
+        fi
+    fi
+
+    if [[ "$location" == "user" ]]; then
+        dir="$CONFIG_DIR/profiles/$type"
+    else
+        dir="./.sbx/profiles/$type"
+        # This check and the write further below are two separate
+        # syscalls: a symlink could in principle appear at "$guard"
+        # between them (TOCTOU). That window is bounded by the noclobber
+        # open on $final below, which still refuses to follow a symlink
+        # or overwrite an existing target even if one is swapped in here
+        # after this loop passes — so the guard is redundant-but-cheap
+        # defense in depth, not the only thing standing between a race
+        # and a write outside ./.sbx.
+        local guard
+        for guard in "./.sbx" "./.sbx/profiles" "./.sbx/profiles/$type"; do
+            if [[ -L "$guard" ]]; then
+                echo "Error: $guard is a symbolic link; sbx-profile will not write a project profile through it." >&2
+                return 1
+            fi
+        done
+    fi
+    # Never write into sbx's own global profile directory, even if a
+    # symlinked $CONFIG_DIR made $dir land there.
+    if [[ "$(realpath -m "$dir")" == "$(realpath -m "$GLOBAL_DIR")" || \
+          "$(realpath -m "$dir")" == "$(realpath -m "$GLOBAL_DIR")/"* ]]; then
+        echo "Error: $dir is sbx's global profile directory; sbx-profile never writes there." >&2
+        return 1
+    fi
+    final="$dir/$name.json"
+    if [[ -e "$final" ]]; then
+        echo "Error: $final already exists; sbx-profile never overwrites a profile. Remove it first to replace it." >&2
+        return 1
+    fi
+
+    if [[ -n "$from" ]]; then
+        src_type="$type"
+        src_name="$from"
+        if [[ "$from" == */* ]]; then
+            src_type="${from%%/*}"
+            src_name="${from#*/}"
+        fi
+        if [[ "$src_type" != "$type" ]]; then
+            echo "Error: --from must name a $type profile." >&2
+            return 2
+        fi
+        src=$(sbx_profile_resolve "$type" "$src_name" "$CONFIG_DIR" "$GLOBAL_DIR") || return 1
+        src_origin=$(sbx_profile_origin "$src" "$PWD" "$CONFIG_DIR" "$GLOBAL_DIR")
+        mapfile -t restricted < <(sbx_profile_restricted_fields "$src" 2>/dev/null)
+        # A project profile is untrusted input (it arrived with the repo);
+        # copying it into --user OR --local would launder whatever
+        # restricted fields it set into a profile that IS allowed to set
+        # them (a user profile always, a project one after the check
+        # below anyway rejects the same fields). Refuse regardless of the
+        # destination.
+        if [[ "$src_origin" == "project" && ${#restricted[@]} -gt 0 ]]; then
+            echo "Error: $(sbx_sanitize_message "$src") is a project profile and sets ${restricted[*]}, which a project profile may not set; sbx-profile will not copy it into a profile that would allow them." >&2
+            return 1
+        fi
+        if [[ "$location" == "project" && ${#restricted[@]} -gt 0 ]]; then
+            echo "Error: $(sbx_sanitize_message "$src") sets ${restricted[*]}, which a project profile may not set. Create it with --user instead." >&2
+            return 1
+        fi
+        if ! content=$(jq --indent 4 --arg d "$name (copied from $type/$(basename "$src" .json), $src_origin)" \
+                '.description = $d' "$src" 2>/dev/null); then
+            echo "Error: $(sbx_sanitize_message "$src") is not valid JSON." >&2
+            return 1
+        fi
+    else
+        content=$(sbx_profile_template "$type" "$name")
+    fi
+
+    # Validate before anything is written, from a temporary file outside
+    # the destination, as the kind of profile it is about to become.
+    tmp=$(mktemp)
+    printf '%s\n' "$content" > "$tmp"
+    while IFS=$'\t' read -r level msg; do
+        msg="${msg//"$tmp"/"$final"}"
+        case "$level" in
+            error)
+                errors=$((errors + 1))
+                messages+=("  error:   $(sbx_sanitize_message "$msg")")
+                ;;
+            warning)
+                messages+=("  warning: $(sbx_sanitize_message "$msg")")
+                ;;
+        esac
+    done < <(sbx_profile_check "$type" "$tmp" "$location")
+    rm -f "$tmp"
+    if [[ ${#messages[@]} -gt 0 ]]; then
+        printf '%s\n' "${messages[@]}"
+    fi
+    if [[ $errors -gt 0 ]]; then
+        echo "Error: not written: the new profile does not validate." >&2
+        return 1
+    fi
+
+    if ! mkdir -p "$dir" 2>/dev/null; then
+        echo "Error: cannot create $dir." >&2
+        return 1
+    fi
+    # noclobber: a file that appeared since the check above is still never
+    # overwritten.
+    if ! ( set -o noclobber; printf '%s\n' "$content" > "$final" ) 2>/dev/null; then
+        if [[ -e "$final" || -L "$final" ]]; then
+            echo "Error: $final already exists; sbx-profile never overwrites a profile. Remove it first to replace it." >&2
+        else
+            echo "Error: cannot write $final." >&2
+        fi
+        return 1
+    fi
+
+    shown="$final"
+    if [[ "$shown" == "$HOME/"* ]]; then
+        shown="~/${shown#"$HOME"/}"
+    fi
+    echo "Created $shown"
+    if [[ -n "$from" ]]; then
+        src_shown="$src"
+        if [[ "$src_shown" == "$HOME/"* ]]; then
+            src_shown="~/${src_shown#"$HOME"/}"
+        fi
+        echo "Copied from $(sbx_sanitize_message "$src_shown") ($src_origin)."
+    fi
+    field_guide "$type"
+    echo 'See "Constructing Profiles" in the README for every field.'
+    echo "Next: sbx --dry-run --$type $name"
+
+    while read -r relation loc other; do
+        case "$relation" in
+            shadows)
+                echo "Note: this profile hides the $loc profile $other."
+                ;;
+            shadowed-by)
+                echo "Warning: the $loc profile $other takes precedence; from this directory sbx will use that one, not this." >&2
+                ;;
+        esac
+    done < <(sbx_profile_shadowing "$type" "$name" "$location" "$CONFIG_DIR" "$GLOBAL_DIR")
+
+    if [[ "$location" == "project" ]]; then
+        echo "Note: sbx uses an untracked ./.sbx profile without asking; once git tracks it, launches from this directory will ask before using it."
+    fi
+    return 0
+}
+
+rc=0
+case "${1:-}" in
+    ls)
+        shift
+        if [[ $# -gt 0 ]]; then
+            usage >&2
+            exit 2
+        fi
+        sbx_profile_list "$CONFIG_DIR" "$GLOBAL_DIR"
+        ;;
+    check)
+        shift
+        cmd_check "$@" || rc=$?
+        exit "$rc"
+        ;;
+    new)
+        shift
+        cmd_new "$@" || rc=$?
+        exit "$rc"
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac

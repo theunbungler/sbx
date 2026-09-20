@@ -1,0 +1,9 @@
+{
+    "path": "@ROOT@/h/.local/state/sbx/sessions/proj/bin:@ROOT@/h/.snap/bin:/opt/tool/bin:/opt/snap/bin:/usr/bin:/usr/local/bin:/usr/bin:/bin",
+    "workdir": "/snap/ro",
+    "caps_keep": false,
+    "forked_stores": [
+  "@ROOT@/h/.local/state/sbx/forked/snapmounts/@ROOT_SLUG@-proj/_snap_state",
+  "@ROOT@/h/.local/state/sbx/forked/snapmounts/@ROOT_SLUG@-proj/_snap_state.json"
+]
+}

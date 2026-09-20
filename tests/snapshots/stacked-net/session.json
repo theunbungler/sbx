@@ -1,0 +1,14 @@
+{
+    "id": "proj",
+    "cwd": "@ROOT@/proj",
+    "pid": @PID@,
+    "fs_profiles": [
+  ""
+],
+    "net_profiles": [
+  "@REPO@/profiles/net/web.json",
+  "@ROOT@/h/.config/sbx/profiles/net/snapdb.json",
+  "@ROOT@/h/.config/sbx/profiles/net/snapwild.json"
+],
+    "cli_profile": null
+}

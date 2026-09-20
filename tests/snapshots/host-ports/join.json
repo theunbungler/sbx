@@ -1,0 +1,6 @@
+{
+    "path": "@ROOT@/h/.local/state/sbx/sessions/proj/bin:/usr/local/bin:/usr/bin:/bin",
+    "workdir": "@ROOT@/proj",
+    "caps_keep": false,
+    "forked_stores": []
+}

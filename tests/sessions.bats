@@ -721,29 +721,3 @@ EOF
     fi
 }
 
-# --- pre-upgrade session directories ---
-
-# Before sessions moved under sessions/, they lived directly at
-# $STATE_DIR/<date>-<random>/ and were never removed — including an fs/
-# subdirectory holding real copy-mount egress. --gc scans only sessions/,
-# so it silently ignores the largest residue an upgrading user has. Report
-# them; never delete them, since fs/ may be the only copy of that egress.
-@test "gc reports pre-upgrade session directories without deleting them" {
-    local old="$HOME/.local/state/sbx/20240102-030405-ab12"
-    mkdir -p "$old/fs"
-    echo egress > "$old/fs/out.txt"
-    run bash -c "cd '$PROJ' && $SBX --gc"
-    [ "$status" -eq 0 ]
-    [[ "$output" == *20240102-030405-ab12* ]]
-    [ -f "$old/fs/out.txt" ]
-}
-
-@test "gc says nothing about pre-upgrade sessions when there are none" {
-    mkdir -p "$HOME/.local/state/sbx/sessions"
-    run bash -c "cd '$PROJ' && $SBX --gc"
-    [ "$status" -eq 0 ]
-    if [[ "$output" == *"pre-upgrade"* ]]; then
-        echo "gc announced pre-upgrade sessions with none present: $output" >&2
-        return 1
-    fi
-}

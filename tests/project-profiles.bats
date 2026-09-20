@@ -59,3 +59,46 @@ EOF
     [ "$status" -eq 0 ]
     [ -f "$HOSTDIR/untracked.txt" ]
 }
+
+# A profile-authored warning echoes profile text verbatim (here the source
+# of a mount that is not present on this host — see lib/resolve.sh), and
+# the launch directory and everything in it is untrusted. That text must be
+# bounded in length before it reaches the terminal.
+#
+# Only the length cap is exercised here: every remaining warning either
+# echoes nothing profile-authored or echoes a value that profile-check has
+# already constrained, so no warning can carry a control character. The
+# stripping itself is covered directly in tests/render.bats.
+@test "profile-authored warning text is length-capped" {
+    local long
+    long=$(printf 'x%.0s' {1..600})
+    jq -n --arg gone "/nonexistent/$long" --arg src "$HOSTDIR" \
+        '{description: "test", mounts: [{source: $src, dest: "/out", perm: "rw"},
+                                        {source: $gone, dest: "/gone", perm: "ro"}]}' \
+        > "$PROJ/.sbx/profiles/fs/tst.json"
+    run bash -c "cd '$PROJ' && $SBX --fs tst -- /bin/true < /dev/null 2>&1"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Warning:"* ]]
+    [[ "$output" == *"..."* ]]
+    if [[ "$output" == *"$long"* ]]; then return 1; fi
+}
+
+# The trust prompt is the one control between a cloned repository and an
+# arbitrary mount set. Nothing profile-authored may be echoed before it;
+# this asserts the ordering holds with the resolve-step plan driving both
+# the prompt and the warnings.
+@test "a profile warning prints after the trust prompt, not before it" {
+    git -C "$PROJ" init -q
+    cat > "$PROJ/.sbx/profiles/fs/tst.json" <<EOF
+{"description":"test","mounts":[{"source":"$HOSTDIR","dest":"/out","perm":"rw"},{"source":"/nonexistent/gone","dest":"/gone","perm":"ro"}]}
+EOF
+    git -C "$PROJ" add -f .sbx/profiles/fs/tst.json
+    run bash -c "cd '$PROJ' && printf 'y\n' | script -qec \"$SBX --fs tst -- /bin/true\" /dev/null 2>&1"
+    [ "$status" -eq 0 ]
+    local prompt_line warn_line
+    prompt_line=$(grep -n "This launch would use a profile tracked" <<< "$output" | head -n1 | cut -d: -f1)
+    warn_line=$(grep -n "mount source not present" <<< "$output" | head -n1 | cut -d: -f1)
+    [ -n "$prompt_line" ]
+    [ -n "$warn_line" ]
+    [ "$warn_line" -gt "$prompt_line" ]
+}

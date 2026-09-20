@@ -1,6 +1,12 @@
 # sbx (sandbox-gemini)
 
-`sbx` is a command-line tool designed to manage isolated sandboxed environments. It allows users to spin up, manage, and join sessions with highly configurable environments using modular profiles for CLI, Filesystem, and Networking.
+`sbx` is a command-line tool designed to manage isolated sandboxed environments. It lets users to spin up, manage, and join sessions with highly configurable environments using modular profiles for CLI, Filesystem, and Networking.
+
+## Motivation
+
+The motivating intent behind sbx is to be a sandboxed environment for an AI coding agent harness that composes only open-source utilities.  Other than bash scripting, no additional code runs with sbx.  sbx will give agents  access to only what you want them to access, and will limit the damage if anything goes wrong.  The main enforcement mechanisms behind this are:
+- Bubblewrap for filesystem isolation
+- nftables, dnsmasq, and pasta for network isolation
 
 ## Features
 
@@ -8,7 +14,8 @@
   - **CLI Profiles**: Set environment variables, paths, and mounts (e.g., `dev`, `gemini`, `pi`).
   - **Filesystem (FS) Profiles**: Define mounts and filesystem-level configurations (e.g., `chrome`, `sandbox`).
   - **Network (NET) Profiles**: Control network access and connectivity (e.g., `web`, `test_net`).
-- **Session Management**: List active sessions, and open additional shells inside a running one.
+- **Composable FS and NET profiles**: Each is designed to enable a minimal environment for something.  Bring as many as you like into the sandbox. 
+- **Flexible Session Management**: List active sessions, and open additional shells inside a running one.
 - **GUI Support**: Enable isolated graphical interfaces using `xpra`.
 - **Flexible Configuration**: Profiles can be stored locally, in your home directory, or in system-wide paths.
 
@@ -18,15 +25,12 @@ sbx assumes the code running inside a sandbox and the project directory it
 was launched from are both adversarial. It is built to protect the host user
 account from them.
 
-What that buys you, in a session without `"caps": "keep"`:
+In sessions (without `"caps": "keep"`), this means:
 
-- **`ro` mounts are read-only.** The payload holds no capabilities, so it
-  cannot remount a bind read-write.
-- **`--join` gets the same containment as the payload.** The drop is applied
-  once, above the in-sandbox tmux server, so everything the session ever
-  forks — the payload, a join, and any window or pane opened from inside one
-  — starts with an empty bounding set. `--join` also takes no input from the
-  sandbox: its command, `PATH` and working directory are built on the host.
+- **`ro` mounts are read-only.** Capabilities are limited in the sandbox, so 
+  code can't modify mounts.
+- **`--join` gets the same containment as the payload.** Once they start, sessions 
+  can't be modified, including by sessiosn that join them.
 - **The egress allow-list is not removable.** `nft` and `dnsmasq` run outside
   the sandbox's PID and mount namespaces; nothing inside can flush the
   ruleset or signal the resolver.
@@ -35,10 +39,13 @@ What that buys you, in a session without `"caps": "keep"`:
 - **sbx's own state and config are masked**, so a sandbox cannot reach
   sibling sessions, persistent cli stores, or the profiles that configure the
   next launch.
-- **Project-supplied profiles require confirmation**, and may never request
-  `caps`, `userns`, or `docker_api`.
+- **Project-supplied profiles that git tracks require confirmation.** A
+  profile under `./.sbx/profiles` that the repository tracks is shown and
+  must be approved before use (or trusted with `SBX_TRUST_PROJECT_PROFILES=1`).
+  No project profile, tracked or not, may request `caps`, `userns`,
+  `docker_api` or `host_ports`.
 
-### What it does not protect against
+### Caveats and Explicit Non-goals
 
 - **Sessions with `"caps": "keep"`** — including `fs/podman` and
   `fs/podman-full`. Capabilities are required for the nested user namespaces
@@ -49,10 +56,40 @@ What that buys you, in a session without `"caps": "keep"`:
 - **Wildcard `allow` entries.** `*.anthropic.com` admits any IP an attacker
   can publish under that suffix.
 - **DNS as an exfiltration channel.** Query labels for allowed domains are
-  forwarded upstream.
+  forwarded upstream.  If you don't want to leak data, don't put it in 
+  the sandbox.
 - **`"ports": ["*"]`** in `net/anthropic.json` and `net/gemini.json` — any
   allowed IP is reachable on any port. Narrowing to 443 would break `git push`
   over SSH to `github.com`.
+- **Untracked project profiles.** A profile under `./.sbx/profiles` that git
+  does not track is treated as your own scratch config and used without a
+  prompt. If a session mounts the launch directory read-write (as
+  `fs/sandbox` does), code inside it can write such a profile, and the next
+  launch from that directory will use it without asking. `--dry-run` shows
+  each profile's origin, so a `(project)` profile you did not write is
+  visible before you launch.
+- **The launch directory's git configuration.** sbx runs `git` in the launch
+  directory to check whether a project profile is tracked, so that
+  repository's `.git/config` applies — including settings such as
+  `core.fsmonitor` that run a command on the host. Launch only from
+  directories whose `.git/config` you trust; like an untracked profile, a
+  session with the launch directory mounted read-write can change it.
+
+## Checking your setup
+
+Run `./sbx --doctor` first. It groups dependencies by what needs them —
+`core` (every session), `net` (`--net`), `gui` (`--gui`) and `podman`
+(`userns`, `caps` or `docker_api` profiles) — and prints one install
+command for everything missing, for Arch, Debian/Ubuntu or Fedora
+families.
+
+It also checks that bwrap can actually create an unprivileged user
+namespace, which is the setup failure that is hardest to recognise from
+the error alone. On Ubuntu 24.04 and later this is blocked by AppArmor by
+default; the doctor prints the profile that allows it.
+
+A launch runs the same checks for just the groups it needs, and stops
+before building a session.
 
 ## Usage
 
@@ -66,6 +103,8 @@ To see all available commands and options, run:
 
 | Command | Description |
 |---------|-------------|
+| `--doctor [--json]` | Check that required tools are installed and that unprivileged user namespaces work. Prints the install command for your distro. Exits non-zero only if something every session needs is missing. |
+| `--dry-run [--json]` | Show everything this launch would do — profiles, mounts, environment, network grants, every host location it would write, missing dependencies, confirmations, warnings and errors — without creating, prompting or launching anything. Exits 1 if the real launch would stop. |
 | `--list-profiles` | Show all available CLI, FS, and NET profiles. |
 | `--list-sessions` | List all currently active sandbox sessions. |
 | `--join <session>` | Open a new shell inside a running sandbox session, with its own terminal. Append `-- <cmd>` to run a command instead. |
@@ -93,11 +132,15 @@ Profiles are JSON files organized into three categories — **CLI**, **Filesyste
 
 ### Profile Locations
 
-`sbx` searches for profiles in the following directories (in order):
+Profiles are loaded by **name only**, from these three locations (in order):
 
 1. `./.sbx/profiles/` (Local to the current directory)
 2. `$HOME/.config/sbx/profiles/` (User-specific configuration)
 3. Global profiles in the profiles directory with sbx
+
+The launch directory itself is never searched — a file sitting next to where you run `sbx` is not a profile just because it has the right name, and `--fs`/`--net`/`--cli` do not accept a file path, only `<name>` or `<type>/<name>`.
+
+`sbx-profile ls` shows which one wins when the same name exists in several places.
 
 
 ### CLI Profiles (`profiles/cli/<name>.json`)
@@ -147,7 +190,7 @@ CLI profiles configure the shell environment inside the sandbox. They control en
 
 ### Filesystem (FS) Profiles (`profiles/fs/<name>.json`)
 
-FS profiles define the sandbox's filesystem layout — which directories are mounted and FS-level environment variables. The starting directory is not a profile field; pass `--wd <path>` on the command line.
+FS profiles define the sandbox's filesystem layout — which directories are mounted and FS-level environment variables. Pass `--wd <path>` on the command line to set the initial working directory.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
@@ -260,7 +303,7 @@ Profiles are applied via the `--cli`, `--fs`, and `--net` flags. Multiple `--fs`
 
 When multiple profiles set the same environment variable, the **last one wins**.
 
-The starting directory is deliberately not part of this: a per-profile `workingDirectory` resolved last-one-wins, so `--fs a --fs b` and `--fs b --fs a` mounted the same tree but started the session in different places. Use `--wd` instead, which says once, explicitly, where the session begins:
+The starting directory is deliberately not a profile field: it would resolve last-one-wins, so `--fs a --fs b` and `--fs b --fs a` would mount the same tree but start the session in different places. `--wd` says once, explicitly, where the session begins:
 
 ```bash
 ./sbx --fs sandbox --wd /workspace
@@ -268,14 +311,74 @@ The starting directory is deliberately not part of this: a per-profile `workingD
 
 Without `--wd`, bwrap picks the start directory itself: the directory you launched from if that path also exists inside the sandbox, otherwise `$HOME`, otherwise `/`. Since most profiles do not mount the launch directory at its host path, this usually lands in `$HOME` — pass `--wd` whenever the session should begin somewhere specific.
 
-A profile that still carries `workingDirectory` is not honored; sbx warns and names the `--wd` to pass instead.
-
 ### Creating Custom Profiles
 
-1. Pick a profile type (`cli`, `fs`, or `net`).
-2. Choose a location (see [Profile Locations](#profile-locations) above). Project-local profiles (`.sbx/profiles/`) are useful for team-shared config, while user-level (`~/.config/sbx/profiles/`) ones are for personal preferences.
-3. Create a JSON file at `<location>/<type>/<name>.json`.
-4. Verify it appears with `./sbx --list-profiles`.
+Use `sbx-profile`:
+
+    ./sbx-profile new net myapi --user              # ~/.config/sbx/profiles/net/myapi.json
+    ./sbx-profile new fs work --local               # ./.sbx/profiles/fs/work.json
+    ./sbx-profile new net web2 --user --from web    # start from an existing profile
+    ./sbx-profile check                             # validate every profile you can see
+    ./sbx-profile ls                                # list them, marking shadowed ones
+
+`check` is schema-only: it validates a profile's fields, not what a launch would actually do with it. Facts like an absent mount source or whether a project profile will prompt only show up in `sbx --dry-run`.
+
+`new` writes a minimal profile that grants nothing (or a copy of `--from`),
+validates it before writing, never overwrites an existing file, and never
+writes the global directory. Without `--user` or `--local` it asks where to
+write when run from a terminal, and refuses otherwise. `--local --from` is
+refused for a profile that sets `caps`, `userns`, `docker_api` or
+`host_ports`, which a project profile may not set. It then prints a short
+guide to the type's fields and the `sbx --dry-run` command to preview it.
+
+A profile under `./.sbx` that git does not track is used without a prompt;
+once git tracks it, launches ask before using it (see Threat model).
+
+### Profile validation
+
+Every profile a launch uses is checked before anything is built, and every
+problem is reported at once:
+
+    ~/.config/sbx/profiles/net/api.json: .ports[1]: expected a port 1-65535 or "*", got "https"
+
+**Errors stop the launch.** Invalid JSON; a field that is not in the schema
+for the profile's type (there is no comment syntax — a misspelt field would
+otherwise be silently ignored); a wrong type or value (`perm`, `caps`,
+`userns`, `docker_api`, `ports`, `host_ports`, `allow`, `passthrough`
+names, `env` values); and, in a project profile, `caps`, `userns`,
+`docker_api` or `host_ports`. This checks whether the field is *present*,
+not what it's set to — a project profile with `"docker_api": false` is
+rejected the same as `"docker_api": true`; if you don't want to grant it,
+omit the field rather than setting it to `false`. An `allow` entry that
+starts with a digit is read as an address, so a hostname like
+`1password.com` is rejected rather than silently treated as a malformed
+CIDR.
+
+**Warnings are printed and the launch continues:** a `dns` value that is
+not a bare IPv4 address (1.1.1.1 is used), a mount whose source does not
+exist on this host (the mount is skipped), and a `*.` wildcard in `allow`.
+
+### Previewing a launch
+
+`--dry-run` takes the same flags as a launch and prints what that launch
+would do, without doing any of it:
+
+    ./sbx --dry-run --cli claude --fs sandbox --net anthropic
+
+It shows the security settings, every mount (with forked stores marked
+*will seed* or *exists*), the environment with which profile won each
+variable, the network grants, and a **Writes** section listing every host
+location the session would write: forked stores, record working copies and
+change archives, read-write binds, podman stores and the session directory.
+It runs the dependency check in report-only form, lists project profiles
+that would ask for confirmation (without asking), and ends with whether the
+launch would proceed. `--dry-run --json` prints the same information as one
+JSON document.
+
+Passthrough variables are listed by name, never by value. The preview
+describes what is mounted, not what the mounted trees contain. Env values
+are shown as the profile wrote them, before `$VAR` expansion, so secrets
+pulled from the host environment are not printed.
 
 ## Forked and Record Mounts
 
