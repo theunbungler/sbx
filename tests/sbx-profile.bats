@@ -91,7 +91,7 @@ teardown() {
 }
 
 @test "check sanitizes profile-authored text" {
-    printf '{"workingDirectory":"/x\\u001b[2Kbad"}\n' > "$HOME/.config/sbx/profiles/fs/esc.json"
+    printf '{"x\\u001b[2Kbad": 1}\n' > "$HOME/.config/sbx/profiles/fs/esc.json"
     run "$SBXP" check fs/esc
     if [[ "$output" == *$'\033'* ]]; then return 1; fi
     [[ "$output" == *"[2Kbad"* ]]

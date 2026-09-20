@@ -46,11 +46,6 @@ check() {   # <type> <origin> <json>
     [[ "$output" == *"$F: .mounts[2]: expected an object, got \"x\""* ]]
 }
 
-@test "perm copy explains the split" {
-    check cli user '{"mounts":[{"source":"/a","dest":"/b","perm":"copy"}]}'
-    [[ "$output" == *".mounts[0].perm: \"copy\" has been split: use \"forked\""*"\"record\""* ]]
-}
-
 @test "field types and fixed values" {
     check fs user '{"description":3,"env":{"A":{"x":1}},"caps":"drop","userns":"yes","docker_api":"true","passthrough":["OK",2,"BAD-NAME"]}'
     [[ "$output" == *".description: expected a string, got 3"* ]]
@@ -76,9 +71,7 @@ check() {   # <type> <origin> <json>
     if [[ "$output" == *".allow[0]"* ]]; then return 1; fi
 }
 
-@test "warnings: workingDirectory, non-IPv4 dns, wildcard suffix" {
-    check fs user '{"workingDirectory":"/src"}'
-    [ "$output" = "warning"$'\t'"$F: .workingDirectory: no longer honored; pass --wd /src instead" ]
+@test "warnings: non-IPv4 dns, wildcard suffix" {
     check net user '{"dns":"sdns://abc","allow":["*.example.com"]}'
     [[ "$output" == *"warning"$'\t'"$F: .dns: not a bare IPv4 address, so 1.1.1.1 is used instead"* ]]
     [[ "$output" == *"warning"$'\t'"$F: .allow[0]: *.example.com admits any address published under that suffix (see README, Threat model)"* ]]

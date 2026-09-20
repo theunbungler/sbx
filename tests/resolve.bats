@@ -227,9 +227,9 @@ r() { jq -r "$1" <<< "$PLAN"; }
     [ "$(q .errors)" = '[]' ]
 }
 
-@test "workingDirectory surfaces as a warning" {
-    local fs
-    fs=$(user fs w '{"workingDirectory":"/src"}')
-    resolve --fs "$fs"
-    [[ "$(r '.warnings[0]')" == *".workingDirectory: no longer honored; pass --wd /src instead"* ]]
+@test "a profile-check warning surfaces in the plan" {
+    local net
+    net=$(user net w '{"dns":"sdns://abc"}')
+    resolve --net "$net"
+    [[ "$(r '.warnings[0]')" == *".dns: not a bare IPv4 address, so 1.1.1.1 is used instead"* ]]
 }

@@ -57,39 +57,10 @@ sbx_keep_changes() {
     printf '%s\n' "$keep"
 }
 
-# Creates the state directory and finishes any interrupted one-time store
-# migration. Every path runs this before touching state — except --dry-run,
-# which must create nothing.
+# Creates the state directory. Every path runs this before touching state —
+# except --dry-run, which must create nothing.
 sbx_state_init() {
     mkdir -p "$STATE_DIR"
-
-    # One-time relocation of the pre-`forked` cli store. The old path is
-    # $STATE_DIR/profiles/cli/<profile>/<slug>/<mount-id>, which is the same
-    # shape the forked store uses, so this is a rename rather than a conversion
-    # — the contents are already a valid sandbox-owned tree. ("profiles/" was
-    # always a poor name for state; nothing else lives under it.)
-    #
-    # The guard is per-entry, not "does forked/ exist": forked/ is created by
-    # ordinary use (or by moving the very first entry below), so an "absent"
-    # check on it can only ever fire once and then never again. That turned an
-    # interrupted migration into a permanent one — stores after the first would
-    # be stranded under profiles/cli forever. Testing each destination
-    # individually makes this resumable: an interrupt just means the next
-    # launch finishes what the last one started.
-    if [[ -d "$STATE_DIR/profiles/cli" ]]; then
-        local old_store new_store
-        for old_store in "$STATE_DIR/profiles/cli"/*; do
-            [[ -d "$old_store" ]] || continue
-            new_store="$STATE_DIR/forked/$(basename "$old_store")"
-            if [[ -e "$new_store" ]]; then
-                echo "Warning: both $old_store and $new_store exist; leaving the old store in place — reconcile manually." >&2
-                continue
-            fi
-            mkdir -p "$STATE_DIR/forked"
-            mv "$old_store" "$new_store"
-        done
-        rmdir "$STATE_DIR/profiles/cli" "$STATE_DIR/profiles" 2>/dev/null || true
-    fi
 }
 
 # --dry-run applies only to a launch. Each command that acts on state calls
@@ -337,28 +308,6 @@ while [[ $# -gt 0 ]]; do
                 echo "$forked_report"
             fi
 
-            # Sessions predating this layout lived at $STATE_DIR/<date>-<rand>/
-            # rather than under sessions/, and were never removed at all — so
-            # an upgrading user's largest residue is precisely the one the
-            # sweeps above cannot see. Reported, never deleted: those
-            # directories hold an fs/ subdirectory of real copy-mount egress,
-            # and for an old session that is the only copy there has ever
-            # been. Matched on the exact old name shape so nothing else that
-            # may sit under $STATE_DIR is ever named as a session.
-            old_report=""
-            for odir in "$STATE_DIR"/*; do
-                [[ -d "$odir" ]] || continue
-                oname=$(basename "$odir")
-                [[ "$oname" =~ ^[0-9]{8}-[0-9]{6}-[0-9a-f]{4}$ ]] || continue
-                old_report+="  $(du -sh "$odir" 2>/dev/null | cut -f1)  $odir"$'\n'
-            done
-            if [[ -n "$old_report" ]]; then
-                echo "Pre-upgrade session directories (not removed):"
-                printf '%s' "$old_report"
-                echo "  These predate the sessions/ layout. Their fs/ subdirectory holds the"
-                echo "  only copy of that session's copy-mount egress; delete them by hand"
-                echo "  once you have taken what you want from it."
-            fi
             exit 0
             ;;
         --reseed)

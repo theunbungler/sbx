@@ -1,6 +1,12 @@
 # sbx (sandbox-gemini)
 
-`sbx` is a command-line tool designed to manage isolated sandboxed environments. It allows users to spin up, manage, and join sessions with highly configurable environments using modular profiles for CLI, Filesystem, and Networking.
+`sbx` is a command-line tool designed to manage isolated sandboxed environments. It lets users to spin up, manage, and join sessions with highly configurable environments using modular profiles for CLI, Filesystem, and Networking.
+
+## Motivation
+
+The motivating intent behind sbx is to be a sandboxed environment for an AI coding agent harness that composes only open-source utilities.  Other than bash scripting, no additional code runs with sbx.  sbx will give agents  access to only what you want them to access, and will limit the damage if anything goes wrong.  The main enforcement mechanisms behind this are:
+- Bubblewrap for filesystem isolation
+- nftables, dnsmasq, and pasta for network isolation
 
 ## Features
 
@@ -8,7 +14,8 @@
   - **CLI Profiles**: Set environment variables, paths, and mounts (e.g., `dev`, `gemini`, `pi`).
   - **Filesystem (FS) Profiles**: Define mounts and filesystem-level configurations (e.g., `chrome`, `sandbox`).
   - **Network (NET) Profiles**: Control network access and connectivity (e.g., `web`, `test_net`).
-- **Session Management**: List active sessions, and open additional shells inside a running one.
+- **Composable FS and NET profiles**: Each is designed to enable a minimal environment for something.  Bring as many as you like into the sandbox. 
+- **Flexible Session Management**: List active sessions, and open additional shells inside a running one.
 - **GUI Support**: Enable isolated graphical interfaces using `xpra`.
 - **Flexible Configuration**: Profiles can be stored locally, in your home directory, or in system-wide paths.
 
@@ -18,15 +25,12 @@ sbx assumes the code running inside a sandbox and the project directory it
 was launched from are both adversarial. It is built to protect the host user
 account from them.
 
-What that buys you, in a session without `"caps": "keep"`:
+In sessions (without `"caps": "keep"`), this means:
 
-- **`ro` mounts are read-only.** The payload holds no capabilities, so it
-  cannot remount a bind read-write.
-- **`--join` gets the same containment as the payload.** The drop is applied
-  once, above the in-sandbox tmux server, so everything the session ever
-  forks — the payload, a join, and any window or pane opened from inside one
-  — starts with an empty bounding set. `--join` also takes no input from the
-  sandbox: its command, `PATH` and working directory are built on the host.
+- **`ro` mounts are read-only.** Capabilities are limited in the sandbox, so 
+  code can't modify mounts.
+- **`--join` gets the same containment as the payload.** Once they start, sessions 
+  can't be modified, including by sessiosn that join them.
 - **The egress allow-list is not removable.** `nft` and `dnsmasq` run outside
   the sandbox's PID and mount namespaces; nothing inside can flush the
   ruleset or signal the resolver.
@@ -41,7 +45,7 @@ What that buys you, in a session without `"caps": "keep"`:
   No project profile, tracked or not, may request `caps`, `userns`,
   `docker_api` or `host_ports`.
 
-### What it does not protect against
+### Caveats and Explicit Non-goals
 
 - **Sessions with `"caps": "keep"`** — including `fs/podman` and
   `fs/podman-full`. Capabilities are required for the nested user namespaces
@@ -52,7 +56,8 @@ What that buys you, in a session without `"caps": "keep"`:
 - **Wildcard `allow` entries.** `*.anthropic.com` admits any IP an attacker
   can publish under that suffix.
 - **DNS as an exfiltration channel.** Query labels for allowed domains are
-  forwarded upstream.
+  forwarded upstream.  If you don't want to leak data, don't put it in 
+  the sandbox.
 - **`"ports": ["*"]`** in `net/anthropic.json` and `net/gemini.json` — any
   allowed IP is reachable on any port. Narrowing to 443 would break `git push`
   over SSH to `github.com`.
@@ -185,7 +190,7 @@ CLI profiles configure the shell environment inside the sandbox. They control en
 
 ### Filesystem (FS) Profiles (`profiles/fs/<name>.json`)
 
-FS profiles define the sandbox's filesystem layout — which directories are mounted and FS-level environment variables. The starting directory is not a profile field; pass `--wd <path>` on the command line.
+FS profiles define the sandbox's filesystem layout — which directories are mounted and FS-level environment variables. Pass `--wd <path>` on the command line to set the initial working directory.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
@@ -298,15 +303,13 @@ Profiles are applied via the `--cli`, `--fs`, and `--net` flags. Multiple `--fs`
 
 When multiple profiles set the same environment variable, the **last one wins**.
 
-The starting directory is deliberately not part of this: a per-profile `workingDirectory` resolved last-one-wins, so `--fs a --fs b` and `--fs b --fs a` mounted the same tree but started the session in different places. Use `--wd` instead, which says once, explicitly, where the session begins:
+The starting directory is deliberately not a profile field: it would resolve last-one-wins, so `--fs a --fs b` and `--fs b --fs a` would mount the same tree but start the session in different places. `--wd` says once, explicitly, where the session begins:
 
 ```bash
 ./sbx --fs sandbox --wd /workspace
 ```
 
 Without `--wd`, bwrap picks the start directory itself: the directory you launched from if that path also exists inside the sandbox, otherwise `$HOME`, otherwise `/`. Since most profiles do not mount the launch directory at its host path, this usually lands in `$HOME` — pass `--wd` whenever the session should begin somewhere specific.
-
-A profile that still carries `workingDirectory` is not honored; sbx warns and names the `--wd` to pass instead.
 
 ### Creating Custom Profiles
 
@@ -351,10 +354,9 @@ starts with a digit is read as an address, so a hostname like
 `1password.com` is rejected rather than silently treated as a malformed
 CIDR.
 
-**Warnings are printed and the launch continues:** a `workingDirectory`
-field, a `dns` value that is not a bare IPv4 address (1.1.1.1 is used), a
-mount whose source does not exist on this host (the mount is skipped), and
-a `*.` wildcard in `allow`.
+**Warnings are printed and the launch continues:** a `dns` value that is
+not a bare IPv4 address (1.1.1.1 is used), a mount whose source does not
+exist on this host (the mount is skipped), and a `*.` wildcard in `allow`.
 
 ### Previewing a launch
 

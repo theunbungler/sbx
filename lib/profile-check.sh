@@ -13,14 +13,13 @@
 # shellcheck disable=SC2016  # jq program: $vars are jq's, not the shell's
 SBX_PROFILE_CHECK_JQ='
 def known:
-  { cli: ["description","env","path","mounts","passthrough","caps","userns","docker_api","workingDirectory"],
-    fs:  ["description","mounts","env","passthrough","caps","userns","docker_api","workingDirectory"],
+  { cli: ["description","env","path","mounts","passthrough","caps","userns","docker_api"],
+    fs:  ["description","mounts","env","passthrough","caps","userns","docker_api"],
     net: ["description","dns","allow","ports","host_ports"] };
 # Same list as sbx_profile_restricted_fields in lib/profiles.sh — keep the two in step.
 def restricted: ["caps","userns","docker_api","host_ports"];
 def err($p; $m): {level: "error", path: $p, message: $m};
 def warn($p; $m): {level: "warning", path: $p, message: $m};
-def show: if type == "string" then . else tojson end;
 def is_port: type == "number" and . == floor and . >= 1 and . <= 65535;
 def is_ipv4: test("^[0-9]{1,3}(\\.[0-9]{1,3}){3}$") and (split(".") | all(tonumber <= 255));
 def is_cidr:
@@ -82,7 +81,6 @@ else
                           elif ($m[$f] | has_ctrl) then err(".mounts[\($i)].\($f)"; "expected no control characters")
                           else empty end ),
                      ( if ($m | has("perm")) | not then err(".mounts[\($i)].perm"; "required")
-                       elif $m.perm == "copy" then err(".mounts[\($i)].perm"; "\"copy\" has been split: use \"forked\" if the sandbox owns the data (seeded from the host once), \"record\" if the host owns it (reseeded every launch, changes archived)")
                        elif ($m.perm | IN("ro", "rw", "dev", "forked", "record")) | not then err(".mounts[\($i)].perm"; "expected one of ro, rw, dev, forked, record, got \($m.perm | tojson)")
                        else empty end ) )
                  end
@@ -92,8 +90,6 @@ else
       ( if has("caps") and .caps != "keep" then err(".caps"; "expected \"keep\", got \(.caps | tojson)") else empty end ),
       ( if has("userns") and .userns != "full" then err(".userns"; "expected \"full\", got \(.userns | tojson)") else empty end ),
       ( if has("docker_api") and (.docker_api | type) != "boolean" then err(".docker_api"; "expected true or false, got \(.docker_api | tojson)") else empty end ),
-
-      ( if has("workingDirectory") then warn(".workingDirectory"; "no longer honored; pass --wd \(.workingDirectory | show) instead") else empty end ),
 
       ( if has("dns") then
           if (.dns | type) != "string" then err(".dns"; "expected a string, got \(.dns | tojson)")
