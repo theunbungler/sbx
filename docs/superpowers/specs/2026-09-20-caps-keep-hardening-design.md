@@ -61,6 +61,19 @@ up any podman functionality**, including container-to-container DNS.
 6. **A subtlety to keep in the code comments:** `nft flush ruleset` from B
    *returns success* — it flushes B's own empty network namespace. Egress stays
    filtered afterwards. A test must assert the filtering, not the exit status.
+7. **Same addresses as a normal session (spike of 2026-09-21).** From B,
+   `127.0.0.1:PORT` reaches a granted host port (TCP and UDP) and
+   `127.0.0.2:53` reaches the session's dnsmasq (UDP and TCP), exactly as from
+   A. Not-granted host ports, a private listener on A's loopback, and
+   non-allowed egress all stayed unreachable, including after B added its own
+   DNAT rules, rerouted `127.0.0.0/8` out of the veth, and flushed its
+   ruleset. A's input drop counter confirmed that A's rules, not an absent
+   listener, did the refusing.
+8. **A DNAT onto A's loopback cannot work.** pasta binds its host-port splice
+   listener to the `lo` device (`*%lo:PORT`, `SO_BINDTODEVICE`), so a packet
+   arriving on `veth-a` never matches it, whatever address it is translated
+   to: the connection is refused even though the DNAT and input rules fire.
+   pasta cannot bind on `veth-a` instead, because it binds before A exists.
 
 ## Design
 
@@ -78,7 +91,9 @@ Two mechanisms, deliberately separable:
 | 2 | Payload in a network namespace B owns, veth to A | touches DNS and host ports |
 
 **Both are implemented unconditionally in libraries, with their own tests, and
-engaged from `sbx` behind one boolean.** That boolean is `CAPS_KEEP` for now.
+engaged from `sbx` behind one boolean.** The cost of a boolean is that engaged
+and ordinary sessions can behave differently, so the design carries a hard
+requirement against that — see "Same addresses in both modes". That boolean is `CAPS_KEEP` for now.
 Sessions that drop capabilities keep today's path, because their guarantees
 already hold: the payload has an empty bounding set and can neither remount a
 `ro` bind nor reach nft. Applying the mechanisms there would buy defence in
@@ -125,21 +140,49 @@ When engaged and a network namespace exists:
 - `ip_forward` on in A. A `postrouting masquerade` rule is emitted for the veth
   subnet; note in a comment that pasta appears to translate forwarded traffic
   anyway, so this is belt-and-braces (the spike worked with and without it).
-- **DNS** moves from `SBX_DNS_ADDR=127.0.0.2` to A's veth address for engaged
-  sessions: dnsmasq binds it, and the sandbox's `resolv.conf` names it. The
-  `--nftset` population is unchanged, because dnsmasq is still the resolver
-  every lookup goes through.
+- **DNS**: dnsmasq additionally listens on A's veth address. `resolv.conf`
+  keeps naming `127.0.0.2`; B's convenience rules (below) carry the query
+  across. The `--nftset` population is unchanged, because dnsmasq is still the
+  resolver every lookup goes through.
 - **The `forward` chain already exists** in the ruleset (it was added for the
   netavark bridge under `userns: full`) and is what filters container and
   payload egress. The `oif "lo" accept` rule stays for A's own traffic.
-- **Host ports** (`--host-port`, and profile `host_ports`) are the one feature
-  that does not work unchanged: pasta splices host services onto A's loopback,
-  which B cannot reach. Two steps, in this order:
-  1. Refuse the combination with a clear error, so no session silently loses
-     host-port access.
-  2. Then implement it: `route_localnet` on `veth-a` plus a `dnat` rule per
-     granted port, and lift the refusal. This is the riskiest piece of the
-     design; it deliberately opens A's loopback to B for named ports only.
+- **Host ports** (`--host-port`, and profile `host_ports`): pasta splices each
+  granted host port onto A's loopback, bound to the `lo` device, which B cannot
+  reach. A runs **one `socat` relay per granted port and protocol**, listening
+  on A's veth address and bound to `veth-a` (`so-bindtodevice`, which is what
+  lets it share the port number with pasta's listener), forwarding to
+  `127.0.0.1:PORT`. The relay's outbound leg is A's own loopback traffic, which
+  the existing `oif "lo" accept` already covers.
+- **A new `input` chain in A**, matching only `iif "veth-a"`: accept the
+  granted host ports and DNS on A's veth address, then drop. This is the
+  security boundary for what B may reach on A itself. A does NOT set
+  `route_localnet`, so nothing B sends can be delivered to A's loopback.
+- **B's convenience rules**, installed in B's network namespace before the
+  payload starts: `nat output` DNATs `127.0.0.1:PORT` (each granted port and
+  protocol) and `127.0.0.2:53` to A's veth address; `route_localnet` on
+  `veth-b`; `nat postrouting` masquerades loopback-sourced packets leaving
+  `veth-b`. The payload holds capabilities in B and can delete these. That
+  is acceptable by construction: they grant nothing A does not already allow
+  at its veth address, so deleting them only costs the payload its own
+  convenient addresses.
+
+### Same addresses in both modes
+
+A requirement, not an aspiration: **a payload reaches host ports and DNS at
+the same addresses whether or not the session is hardened.** A config that
+says `localhost:5432` must not work under `fs/sandbox` and fail under
+`fs/podman-full`. The parity test (see Testing) runs one set of checks
+against both modes.
+
+What still differs, deliberately and documented:
+
+- Interface names and addresses inside the session (`veth-b` on a private
+  `/30`, rather than pasta's interface).
+- The `veth` module must be loadable, and `socat` installed when host ports
+  are granted. After a kernel upgrade without a reboot, only hardened
+  sessions fail.
+- `--dry-run` says the session is hardened.
 
 ### Launch assembly
 
@@ -163,6 +206,9 @@ and no new state lands on disk.
 
 ### Surfaces that change
 
+- **`socat` joins the dependency table** in the `podman` group (package
+  `socat` on all three families). The launch preflight requires it only for a
+  hardened session that grants host ports.
 - **`--doctor` and the launch preflight** gain a check in the `podman` group:
   `veth` must be loadable. This is not hypothetical — a kernel upgrade without a
   reboot leaves the running kernel's module tree empty, and `ip link add … type
@@ -191,6 +237,16 @@ and no new state lands on disk.
   file unchanged afterwards; A's ruleset invisible; **egress still filtered
   after B runs `nft flush ruleset`**; the payload reaches an allowed address and
   not a denied one.
+- **Parity, both modes:** the same checks run in an ordinary and an engaged
+  session and must give the same answers — a granted TCP and UDP host port at
+  `127.0.0.1`, `localhost` for TCP, a lookup through `resolv.conf`, a
+  not-granted host port refused.
+- **Attacks from B** (the spike's list): its own DNAT to A's veth address on a
+  not-granted port, `127.0.0.0/8` rerouted out of the veth, and a flush of
+  its own ruleset — each must leave not-granted ports and A-private
+  listeners unreachable, with A's input drop counter rising. After the flush
+  the granted port must still answer at A's veth address: the payload has
+  lost only the convenience.
 - **Container-level (needs podman, `veth` loadable, network access):** marked
   skippable, since CI may have none of the three. `podman network create`, two
   containers resolving each other by name, container egress filtered, and
