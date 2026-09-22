@@ -68,22 +68,32 @@ Four spikes (kernel 6.12.104 and 6.12.108 Manjaro, bwrap 0.12.0, podman
    input drop counter confirmed A's rules did the refusing.
 8. **DNAT onto A's loopback cannot work.** pasta binds its host-port splice
    listener to the `lo` device (`*%lo:PORT`, `SO_BINDTODEVICE`), so a packet
-   arriving on `veth-a` is refused whatever it is translated to. pasta cannot
-   bind on `veth-a` instead: it binds before the veth exists.
+   arriving on `sbx-a` is refused whatever it is translated to. pasta cannot
+   bind on `sbx-a` instead: it binds before the veth exists.
 
-**Not yet verified**, and each gates a task in the plan:
+9. **Gates run on 2026-09-21**, in all three launch shapes (no networking,
+   networked, `userns: full`), with bwrap run in A and `--userns2`:
+   - `--userns2 <fd>` **alone** works. The man page's `--userns <A> --userns2
+     <B>` form fails ("Joining the specified user namespace failed"); do not
+     use it.
+   - Capability-dropping sessions (today's `--cap-drop ALL --cap-add
+     CAP_SETPCAP` plus `setpriv`) end with empty effective, bounding and
+     ambient sets. `caps: keep` sessions end with full ones.
+   - `ro` write, remount and umount are refused in every shape, including
+     `caps: keep`; the host file is intact.
+   - Overlay: a kernel overlay mount works inside B's own mount namespace in
+     all shapes, and real podman 6.1.1 on sbx's overlay `storage.conf` loads an
+     image and runs containers in both podman modes. `podman-full` keeps
+     `--user 1000:1000` and in-container `chown`; single-uid `fs/podman` fails
+     both exactly as it does today (measured in today's shape too).
+   - B's loopback starts down; A must bring it up.
+   - `setpriv --pdeathsig KILL` survives `unshare --user`: B's holder dies
+     when the script that started it is SIGKILLed.
 
-- **The `overlay` storage driver.** `sbx` configures overlay today
-  (`sbx:1064-1087`); every spike used `vfs`. B owns the mount namespace it
-  unshares, so an unprivileged overlay mount should be allowed there, but this
-  must be shown before podman sessions move.
-- **Capabilities after `--userns2`.** `setns` into B grants a full capability
-  set in B. The payload's effective, bounding and ambient sets must end up
-  empty for capability-dropping sessions (today's `--cap-drop ALL` +
-  `setpriv`) and full for `caps: keep`.
-- **Ubuntu 24.04's AppArmor userns restriction** applied to a namespace created
-  from inside A. Already on the needs-another-machine list; with a uniform
-  design it affects every session, so it blocks merging, not starting.
+**Still open:** Ubuntu 24.04's AppArmor userns restriction. Sessions without
+networking now create A with `unshare`, which Ubuntu's default policy may
+refuse for an unconfined binary, and B is created from inside A. This blocks
+merging, not starting, and is checked on a real machine.
 
 ## Design
 
@@ -95,9 +105,11 @@ Every session has the same shape:
   pasta, dnsmasq and the nft ruleset live here, and bwrap runs here, so every
   mount the sandbox makes belongs to A.
 - **B, the payload namespace.** A user namespace nested in A, owning its own
-  network namespace. The payload runs here, under `unshare --mount`, and can
-  neither alter A's mounts nor see A's ruleset — whatever capabilities it
-  holds.
+  network namespace. The payload runs here and can neither alter A's mounts
+  nor see A's ruleset, whatever capabilities it holds. `caps: keep` payloads
+  additionally run under `unshare --mount`, so podman can mount in a
+  namespace B owns; a capability-dropping payload could not run `unshare
+  --mount` and has no use for it.
 
 For networked sessions A is what pasta creates today. **Sessions without
 networking get an A too**, from `unshare --user --map-root-user --net`, and
@@ -119,12 +131,17 @@ There is no second environment and no parity to maintain between two.
 
 ### Identity inside B
 
-B's map is chosen so the payload sees what it sees today. A test pins
-`id -u`, `id -g` and `$HOME` ownership for each mode before and after.
-Today: bwrap-created namespaces (no networking) show the real uid; pasta's
-namespace maps the host uid to 0. The plan settles, from the snapshot
-goldens, which one each mode shows and reproduces it; any change is a
-separate, explicit decision.
+B's map reproduces what the payload sees today, measured on 2026-09-21:
+
+| Shape | A's map (inside → host) | Payload today | B's map |
+|---|---|---|---|
+| no networking | `0 → uid` (from `unshare`) | real uid | `uid 0 1` |
+| networked | `0 → uid` (pasta) | 0 | `0 0 1` |
+| `userns: full` | `0 → uid`, `1.. → subuids` | 0 | A's ranges, identity |
+
+The last two are the same rule: B mirrors A's map as an identity. The
+difference between the first two exists today; unifying it would be a
+separate decision. Tests pin `id -u` per shape.
 
 ### New library: `lib/userns.sh`
 
@@ -141,7 +158,7 @@ sbx_userns_hold                                    -> prints "<holder pid>"
 sbx_userns_map_single <pid> <inside> <outside>      # one line, one write
 sbx_userns_map_full   <pid> <subuid start> <count>  # 0 0 1 + 1 <start> <count>
 
-sbx_userns_release <pid>        # kill the holder; its netns and veth-b go too
+sbx_userns_release <pid>        # kill the holder; its netns and sbx-b go too
 ```
 
 launch.sh opens the namespace fd itself: `exec {SBX_BFD}</proc/$B_PID/ns/user`.
@@ -150,14 +167,18 @@ launch.sh opens the namespace fd itself: `exec {SBX_BFD}</proc/$B_PID/ns/user`.
 
 Generates launch.sh fragments; `sbx` does not hand-assemble them.
 
-- **Wiring** (networked sessions): `veth-a`/`veth-b`, `veth-b` moved into B's
-  network namespace, a fixed `/30` (every session has its own pair of
-  namespaces, so the same addresses are reused without allocation),
-  `ip_forward` in A, default route in B via A.
+- **Wiring** (networked sessions): `sbx-a`/`sbx-b`, `sbx-b` moved into B's
+  network namespace, the fixed subnet `10.200.0.0/30` (A `10.200.0.1`, B
+  `10.200.0.2`; every session has its own pair of namespaces, so the same
+  addresses are reused without allocation), `ip_forward` in A, default route
+  in B via A. The wiring happens before the ruleset and dnsmasq, because
+  dnsmasq binds A's veth address; rules still match `iifname`, which does not
+  depend on the order.
 - **A's ruleset additions**, in the existing `table inet sbx_filter`:
-  - `postrouting masquerade` for the veth subnet (belt-and-braces: pasta seems
-    to translate forwarded traffic anyway; kept for determinism);
-  - an **`input` chain matching only `iif "veth-a"`**: accept granted host
+  - `postrouting masquerade` for B's address leaving by any interface other
+    than `sbx-a`. The spikes ran with it; whether pasta would translate B's
+    forwarded traffic on its own is untested, so it stays;
+  - an **`input` chain matching only `iif "sbx-a"`**: accept granted host
     ports and DNS on A's veth address, then drop. This is the boundary for
     what B may reach on A itself.
   - The existing `output` chain (A's own traffic, including dnsmasq's upstream
@@ -167,7 +188,7 @@ Generates launch.sh fragments; `sbx` does not hand-assemble them.
 - **DNS:** dnsmasq additionally listens on A's veth address. `resolv.conf`
   still names `127.0.0.2`.
 - **Host ports:** one `socat` relay per granted port and protocol, listening on
-  A's veth address, bound to `veth-a` with `so-bindtodevice` (which lets it
+  A's veth address, bound to `sbx-a` with `so-bindtodevice` (which lets it
   share the port number with pasta's own listener), forwarding to
   `127.0.0.1:PORT`. Its outbound leg is A's loopback traffic, already accepted
   by `oif "lo" accept`. A does NOT set `route_localnet`: nothing B sends can be
@@ -175,8 +196,8 @@ Generates launch.sh fragments; `sbx` does not hand-assemble them.
 - **B's convenience rules**, installed in B's network namespace before the
   payload starts: `nat output` DNATs `127.0.0.1:PORT` (each granted port and
   protocol) and `127.0.0.2:53` to A's veth address; `route_localnet` on
-  `veth-b`; `nat postrouting` masquerades loopback-sourced packets leaving
-  `veth-b`. A `caps: keep` payload can delete them. That is acceptable by
+  `sbx-b`; `nat postrouting` masquerades loopback-sourced packets leaving
+  `sbx-b`. A `caps: keep` payload can delete them. That is acceptable by
   construction: they grant nothing A does not already allow at its veth
   address, so deleting them costs the payload only its own convenient
   addresses.
@@ -200,8 +221,9 @@ run in B with no change to `--join`.
 ### Teardown
 
 B's holder, the relays and dnsmasq are children of launch.sh, reaped by a trap
-on normal exit and killed with it otherwise (`--die-with-parent` keeps its
-role for bwrap). B's network namespace dies with the holder and `veth-b` with
+on normal exit; the holder and relays carry `setpriv --pdeathsig KILL`, so
+they die with launch.sh even when it is SIGKILLed (`--die-with-parent` keeps its
+role for bwrap). B's network namespace dies with the holder and `sbx-b` with
 the namespace; A's namespaces die with pasta or the `unshare`. `--gc` needs no
 change, and no new state lands on disk.
 
