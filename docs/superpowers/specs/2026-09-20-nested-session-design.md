@@ -229,10 +229,21 @@ change, and no new state lands on disk.
 
 ### Surfaces that change
 
-- **Dependencies.** `socat` joins the table in the `net` group (package `socat`
-  on all three families), required at launch only when host ports are granted.
-  `ip` (iproute2) moves from the `net` group to `core`, since every session now
-  runs `ip` in A.
+- **Dependencies.** `socat` joins the `net` group (package `socat` on all three
+  families); the groups are coarse, and `dnsmasq` is already required the same
+  way for host-ports-only sessions that never start it. `unshare` moves from
+  `podman` to `core` and `nsenter` joins `core`, since every session now runs
+  both. (`ip` is already in `core`.)
+- **Payload DNS goes through dnsmasq only.** The payload's egress now crosses
+  A's `forward` chain, which never carried the `output` chain's "upstream DNS
+  on port 53" accepts. A payload that queried the upstream resolver directly
+  used to succeed; it now fails. dnsmasq's own upstream queries are A's
+  traffic and are unaffected.
+- **Binding a forwarded port inside the sandbox** used to fail with
+  `EADDRINUSE`, because pasta's listener held it. In B the bind succeeds, but
+  the payload's own connections to `127.0.0.1:<port>` still reach the host
+  service (B's DNAT applies to them). The README's "Reaching Host Services"
+  paragraph is updated to say so.
 - **`--doctor` and the launch preflight:** `veth` must be loadable for any
   networked session. A kernel upgrade without a reboot leaves the running
   kernel's module tree empty, and `ip link add … type veth` then fails with
