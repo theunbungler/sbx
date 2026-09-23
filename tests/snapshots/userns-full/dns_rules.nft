@@ -34,6 +34,6 @@ table inet sbx_filter {
     }
     chain postrouting {
         type nat hook postrouting priority srcnat; policy accept;
-        ip saddr 10.200.0.2 oifname != "sbx-a" masquerade
+        ip saddr 10.200.0.3 oifname != "sbx-a" masquerade
     }
 }

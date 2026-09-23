@@ -6,7 +6,7 @@
 
 The motivating intent behind sbx is to be a sandboxed environment for an AI coding agent harness that composes only open-source utilities.  Other than bash scripting, no additional code runs with sbx.  sbx will give agents  access to only what you want them to access, and will limit the damage if anything goes wrong.  The main enforcement mechanisms behind this are:
 - Bubblewrap for filesystem isolation
-- nftables, dnsmasq, and pasta for network isolation
+- nftables, dnsmasq, pasta, and socat for network isolation
 
 ## Features
 
@@ -266,9 +266,9 @@ Egress is enforced at the **IP layer by `nftables`**, not just at DNS resolution
 2. **Dynamic IP allowlisting** — The same domains get a `--nftset=/<domain>/inet#sbx_filter#allowed4` flag, so dnsmasq adds every A-record answer it returns straight to the `nftables` set `allowed4`. `nftables` then permits connections to exactly those IPs (subject to the port filter). An IP the resolver never returned is dropped. `--filter-AAAA` keeps answers to A records; IPv6 egress is dropped regardless.
 3. **CIDR allowlisting** — IP/CIDR entries in `allow` (those matching `^[0-9]`) become `nftables` rules that accept outbound traffic to those address ranges (any port).
 4. **Port filtering** — `nftables` rules restrict the allowed TCP/UDP destination ports for resolved hosts. If only hostnames are listed without explicit ports, TCP 80 and 443 are allowed by default.
-5. **Default policy** — The egress chain default is `drop`. The only fixed exceptions are loopback, established/related flows, and the upstream resolver on port 53 (the IP set via `dns`, default `1.1.1.1`). All outbound IPv6 is dropped. A `forward` chain carries the same rules, because rootful podman under `userns: full` uses the netavark bridge backend, whose container traffic traverses the forward hook and would otherwise be ungated.
+5. **Default policy** — The egress chain default is `drop`. The payload runs nested one namespace behind the control namespace that holds the firewall, so its traffic crosses that namespace's `forward` chain, not `output`. `forward`'s only fixed exceptions are established/related flows and the allow-list above — it carries neither the loopback exception nor the upstream-resolver accept that `output` (the control namespace's own traffic, including dnsmasq's upstream queries) has. All outbound IPv6 is dropped in both chains. The `forward` chain also gates rootful podman's netavark bridge traffic under `userns: full`, which traverses the forward hook rather than output and would otherwise be ungated.
 
-> **Note:** because the upstream resolver is reachable, a process could still perform DNS lookups against it, but it cannot *connect* anywhere the resolver didn't hand back for an allowed domain — egress is gated on `nftables`, not on resolution.
+> **Note:** the resolver at `127.0.0.2` is the payload's only route to DNS — a direct query to the upstream resolver from inside a session now fails, since `forward` has no accept for it. Egress is still gated on `nftables`, not on resolution, so even a successful lookup cannot connect anywhere the resolver didn't hand back for an allowed domain.
 
 **Example — web browsing profile:**
 

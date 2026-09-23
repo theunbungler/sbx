@@ -264,7 +264,7 @@ EOF
 socat -T2 - TCP:127.0.0.1:$other </dev/null > /out/direct.txt 2>/dev/null
 nft add table ip attack
 nft add chain ip attack out '{ type nat hook output priority -150; }'
-nft add rule ip attack out ip daddr 127.0.0.1 tcp dport $other dnat to 10.200.0.1
+nft add rule ip attack out ip daddr 127.0.0.1 tcp dport $other dnat to 10.200.0.2
 socat -T2 - TCP:127.0.0.1:$other </dev/null > /out/dnat.txt 2>/dev/null
 true
 EOF
@@ -338,6 +338,25 @@ EOF
     [ "$(head -1 "$HOSTDIR/udp.txt")" = "host-udp" ]
 }
 
+@test "a granted UDP host port and a net profile coexist: both the port and DNS answer" {
+    # Regression for the relay/dnsmasq collision: before A had a second
+    # address, a granted UDP host port and dnsmasq both wanted
+    # 10.200.0.1:<port>, so any session combining a net profile with a
+    # host-port grant died at "dnsmasq did not become ready". This does not
+    # grant port 53 itself (the host's real 53 cannot be bound in a test),
+    # but exercises the same mechanism: a relay and dnsmasq, both live on A
+    # at once.
+    requires_net
+    allowed_ip_profile
+    start_host_udp
+    payload "--fs drop --host-port $UDP_PORT/udp --net allowip" <<EOF
+echo q | socat -T2 - UDP:127.0.0.1:$UDP_PORT > /out/udp.txt
+getent ahostsv4 example.com > /out/dns.txt
+EOF
+    [ "$(head -1 "$HOSTDIR/udp.txt")" = "host-udp" ]
+    [ -s "$HOSTDIR/dns.txt" ]
+}
+
 @test "capless with networking: DNS answers through resolv.conf and a denied target stays denied" {
     requires_net
     requires_denied_target
@@ -353,14 +372,8 @@ EOF
 @test "fs/podman-full keeps multi-uid fidelity and container DNS on an explicit network" {
     requires_net
     requires_podman_image
-    # DNS runs on an explicitly created network, not the containers.conf
-    # default_network ("sbx0"): podman 6.x disables aardvark DNS on
-    # whatever network is named as default_network, regardless of how
-    # that network was created. That is a pre-existing sbx issue
-    # (containers.conf's default_network choice), unrelated to nesting,
-    # and out of scope here — this test instead proves what the nested
-    # architecture itself claims: aardvark DNS resolves between
-    # containers in B on an ordinary user-created network.
+    # DNS here runs on an ordinary user-created network. The default
+    # network ("sbx0") is covered separately by the next test.
     payload "--fs podman-full --fs img --fs keep --net nothing" <<'EOF'
 podman load -q -i /img/alpine.tar >/dev/null 2>&1
 podman run --rm --network=none --user 1000:1000 docker.io/library/alpine:latest id -u > /out/uid.txt 2>&1

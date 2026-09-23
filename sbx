@@ -2113,7 +2113,7 @@ nest_fail() {
     echo "Error: \$1" >&2
     exit 1
 }
-trap 'sbx_nestnet_release; sbx_userns_release "\$SBX_B_PID"; [[ -n "\${DNSMASQ_PID:-}" ]] && kill "\$DNSMASQ_PID" 2>/dev/null' EXIT
+trap 'sbx_nestnet_release; sbx_userns_release "\${SBX_B_PID:-}"; [[ -n "\${DNSMASQ_PID:-}" ]] && kill "\$DNSMASQ_PID" 2>/dev/null' EXIT
 sbx_userns_hold || nest_fail "could not create the payload user namespace."
 $NEST_MAP || nest_fail "could not map the payload user namespace."
 $NEST_NET
@@ -2122,6 +2122,13 @@ $NEST_NET
 # print an error, leave SBX_BFD unset, and let control reach bwrap with
 # --userns2 "" — bwrap would still refuse it, but by its own argument
 # parser rather than this script's contract.
+#
+# The payload inherits this fd across its own exec()s (it is not
+# close-on-exec on purpose: bwrap needs it open for --userns2). That is
+# harmless: a payload that unshares a further namespace C and tries
+# setns(SBX_BFD) to climb back into B needs CAP_SYS_ADMIN *in B*'s user
+# namespace, which nothing in C holds — B's capability sets are already
+# empty by the time session.sh runs (setpriv below).
 exec {SBX_BFD}</proc/\$SBX_B_PID/ns/user || nest_fail "could not open the payload user namespace."
 EOF
 )
@@ -2226,7 +2233,13 @@ fi
 # singling out the no-net case. setpriv is a plain exec: it sets the
 # signal, then execs the rest of the command line in the same process, so
 # the setting survives every further exec in the chain (unshare into
-# pasta, or unshare into launch.sh).
+# pasta, or unshare into launch.sh). For the pasta-based shapes, then, a
+# SIGKILLed sbx kills pasta while its forked child (launch.sh and
+# everything under it) survives orphaned but networkless, since pasta's
+# own namespace and interface go away with it — that orphan is expected to
+# look dead-ish rather than healthy, and --gc already treats a session
+# whose top-level process is gone as dead regardless of what its children
+# are still doing.
 if [[ "$SBX_NETNS" == "true" ]]; then
     if [[ "$USERNS_FULL" == "true" ]]; then
         echo "Starting session $SESSION_ID with networking (full userns)..."
