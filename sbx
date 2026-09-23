@@ -970,11 +970,10 @@ while IFS= read -r var; do
     fi
 done < <(plan_get '.passthrough[]')
 
+# Every session's user and network namespaces now come from A: pasta's,
+# below, or `unshare`'s for a session without networking. bwrap joins A
+# without creating a user namespace of its own, in either case.
 if [[ "$SBX_NETNS" == "true" ]]; then
-    # Every session's user and network namespaces now come from A: pasta's,
-    # here, or `unshare`'s for a session without networking. bwrap joins A
-    # without creating a user namespace of its own.
-    #
     # pasta maps the host uid to 0 inside the namespace. bwrap does NOT drop
     # inherited capabilities when it is not the namespace's creator, so
     # without an explicit --cap-drop ALL (added below) the payload would run
@@ -2083,10 +2082,11 @@ else
     NEST_NET='sbx_nestnet_lo_up "$SBX_B_PID" || nest_fail "could not bring up the payload loopback."'
 fi
 # The EXIT trap is the one place every teardown path meets: B, its relays,
-# and (with a net profile) dnsmasq. kill on an empty/unset DNSMASQ_PID (no
-# net profile started one) just fails quietly. This does not reach a
-# SIGKILLed launch.sh — dnsmasq has no --pdeathsig, unlike the holder and
-# the relays — but it is exact for every path that does trigger a bash EXIT
+# and (with a net profile) dnsmasq — guarded, since most sessions never set
+# DNSMASQ_PID and an unguarded `kill ''` would just fail quietly instead of
+# stating that there is nothing to kill. This does not reach a SIGKILLed
+# launch.sh — dnsmasq has no --pdeathsig, unlike the holder and the relays
+# — but it is exact for every path that does trigger a bash EXIT
 # trap, and it keeps the reap logic in one place now that this prelude
 # always runs.
 NEST_PRELUDE=$(cat <<EOF
@@ -2097,12 +2097,16 @@ nest_fail() {
     echo "Error: \$1" >&2
     exit 1
 }
-trap 'sbx_nestnet_release; sbx_userns_release "\$SBX_B_PID"; kill "\${DNSMASQ_PID:-}" 2>/dev/null' EXIT
+trap 'sbx_nestnet_release; sbx_userns_release "\$SBX_B_PID"; [[ -n "\${DNSMASQ_PID:-}" ]] && kill "\$DNSMASQ_PID" 2>/dev/null' EXIT
 sbx_userns_hold || nest_fail "could not create the payload user namespace."
 $NEST_MAP || nest_fail "could not map the payload user namespace."
 $NEST_NET
 # bwrap moves the payload into B through this descriptor (--userns2 below).
-exec {SBX_BFD}</proc/\$SBX_B_PID/ns/user
+# Guarded: a failed exec here is only redirections, so it would otherwise
+# print an error, leave SBX_BFD unset, and let control reach bwrap with
+# --userns2 "" — bwrap would still refuse it, but by its own argument
+# parser rather than this script's contract.
+exec {SBX_BFD}</proc/\$SBX_B_PID/ns/user || nest_fail "could not open the payload user namespace."
 EOF
 )
 
@@ -2195,6 +2199,18 @@ if [[ "$PASTA_FWD_UDP" != "none" ]]; then
     HOST_PORT_DESC+="udp $PASTA_FWD_UDP"
 fi
 
+# Every one of these dispatches runs under setpriv --pdeathsig KILL, so a
+# killed sbx tears the session down instead of leaving it running. This
+# used to be bwrap's own --die-with-parent, back when a no-net session's
+# launch.sh `exec`ed bwrap directly and bwrap's parent was sbx itself; now
+# that launch.sh always outlives bwrap (to release B and the relays), a
+# bash process sits in between and needs its own parent-death signal. The
+# networked shapes below already had a process in between (pasta, or
+# unshare wrapping pasta), so setpriv is not a fix there, but the same
+# wrapping is applied uniformly rather than singling out the no-net case.
+# setpriv is a plain exec: it sets the signal, then execs the rest of the
+# command line in the same process, so the setting survives every further
+# exec in the chain (unshare into pasta, or unshare into launch.sh).
 if [[ "$SBX_NETNS" == "true" ]]; then
     if [[ "$USERNS_FULL" == "true" ]]; then
         echo "Starting session $SESSION_ID with networking (full userns)..."
@@ -2203,7 +2219,8 @@ if [[ "$SBX_NETNS" == "true" ]]; then
         # no_new_privs only applies further down the chain. pasta must
         # then NOT create its own user namespace (that would discard the
         # multi-UID mapping): --netns-only.
-        unshare --map-auto --map-root-user -- \
+        setpriv --pdeathsig KILL -- \
+            unshare --map-auto --map-root-user -- \
             pasta -f --config-net --netns-only --no-map-gw "${PASTA_PORT_ARGS[@]}" --interface "$HOST_IFACE" --no-ndp --no-dhcpv6 --no-ra -a "$HOST_IP" -g "$HOST_GW" -n "$HOST_MASK" -- "$LAUNCH_SCRIPT"
     else
         if [[ ${#NET_PROFILES[@]} -gt 0 ]]; then
@@ -2211,12 +2228,13 @@ if [[ "$SBX_NETNS" == "true" ]]; then
         else
             echo "Starting session $SESSION_ID with host ports $HOST_PORT_DESC (no internet)..."
         fi
-        pasta -f --config-net --no-map-gw "${PASTA_PORT_ARGS[@]}" --interface "$HOST_IFACE" --no-ndp --no-dhcpv6 --no-ra -a "$HOST_IP" -g "$HOST_GW" -n "$HOST_MASK" -- "$LAUNCH_SCRIPT"
+        setpriv --pdeathsig KILL -- \
+            pasta -f --config-net --no-map-gw "${PASTA_PORT_ARGS[@]}" --interface "$HOST_IFACE" --no-ndp --no-dhcpv6 --no-ra -a "$HOST_IP" -g "$HOST_GW" -n "$HOST_MASK" -- "$LAUNCH_SCRIPT"
     fi
 else
     echo "Starting session $SESSION_ID..."
     # The control namespace A for a session without networking: this user
     # mapped to 0 in a new user namespace, and an empty network namespace.
     # B gives the payload its host identity back (sbx_userns_map_outer_ids).
-    unshare --user --map-root-user --net -- "$LAUNCH_SCRIPT"
+    setpriv --pdeathsig KILL -- unshare --user --map-root-user --net -- "$LAUNCH_SCRIPT"
 fi

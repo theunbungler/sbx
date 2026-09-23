@@ -7,14 +7,18 @@ nest_fail() {
     echo "Error: $1" >&2
     exit 1
 }
-trap 'sbx_nestnet_release; sbx_userns_release "$SBX_B_PID"; kill "${DNSMASQ_PID:-}" 2>/dev/null' EXIT
+trap 'sbx_nestnet_release; sbx_userns_release "$SBX_B_PID"; [[ -n "${DNSMASQ_PID:-}" ]] && kill "$DNSMASQ_PID" 2>/dev/null' EXIT
 sbx_userns_hold || nest_fail "could not create the payload user namespace."
 sbx_userns_map_identity "$SBX_B_PID" || nest_fail "could not map the payload user namespace."
 sbx_nestnet_wire "$SBX_B_PID" || nest_fail "could not connect the payload network namespace. Is the veth module available? Run: sbx --doctor"
 sbx_nestnet_b_rules "$SBX_B_PID" "127.0.0.2" "" "" || nest_fail "could not load the payload loopback rules."
 sbx_nestnet_relays "" "" || nest_fail "could not start the host-port relays."
 # bwrap moves the payload into B through this descriptor (--userns2 below).
-exec {SBX_BFD}</proc/$SBX_B_PID/ns/user
+# Guarded: a failed exec here is only redirections, so it would otherwise
+# print an error, leave SBX_BFD unset, and let control reach bwrap with
+# --userns2 "" — bwrap would still refuse it, but by its own argument
+# parser rather than this script's contract.
+exec {SBX_BFD}</proc/$SBX_B_PID/ns/user || nest_fail "could not open the payload user namespace."
 ip link set lo up >/dev/null 2>&1
 
 # Hard-fail if nftables rules cannot be loaded — never proceed with open egress.
