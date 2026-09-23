@@ -1109,6 +1109,19 @@ if [[ "$USERNS_FULL" == "true" ]]; then
 [network]
 default_network = "sbx0"
 CONFEOF2
+
+    # podman materialises whatever containers.conf names as default_network
+    # itself, with dns_enabled=false, and then refuses to create it
+    # ("netavark: network already exists") — so creating sbx0 under the
+    # session's own config yields a network with no DNS, and containers on it
+    # cannot resolve anything (their resolv.conf names 127.0.0.2, which in a
+    # container's network namespace is its own loopback). This config is
+    # identical apart from omitting the [network] section, and is used for
+    # exactly one command: the network create in USERNS_NET_SETUP. Created
+    # that way the network keeps dns_enabled=true, including once the
+    # session's config names it as the default. Measured on podman 6.1.1.
+    grep -v -e '^\[network\]' -e '^default_network' "$VIRT_DIR/containers.conf" \
+        > "$VIRT_DIR/containers-bootstrap.conf"
 fi
 
 : > "$VIRT_DIR/empty"
@@ -1859,7 +1872,7 @@ fi
 # state is even created.
 USERNS_NET_SETUP=""
 if [[ "$USERNS_FULL" == "true" ]]; then
-    USERNS_NET_SETUP="podman network create sbx0 >/dev/null 2>> \"$VIRT_DIR/network-create.log\" || true"
+    USERNS_NET_SETUP="CONTAINERS_CONF=\"$VIRT_DIR/containers-bootstrap.conf\" podman network create sbx0 >/dev/null 2>> \"$VIRT_DIR/network-create.log\" || true"
 fi
 
 NET_PRELUDE=""

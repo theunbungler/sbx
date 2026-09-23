@@ -372,3 +372,17 @@ EOF
     [ "$(tail -1 "$HOSTDIR/uid.txt")" = "1000" ]
     grep -q '^Name:' "$HOSTDIR/dns.txt"
 }
+
+@test "fs/podman-full gives containers DNS on the default network" {
+    requires_net
+    requires_podman_image
+    payload "--fs podman-full --fs img --fs keep --net nothing" <<'EOF'
+podman load -q -i /img/alpine.tar >/dev/null 2>&1
+podman network inspect sbx0 --format '{{.DNSEnabled}}' > /out/dns_enabled.txt 2>&1
+podman run -d --name pg docker.io/library/alpine:latest sleep 60 >/dev/null 2>&1
+podman run --rm docker.io/library/alpine:latest nslookup pg > /out/lookup.txt 2>&1
+podman rm -f pg >/dev/null 2>&1
+EOF
+    [ "$(tail -1 "$HOSTDIR/dns_enabled.txt")" = "true" ]
+    grep -q '^Name:' "$HOSTDIR/lookup.txt"
+}

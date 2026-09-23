@@ -43,7 +43,8 @@ sdir="$1"
 name=$(basename "$sdir")
 mkdir -p "$SBX_CAPTURE"
 for f in launch.sh session.sh wrapper.sh tmux.conf session.json \
-         dns/rules.nft dns/resolv.conf virt/storage.conf virt/containers.conf; do
+         dns/rules.nft dns/resolv.conf virt/storage.conf virt/containers.conf \
+         virt/containers-bootstrap.conf; do
     if [[ -f "$sdir/$f" ]]; then
         cp "$sdir/$f" "$SBX_CAPTURE/${f//\//_}"
     fi

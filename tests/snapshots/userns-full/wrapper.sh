@@ -1,5 +1,5 @@
 #!/bin/bash
-podman network create sbx0 >/dev/null 2>> "@ROOT@/h/.local/state/sbx/sessions/proj/virt/network-create.log" || true
+CONTAINERS_CONF="@ROOT@/h/.local/state/sbx/sessions/proj/virt/containers-bootstrap.conf" podman network create sbx0 >/dev/null 2>> "@ROOT@/h/.local/state/sbx/sessions/proj/virt/network-create.log" || true
 mkdir -p "/run/user/@UID@/podman"
 podman system service --time=0 "unix:///run/user/@UID@/podman/podman.sock" > "@ROOT@/h/.local/state/sbx/sessions/proj/podman-api.log" 2>&1 &
 PODMAN_API_PID=$!
