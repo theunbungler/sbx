@@ -96,3 +96,20 @@ scenario() {   # <probe script text>
         if sbx_nestnet_relays 18090 ""; then echo "relays=ok"; else echo "relays=failed"; fi'
     [[ "$output" == *"relays=failed"* ]]
 }
+
+# Regression: a UDP relay's per-peer forked child does not inherit
+# --pdeathsig (cleared across fork, per prctl(2)); it used to survive a
+# plain `kill "$pid"` in sbx_nestnet_release, orphan to pid 1, and hold a
+# bats output pipe open, hanging the whole run. Driving one datagram makes
+# socat fork that child; release must reach it too.
+@test "release kills a UDP relay's forked per-peer child, not just the relay itself" {
+    scenario 'relay_pid="${SBX_NEST_RELAY_PIDS[1]}"
+        udp_get 127.0.0.1 18083 >/dev/null
+        sleep 0.3
+        echo "forked=$(pgrep -g "$relay_pid" | grep -vc "^$relay_pid$")"
+        sbx_nestnet_release
+        sleep 0.3
+        echo "survivors=[$(pgrep -g "$relay_pid" 2>/dev/null)]"'
+    [[ "$output" == *"forked=1"* ]]
+    [[ "$output" == *"survivors=[]"* ]]
+}

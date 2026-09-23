@@ -44,7 +44,11 @@ inb() {
     nsenter -t "$SBX_B_PID" -U -n --preserve-credentials -- "$@"
 }
 tcp_get() {   # <addr> <port>
-    inb socat -T2 - "TCP:$1:$2" </dev/null 2>/dev/null
+    # connect-timeout bounds the connect() itself: A's input chain drops
+    # (not rejects) blocked probes, so without this the kernel's SYN-retry
+    # backoff (~127s) runs to completion on every one of them. -T2 only
+    # bounds inactivity on an already-open connection, not the connect.
+    inb socat -T2 - "TCP:$1:$2,connect-timeout=2" </dev/null 2>/dev/null
 }
 udp_get() {   # <addr> <port>
     echo q | inb socat -T2 - "UDP:$1:$2" 2>/dev/null
