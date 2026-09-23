@@ -1565,7 +1565,113 @@ bind now succeeds), golden diff summary, trailers>"
 
 ---
 
-### Task 6: Surfaces — warning, dry run, README
+### Task 6: podman-full's default network gets DNS
+
+A pre-existing defect, verified on 2026-09-22 and folded in here because Task 7 rewrites the claims it falsifies. `sbx` writes `default_network = "sbx0"` into the session's `containers.conf` (`sbx:1092-1111`) and the wrapper runs `podman network create sbx0 || true` (`USERNS_NET_SETUP`, `sbx:1855-1858`). On podman 6.x, naming a network as `default_network` makes podman materialise it itself with `dns_enabled=false`, and the create then fails with "netavark: network already exists". So `userns: full` containers get no DNS at all: they inherit the sandbox's `nameserver 127.0.0.2`, which in a container's own network namespace is its own loopback, and every lookup times out. Hostname `allow` entries never resolve for containers; only CIDR entries work.
+
+The fix, measured: create the network through podman's own path with a config that does NOT name it as the default, then let the payload use the config that does. The network comes out `dns_enabled=true`, stays true under the real config, and a container started with no `--network` lands on it with aardvark as its resolver.
+
+**Files:**
+- Modify: `sbx` (virt config generation, the `USERNS_FULL` branch at ~1092-1111; `USERNS_NET_SETUP` at ~1855-1858)
+- Modify: `tests/snapshot.bats` (capture the new file)
+- Test: `tests/nested.bats`
+- Regenerate: `tests/snapshots/userns-full/` only
+
+**Interfaces:**
+- Consumes: the nested launch from Tasks 4-5 (no dependency on its internals).
+- Produces: `$VIRT_DIR/containers-bootstrap.conf`, used only by the network create.
+
+- [ ] **Step 1: Write the failing test**
+
+Add to `tests/nested.bats`, beside the other podman tests (it uses that file's existing `payload`, `requires_net`, `requires_podman_image` helpers):
+
+```bash
+@test "fs/podman-full gives containers DNS on the default network" {
+    requires_net
+    requires_podman_image
+    payload "--fs podman-full --fs img --fs keep --net nothing" <<'EOF'
+podman load -q -i /img/alpine.tar >/dev/null 2>&1
+podman network inspect sbx0 --format '{{.DNSEnabled}}' > /out/dns_enabled.txt 2>&1
+podman run -d --name pg docker.io/library/alpine:latest sleep 60 >/dev/null 2>&1
+podman run --rm docker.io/library/alpine:latest nslookup pg > /out/lookup.txt 2>&1
+podman rm -f pg >/dev/null 2>&1
+EOF
+    [ "$(tail -1 "$HOSTDIR/dns_enabled.txt")" = "true" ]
+    grep -q '^Name:' "$HOSTDIR/lookup.txt"
+}
+```
+
+Neither container names a network, so both land on the session's default — which is the point: this is the path a user's `podman run` and most compose-less workflows take.
+
+- [ ] **Step 2: Run it to verify it fails**
+
+Run: `bats tests/nested.bats -f 'DNS on the default network'`
+Expected: FAIL — `dns_enabled.txt` reads `false`, and `nslookup pg` reports no answer.
+
+- [ ] **Step 3: Implement**
+
+In `sbx`, inside the `if [[ "$USERNS_FULL" == "true" ]]` branch that appends `[network] default_network = "sbx0"` to `$VIRT_DIR/containers.conf`, write the bootstrap config too, right after that heredoc:
+
+```bash
+    # podman materialises whatever containers.conf names as default_network
+    # itself, with dns_enabled=false, and then refuses to create it
+    # ("netavark: network already exists") — so creating sbx0 under the
+    # session's own config yields a network with no DNS, and containers on it
+    # cannot resolve anything (their resolv.conf names 127.0.0.2, which in a
+    # container's network namespace is its own loopback). This config is
+    # identical apart from omitting the [network] section, and is used for
+    # exactly one command: the network create in USERNS_NET_SETUP. Created
+    # that way the network keeps dns_enabled=true, including once the
+    # session's config names it as the default. Measured on podman 6.1.1.
+    grep -v -e '^\[network\]' -e '^default_network' "$VIRT_DIR/containers.conf" \
+        > "$VIRT_DIR/containers-bootstrap.conf"
+```
+
+`grep -v` on two fixed patterns keeps the two files from drifting apart: whatever the main config gains, the bootstrap copy gains too, minus the section that causes the problem. The `[network]` section is the last thing appended to the file, and `default_network` is its only key, so nothing else is lost — confirm that by reading the generated file in your test run and say so in your report.
+
+Then `USERNS_NET_SETUP` (`sbx:1855-1858`) runs the create under that config:
+
+```bash
+    USERNS_NET_SETUP="CONTAINERS_CONF=\"$VIRT_DIR/containers-bootstrap.conf\" podman network create sbx0 >/dev/null 2>> \"$VIRT_DIR/network-create.log\" || true"
+```
+
+Keep `|| true`: a create that fails because the network already exists from an earlier session is not an error. But make the failure visible — the log file is already there, and the new test asserts the outcome that matters (`DNSEnabled` is true).
+
+- [ ] **Step 4: Capture the new file in snapshots**
+
+In `tests/snapshot.bats`'s `sbx-capture` stub, add `virt/containers-bootstrap.conf` to the `for f in …` list, after `virt/containers.conf`.
+
+- [ ] **Step 5: Run the tests**
+
+Run: `bats tests/nested.bats -f 'DNS on the default network'`
+Expected: PASS — `DNSEnabled` is `true` and `nslookup pg` prints a `Name:` line.
+
+Run: `bats tests/snapshot.bats`
+Expected: only "snapshot: userns full" fails (its `wrapper.sh` now carries the `CONTAINERS_CONF=` prefix, and `virt_containers-bootstrap.conf` is new). If any other case fails, stop and report.
+
+```bash
+SBX_UPDATE_SNAPSHOTS=1 bats tests/snapshot.bats -f 'userns full'
+git diff tests/snapshots/
+```
+
+Expected diff: `userns-full/wrapper.sh` gains the `CONTAINERS_CONF=…containers-bootstrap.conf` prefix on the `podman network create sbx0` line, and `userns-full/virt_containers-bootstrap.conf` is new and holds the storage/engine settings without the `[network]` section. Summarise it in the commit message.
+
+Run: `bats tests/ && shellcheck -S error sbx sbx-profile lib/*.sh`
+Expected: all pass; shellcheck silent.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add sbx tests/nested.bats tests/snapshot.bats tests/snapshots/
+git commit -m "Give podman-full containers DNS on the default network
+
+<body: the podman 6 behaviour, the bootstrap config, what containers could
+not resolve before, golden diff summary, trailers>"
+```
+
+---
+
+### Task 7: Surfaces — warning, dry run, README
 
 **Files:**
 - Modify: `sbx:809-812` (caps-keep launch warning)
@@ -1679,7 +1785,7 @@ git commit -m "Say what nested sessions guarantee: warning, dry run, README
 
 ---
 
-### Task 7 (manual, the user): Ubuntu 24.04 before merging
+### Task 8 (manual, the user): Ubuntu 24.04 before merging
 
 Not for a subagent: it needs an Ubuntu 24.04 machine. On one, with this branch checked out:
 
@@ -1689,6 +1795,6 @@ Not for a subagent: it needs an Ubuntu 24.04 machine. On one, with this branch c
 
 ## Self-Review
 
-- **Spec coverage.** One environment (Tasks 4-5); identity per shape (Task 1 `map_identity`/`map_outer_ids`, tests in Tasks 4-5); `unshare --mount` for `caps: keep` only (Task 4 Step 6); `lib/userns.sh` (Task 1); `lib/nestnet.sh` wiring, A's input and postrouting chains, DNS on both addresses, relays, B's convenience rules (Task 2, engaged in Task 4); launch order with wiring before dnsmasq (Task 4 Step 6: NEST_PRELUDE before NET_PRELUDE); teardown with trap and pdeathsig (Tasks 1, 2, 4); dependencies and `veth` in doctor, preflight and dry run (Task 3); dry-run Security wording, README, launch note (Task 6); goldens regenerated only in Tasks 4 and 5 with reviewed diffs; sequencing checkpoint then uniform (Tasks 4, 5); Ubuntu gate (Task 7). Testing section: unit (Tasks 1-2), every-session ro/caps/identity (Tasks 4-5), networked parity (Tasks 4-5), attacks from B (Task 2 in-namespace, Task 4 end-to-end), containers incl. overlay (Task 4).
+- **Spec coverage.** One environment (Tasks 4-5); podman-full container DNS on the default network (Task 6, a pre-existing defect folded in on the user's instruction 2026-09-22); identity per shape (Task 1 `map_identity`/`map_outer_ids`, tests in Tasks 4-5); `unshare --mount` for `caps: keep` only (Task 4 Step 6); `lib/userns.sh` (Task 1); `lib/nestnet.sh` wiring, A's input and postrouting chains, DNS on both addresses, relays, B's convenience rules (Task 2, engaged in Task 4); launch order with wiring before dnsmasq (Task 4 Step 6: NEST_PRELUDE before NET_PRELUDE); teardown with trap and pdeathsig (Tasks 1, 2, 4); dependencies and `veth` in doctor, preflight and dry run (Task 3); dry-run Security wording, README, launch note (Task 7); goldens regenerated only in Tasks 4 and 5 with reviewed diffs; sequencing checkpoint then uniform (Tasks 4, 5); Ubuntu gate (Task 8). Testing section: unit (Tasks 1-2), every-session ro/caps/identity (Tasks 4-5), networked parity (Tasks 4-5), attacks from B (Task 2 in-namespace, Task 4 end-to-end), containers incl. overlay (Task 4).
 - **Deviation from the spec, recorded there:** `socat` is in the `net` group, required for every networked session rather than only those granting host ports (the design's "Surfaces that change" was updated to match).
-- **Names.** `SBX_B_PID`, `SBX_BFD`, `SBX_NEST_RELAY_PIDS`, `SBX_NEST_A_IF`/`B_IF`/`A_ADDR`/`B_ADDR`/`PREFIX`, `sbx_userns_{hold,write_map,map_identity,map_outer_ids,release}`, `sbx_nestnet_{a_rules,lo_up,wire,b_rules,relays,release}`, `sbx_deps_{kernel_release,veth_ok,veth_explain}`, `SBX_NESTED` (Task 4 only), `NEST_TCP`/`NEST_UDP`/`NEST_PRELUDE`/`NEST_MAP`/`NEST_NET`/`NEST_B_DNS`/`DNSMASQ_NEST_LISTEN` — used consistently across tasks.
+- **Names.** `SBX_B_PID`, `SBX_BFD`, `SBX_NEST_RELAY_PIDS`, `SBX_NEST_A_IF`/`B_IF`/`A_ADDR`/`B_ADDR`/`PREFIX`, `sbx_userns_{hold,write_map,map_identity,map_outer_ids,release}`, `sbx_nestnet_{a_rules,lo_up,wire,b_rules,relays,release}`, `sbx_deps_{kernel_release,veth_ok,veth_explain}`, `SBX_NESTED` (Task 4 only), `$VIRT_DIR/containers-bootstrap.conf` (Task 6), `NEST_TCP`/`NEST_UDP`/`NEST_PRELUDE`/`NEST_MAP`/`NEST_NET`/`NEST_B_DNS`/`DNSMASQ_NEST_LISTEN` — used consistently across tasks.

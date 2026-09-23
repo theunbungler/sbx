@@ -300,6 +300,27 @@ broke" separately verifiable:
   container egress filtered, `--user 1000:1000`, overlay storage.
 - **The existing suite** passes throughout.
 
+## Added to scope: podman-full's default network (2026-09-22)
+
+A pre-existing defect found while testing Task 4, and folded into this branch
+on the user's instruction. `sbx` names `sbx0` as `default_network` in the
+session's `containers.conf` and then creates it. On podman 6.x, podman
+materialises whatever is named as the default itself with `dns_enabled=false`
+and refuses to create it ("netavark: network already exists"), so `userns:
+full` containers have no working DNS at all: they inherit the sandbox's
+`nameserver 127.0.0.2`, which in a container's own network namespace is its
+own loopback. Hostname `allow` entries therefore never resolve for
+containers; CIDR entries still work. Measured on podman 6.1.1, and the
+README's Virt section currently claims otherwise.
+
+The fix is an ordering change, not a format dependency: a second generated
+`containers.conf` that omits the `[network]` section is used for the one
+`podman network create` call, after which the network keeps
+`dns_enabled=true` under the real config, and a container started with no
+`--network` lands on it with aardvark as its resolver (all three verified).
+Nesting neither caused nor hides this; the September 20 spike missed it only
+because it created a network that was not the configured default.
+
 ## Non-goals and open questions
 
 - **`--network=pasta` for containers** also works and needs no veth, but loses
