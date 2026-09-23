@@ -124,8 +124,10 @@ sbx_resolve() {
         #                          UID range (multi-UID podman). Requires --net.
         #                          Implies "caps": "keep".
         #   "caps": "keep"      -> retain capabilities inside the sandbox. Needed
-        #                          for nested user namespaces (podman), and it
-        #                          costs the ro-mount and firewall guarantees.
+        #                          for nested user namespaces (podman). Capabilities
+        #                          are held inside the payload namespace B; the ro
+        #                          mounts and the firewall ruleset belong to the
+        #                          control namespace A and stay out of B's reach.
         #   "docker_api": true  -> start a podman docker-API socket for the session.
         #
         # None of these are honored from a project-supplied profile: a repository

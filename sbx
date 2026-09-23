@@ -816,8 +816,9 @@ if [[ "$USERNS_FULL" == "true" ]] && ! sbx_deps_subids_ok; then
 fi
 
 if [[ "$CAPS_KEEP" == "true" ]]; then
-    echo "Warning: profile '$(basename "$CAPS_PROFILE" .json)' retains capabilities — this session's" >&2
-    echo "  ro mounts and egress firewall are NOT enforceable against code running inside it." >&2
+    echo "Note: profile '$(basename "$CAPS_PROFILE" .json)' retains capabilities inside the payload's own namespace." >&2
+    echo "  ro mounts and the egress firewall are still enforced from outside it; the payload can" >&2
+    echo "  create further namespaces and hide paths from itself." >&2
 fi
 
 # Session Initialization
@@ -2214,18 +2215,18 @@ if [[ "$PASTA_FWD_UDP" != "none" ]]; then
     HOST_PORT_DESC+="udp $PASTA_FWD_UDP"
 fi
 
-# Every one of these dispatches runs under setpriv --pdeathsig KILL, so a
-# killed sbx tears the session down instead of leaving it running. This
-# used to be bwrap's own --die-with-parent, back when a no-net session's
-# launch.sh `exec`ed bwrap directly and bwrap's parent was sbx itself; now
-# that launch.sh always outlives bwrap (to release B and the relays), a
-# bash process sits in between and needs its own parent-death signal. The
-# networked shapes below already had a process in between (pasta, or
-# unshare wrapping pasta), so setpriv is not a fix there, but the same
-# wrapping is applied uniformly rather than singling out the no-net case.
-# setpriv is a plain exec: it sets the signal, then execs the rest of the
-# command line in the same process, so the setting survives every further
-# exec in the chain (unshare into pasta, or unshare into launch.sh).
+# setpriv --pdeathsig KILL is applied uniformly across every dispatch below.
+# For the no-net shape it genuinely closes a gap: launch.sh now always
+# outlives bwrap (to release B and the relays), so a bash process sits
+# between sbx and bwrap and needs its own parent-death signal — the role
+# bwrap's own --die-with-parent used to play when launch.sh `exec`ed bwrap
+# directly. For the pasta-based shapes, pasta forks the namespaced child
+# rather than exec'ing into it, so a killed sbx can still orphan that
+# child; this does not claim to fix that pre-existing gap, only to avoid
+# singling out the no-net case. setpriv is a plain exec: it sets the
+# signal, then execs the rest of the command line in the same process, so
+# the setting survives every further exec in the chain (unshare into
+# pasta, or unshare into launch.sh).
 if [[ "$SBX_NETNS" == "true" ]]; then
     if [[ "$USERNS_FULL" == "true" ]]; then
         echo "Starting session $SESSION_ID with networking (full userns)..."

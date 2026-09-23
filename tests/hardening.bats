@@ -156,6 +156,10 @@ EOF
 {"description":"test","caps":"keep","mounts":[{"source":"$HOSTDIR","dest":"/out","perm":"rw"}]}
 EOF
     run bash -c "cd '$PROJ' && script -qec \"$SBX --fs keep -- /bin/true\" /dev/null 2>&1"
+    if [[ "$output" == *"NOT enforceable"* ]]; then
+        echo "the warning still claims ro and the firewall are lost" >&2
+        return 1
+    fi
     [[ "$output" == *"retains capabilities"* ]]
 }
 

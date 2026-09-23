@@ -44,7 +44,7 @@ line() {   # <prefix> -> the first output line starting with it
     [ "$(line Profiles)" = "Profiles   fs/sandbox (global)  cli/pi (user)" ]
     [ "$(line Security)" = "Security   capabilities dropped · no userns · no docker API" ]
     render '.security = {caps_keep:true, caps_profile:"/home/u/.config/sbx/profiles/fs/k.json", userns_full:true, userns_profile:"x", docker_api:true}'
-    [ "$(line Security)" = "Security   capabilities KEPT (~/.config/sbx/profiles/fs/k.json) · userns full · docker API" ]
+    [ "$(line Security)" = "Security   capabilities KEPT in the payload namespace (~/.config/sbx/profiles/fs/k.json) · userns full · docker API" ]
 }
 
 @test "mounts show perm, paths, note and origin; absent sources are skipped" {

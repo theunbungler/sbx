@@ -25,15 +25,19 @@ sbx assumes the code running inside a sandbox and the project directory it
 was launched from are both adversarial. It is built to protect the host user
 account from them.
 
-In sessions (without `"caps": "keep"`), this means:
+In every session, this means:
 
-- **`ro` mounts are read-only.** Capabilities are limited in the sandbox, so 
-  code can't modify mounts.
+- **`ro` mounts are read-only.** bwrap makes every mount in the session's
+  control namespace and runs the payload in a user namespace nested inside
+  it. A mount inherited across that boundary is locked: it cannot be
+  remounted or unmounted from inside, whatever capabilities the payload
+  holds.
 - **`--join` gets the same containment as the payload.** Once they start, sessions 
   can't be modified, including by sessiosn that join them.
-- **The egress allow-list is not removable.** `nft` and `dnsmasq` run outside
-  the sandbox's PID and mount namespaces; nothing inside can flush the
-  ruleset or signal the resolver.
+- **The egress allow-list is not removable.** `nft` and `dnsmasq` run in
+  the control namespace, outside the sandbox's PID and mount namespaces.
+  The payload has its own network namespace behind a veth pair; it cannot
+  see the ruleset, change it, or signal the resolver.
 - **The host environment does not leak in.** The environment is cleared;
   variables arrive only via the base set or a profile's `passthrough`.
 - **sbx's own state and config are masked**, so a sandbox cannot reach
@@ -48,9 +52,10 @@ In sessions (without `"caps": "keep"`), this means:
 ### Caveats and Explicit Non-goals
 
 - **Sessions with `"caps": "keep"`** — including `fs/podman` and
-  `fs/podman-full`. Capabilities are required for the nested user namespaces
-  podman needs, and with them `ro` mounts are writable and the firewall is
-  removable. Such sessions print a warning at launch.
+  `fs/podman-full` — hold capabilities inside the payload's own namespace.
+  They can create further namespaces and hide paths from themselves with
+  over-mounts; they cannot write `ro` mounts or change the firewall. Such
+  sessions print a note at launch.
 - **Kernel exploits.** There is no seccomp filter: `bwrap --seccomp` needs a
   compiled BPF blob, which is the kind of custom code this project avoids.
 - **Wildcard `allow` entries.** `*.anthropic.com` admits any IP an attacker
@@ -87,6 +92,11 @@ It also checks that bwrap can actually create an unprivileged user
 namespace, which is the setup failure that is hardest to recognise from
 the error alone. On Ubuntu 24.04 and later this is blocked by AppArmor by
 default; the doctor prints the profile that allows it.
+
+For networked sessions it also checks that the running kernel can load the
+`veth` module, which joins the sandbox's network namespace to the one that
+holds its firewall. After a kernel upgrade that check fails until you
+reboot.
 
 A launch runs the same checks for just the groups it needs, and stops
 before building a session.
@@ -154,7 +164,7 @@ CLI profiles configure the shell environment inside the sandbox. They control en
 | `path` | array of strings | No | Directories to prepend to the sandbox `PATH` |
 | `mounts` | array of objects | No | Filesystem mounts (same structure as FS mounts below) |
 | `passthrough` | array | No | Host environment variables to forward into the sandbox by name. The environment is otherwise cleared. |
-| `caps` | string | No | `"keep"` retains capabilities inside the sandbox. Required for nested user namespaces (podman); costs the read-only-mount and firewall guarantees. Ignored — and rejected — in project-supplied profiles. |
+| `caps` | string | No | `"keep"` retains capabilities inside the sandbox. Required for nested user namespaces (podman); capabilities stay inside the payload's namespace; `ro` mounts and the firewall still hold. Ignored — and rejected — in project-supplied profiles. |
 
 **Example — minimal:**
 
@@ -200,7 +210,7 @@ FS profiles define the sandbox's filesystem layout — which directories are mou
 | `userns` | string | No | `"full"` runs the entire session inside an outer user namespace carrying your full subordinate-UID range (multi-UID podman). Requires `--net`; the session identity becomes namespace-root. See [Multi-UID containers](#multi-uid-containers-podman-full). |
 | `docker_api` | boolean | No | `true` starts a podman docker-API socket for the session (see [Docker compatibility](#docker-compatibility)). Honored in CLI profiles too. |
 | `passthrough` | array | No | Host environment variables to forward into the sandbox by name. The environment is otherwise cleared. |
-| `caps` | string | No | `"keep"` retains capabilities inside the sandbox. Required for nested user namespaces (podman); costs the read-only-mount and firewall guarantees. Ignored — and rejected — in project-supplied profiles. |
+| `caps` | string | No | `"keep"` retains capabilities inside the sandbox. Required for nested user namespaces (podman); capabilities stay inside the payload's namespace; `ro` mounts and the firewall still hold. Ignored — and rejected — in project-supplied profiles. |
 
 #### Mount Object
 
@@ -565,7 +575,11 @@ The second form is the useful one for an agent you want kept off the network but
 
 The two are independent all the way down — forwarding a TCP port does not open its UDP twin. That matters for a port like `53`: a session reaches a host resolver only if it asks for `53/udp` by name, and doing so does not disturb the session's own DNS, which runs on a different loopback address.
 
-**Ports the sandbox binds itself are unaffected**, as long as they are not also forwarded. A sandbox can serve on `127.0.0.1:10000` while reaching the host's service on `127.0.0.1:10001`. The one case to avoid is naming a port the sandbox also wants to bind: the forwarded host service owns that port inside the sandbox, and the sandbox's own `bind()` fails with `EADDRINUSE`.
+**Ports the sandbox binds itself are unaffected**, as long as they are not
+also forwarded. A sandbox can serve on `127.0.0.1:10000` while reaching the
+host's service on `127.0.0.1:10001`. If it binds a port it also forwards,
+the bind succeeds, but its own connections to `127.0.0.1:<port>` still
+reach the host service, not its own listener.
 
 **Only named ports are forwarded.** This is deliberate, and it is not what the underlying tooling does by default: pasta's `-T auto` forwards *every* port bound on the host, including ports bound after the session starts and ports bound by other users. sbx passes an explicit list instead, so host access is an allow-list like egress rather than a side effect of having networking at all.
 
