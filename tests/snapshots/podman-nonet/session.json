@@ -1,0 +1,10 @@
+{
+    "id": "proj",
+    "cwd": "@ROOT@/proj",
+    "pid": @PID@,
+    "fs_profiles": [
+  "@REPO@/profiles/fs/podman.json"
+],
+    "net_profiles": [],
+    "cli_profile": null
+}

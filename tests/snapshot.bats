@@ -74,10 +74,16 @@ exec "$(dirname "$0")/sbx-capture" "$(dirname "${@: -1}")"
 EOF
     cat > "$STUB/unshare" <<'EOF'
 #!/bin/bash
+args=("$@")
 while [[ $# -gt 0 && "$1" != "--" ]]; do
     shift
 done
 shift
+if [[ "$1" == */launch.sh ]]; then
+    mkdir -p "$SBX_CAPTURE"
+    printf '%s\n' "${args[@]}" > "$SBX_CAPTURE/unshare.args"
+    exec "$(dirname "$0")/sbx-capture" "$(dirname "$1")"
+fi
 exec "$@"
 EOF
     cat > "$STUB/ip" <<'EOF'
@@ -241,6 +247,11 @@ check_snapshot() {   # <case name>
 @test "snapshot: userns full" {
     run_case userns-full --fs podman-full --net web
     check_snapshot userns-full
+}
+
+@test "snapshot: caps keep without networking" {
+    run_case podman-nonet --fs podman
+    check_snapshot podman-nonet
 }
 
 @test "snapshot capture is deterministic across launches" {
