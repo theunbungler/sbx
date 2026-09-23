@@ -1091,6 +1091,21 @@ events_logger = "file"
 CONFEOF
 
 if [[ "$USERNS_FULL" == "true" ]]; then
+    # podman materialises whatever containers.conf names as default_network
+    # itself, with dns_enabled=false, and then refuses to create it
+    # ("netavark: network already exists") — so creating sbx0 under the
+    # session's own config (which is about to gain a [network] section
+    # below) would yield a network with no DNS, and containers on it
+    # could not resolve anything (their resolv.conf names 127.0.0.2, which
+    # in a container's network namespace is its own loopback). This copy
+    # is taken now, before the [network] section is appended, so it holds
+    # only the settings above and cannot inherit that section no matter
+    # how large it later grows. It is used for exactly one command: the
+    # network create in USERNS_NET_SETUP. Created under this config, sbx0
+    # keeps dns_enabled=true even once the real config below names it as
+    # the default. Measured on podman 6.1.1.
+    cp "$VIRT_DIR/containers.conf" "$VIRT_DIR/containers-bootstrap.conf"
+
     # Podman's implicit default "podman" bridge network ships with
     # dns_enabled=false; only explicitly-created custom networks default
     # to DNS-enabled (verified empirically — podman network inspect
@@ -1109,19 +1124,6 @@ if [[ "$USERNS_FULL" == "true" ]]; then
 [network]
 default_network = "sbx0"
 CONFEOF2
-
-    # podman materialises whatever containers.conf names as default_network
-    # itself, with dns_enabled=false, and then refuses to create it
-    # ("netavark: network already exists") — so creating sbx0 under the
-    # session's own config yields a network with no DNS, and containers on it
-    # cannot resolve anything (their resolv.conf names 127.0.0.2, which in a
-    # container's network namespace is its own loopback). This config is
-    # identical apart from omitting the [network] section, and is used for
-    # exactly one command: the network create in USERNS_NET_SETUP. Created
-    # that way the network keeps dns_enabled=true, including once the
-    # session's config names it as the default. Measured on podman 6.1.1.
-    grep -v -e '^\[network\]' -e '^default_network' "$VIRT_DIR/containers.conf" \
-        > "$VIRT_DIR/containers-bootstrap.conf"
 fi
 
 : > "$VIRT_DIR/empty"
