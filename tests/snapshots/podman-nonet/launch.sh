@@ -7,7 +7,7 @@ nest_fail() {
     echo "Error: $1" >&2
     exit 1
 }
-trap 'sbx_nestnet_release; sbx_userns_release "$SBX_B_PID"' EXIT
+trap 'sbx_nestnet_release; sbx_userns_release "$SBX_B_PID"; kill "${DNSMASQ_PID:-}" 2>/dev/null' EXIT
 sbx_userns_hold || nest_fail "could not create the payload user namespace."
 sbx_userns_map_outer_ids "$SBX_B_PID" || nest_fail "could not map the payload user namespace."
 sbx_nestnet_lo_up "$SBX_B_PID" || nest_fail "could not bring up the payload loopback."

@@ -10,4 +10,14 @@ table inet sbx_filter {
         ct state established,related accept
         meta nfproto ipv6 drop
     }
+    chain input {
+        type filter hook input priority 0; policy accept;
+        iifname "sbx-a" ip daddr 10.200.0.1 tcp dport { 8080 } accept
+        iifname "sbx-a" ip daddr 10.200.0.1 udp dport { 5353 } accept
+        iifname "sbx-a" counter drop
+    }
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        ip saddr 10.200.0.2 oifname != "sbx-a" masquerade
+    }
 }

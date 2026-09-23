@@ -799,14 +799,9 @@ SBX_NETNS=$(plan_get '.netns')
 
 # The payload runs in a user namespace B nested in the session's control
 # namespace A (lib/userns.sh, lib/nestnet.sh): mounts made in A are locked
-# in B, and A's ruleset is out of B's reach. caps:keep sessions first.
-SBX_NESTED=$CAPS_KEEP
+# in B, and A's ruleset is out of B's reach.
 NEST_TCP=$(IFS=,; echo "${HOST_PORTS_TCP[*]}")
 NEST_UDP=$(IFS=,; echo "${HOST_PORTS_UDP[*]}")
-DNSMASQ_NEST_LISTEN=""
-if [[ "$SBX_NESTED" == "true" ]]; then
-    DNSMASQ_NEST_LISTEN="--listen-address=$SBX_NEST_A_ADDR"
-fi
 
 # --- Dependency preflight: optional groups ---
 mapfile -t DEP_GROUPS < <(plan_get '.deps[] | select(. != "core")')
@@ -976,9 +971,9 @@ while IFS= read -r var; do
 done < <(plan_get '.passthrough[]')
 
 if [[ "$SBX_NETNS" == "true" ]]; then
-    # When a network namespace is used, pasta creates the user and net
-    # namespaces.
-    # bwrap joins them and provides filesystem isolation.
+    # Every session's user and network namespaces now come from A: pasta's,
+    # here, or `unshare`'s for a session without networking. bwrap joins A
+    # without creating a user namespace of its own.
     #
     # pasta maps the host uid to 0 inside the namespace. bwrap does NOT drop
     # inherited capabilities when it is not the namespace's creator, so
@@ -1011,17 +1006,6 @@ if [[ "$SBX_NETNS" == "true" ]]; then
             )
         fi
     fi
-else
-    if [[ "$SBX_NESTED" != "true" ]]; then
-        # With neither a net profile nor host ports, bwrap creates its own
-        # namespaces and the session has no network stack at all.
-        # No --uid/--gid: bwrap defaults to mapping the real UID/GID into the
-        # new user namespace, so the sandbox sees the same user/HOME identity
-        # as the host (matches what the --net branch already does via pasta).
-        BWRAP_ARGS+=(--unshare-user --unshare-net)
-    fi
-    # A nested session's control namespace comes from unshare instead (see
-    # the launch at the end), and bwrap joins it, as on the networked path.
 fi
 
 # The payload never needs capabilities. Session setup does, but all of it
@@ -1031,10 +1015,10 @@ fi
 #
 # CAP_SETPCAP is retained deliberately and is the ONLY capability kept.
 # It is the privilege setpriv needs to empty the bounding set, which bwrap
-# leaves full whenever it JOINS an existing user namespace instead of
-# creating one — i.e. the --net path. Dropping it here makes setpriv fail
-# with "apply bounding set: Operation not permitted" and every session
-# exit 127.
+# leaves full on every path now: bwrap always joins an existing user
+# namespace (B, via --userns2) instead of creating one. Dropping it here
+# makes setpriv fail with "apply bounding set: Operation not permitted" and
+# every session exit 127.
 #
 # Why that is not an escape surface: the setpriv that spends it is
 # launch.sh's, above session.sh (see the comment there), so CAP_SETPCAP is
@@ -1046,11 +1030,11 @@ fi
 # capability, not a single exec. CAP_SETPCAP cannot mount, configure
 # networking, or change ownership in any case.
 #
-# The "caps": "keep" opt-out needs --cap-add ALL in BOTH modes, not just
-# --net. Where bwrap creates the user namespace itself (the no-net path) it
-# hands the payload an empty effective AND bounding set unless told
-# otherwise, so omitting the flag here would silently ignore the profile
-# field rather than honour it.
+# bwrap no longer creates the user namespace on any path — it always joins
+# B with --userns2, entering it holding B's full capability set. --cap-add
+# ALL / --cap-drop ALL are what then decide what the payload keeps (measured
+# 2026-09-21). Omitting them here would leave the payload holding
+# everything B has regardless of the "caps" profile field.
 if [[ "$CAPS_KEEP" == "true" ]]; then
     BWRAP_ARGS+=(--cap-add ALL)
 else
@@ -1595,9 +1579,7 @@ if [[ "$SBX_NETNS" == "true" ]]; then
 
         # A's side of the nested payload: what B may reach on A, and the
         # masquerade for B's egress (lib/nestnet.sh).
-        if [[ "$SBX_NESTED" == "true" ]]; then
-            sbx_nestnet_a_rules "$([[ ${#NET_PROFILES[@]} -gt 0 ]] && echo true || echo false)" "$NEST_TCP" "$NEST_UDP"
-        fi
+        sbx_nestnet_a_rules "$([[ ${#NET_PROFILES[@]} -gt 0 ]] && echo true || echo false)" "$NEST_TCP" "$NEST_UDP"
 
         echo "}"
     } > "$NFT_RULES"
@@ -1935,7 +1917,7 @@ fi
     --conf-file=/dev/null \\
     -d \\
     --port=53 \\
-    --listen-address=$SBX_DNS_ADDR${DNSMASQ_NEST_LISTEN:+ $DNSMASQ_NEST_LISTEN} \\
+    --listen-address=$SBX_DNS_ADDR --listen-address=$SBX_NEST_A_ADDR \\
     --bind-interfaces \\
     --no-resolv \\
     --no-hosts \\
@@ -2084,25 +2066,30 @@ chmod +x "$SESSION_SCRIPT"
 # The payload namespace B, set up by launch.sh in A before anything else, so
 # that A's veth address exists when dnsmasq binds it. See lib/userns.sh and
 # lib/nestnet.sh for what each step is for.
-NEST_PRELUDE=""
-if [[ "$SBX_NESTED" == "true" ]]; then
-    if [[ "$SBX_NETNS" == "true" ]]; then
-        NEST_MAP='sbx_userns_map_identity "$SBX_B_PID"'
-        NEST_B_DNS=""
-        if [[ ${#NET_PROFILES[@]} -gt 0 ]]; then
-            NEST_B_DNS="$SBX_DNS_ADDR"
-        fi
-        NEST_NET=$(cat <<EOF
+if [[ "$SBX_NETNS" == "true" ]]; then
+    NEST_MAP='sbx_userns_map_identity "$SBX_B_PID"'
+    NEST_B_DNS=""
+    if [[ ${#NET_PROFILES[@]} -gt 0 ]]; then
+        NEST_B_DNS="$SBX_DNS_ADDR"
+    fi
+    NEST_NET=$(cat <<EOF
 sbx_nestnet_wire "\$SBX_B_PID" || nest_fail "could not connect the payload network namespace. Is the veth module available? Run: sbx --doctor"
 sbx_nestnet_b_rules "\$SBX_B_PID" "$NEST_B_DNS" "$NEST_TCP" "$NEST_UDP" || nest_fail "could not load the payload loopback rules."
 sbx_nestnet_relays "$NEST_TCP" "$NEST_UDP" || nest_fail "could not start the host-port relays."
 EOF
 )
-    else
-        NEST_MAP='sbx_userns_map_outer_ids "$SBX_B_PID"'
-        NEST_NET='sbx_nestnet_lo_up "$SBX_B_PID" || nest_fail "could not bring up the payload loopback."'
-    fi
-    NEST_PRELUDE=$(cat <<EOF
+else
+    NEST_MAP='sbx_userns_map_outer_ids "$SBX_B_PID"'
+    NEST_NET='sbx_nestnet_lo_up "$SBX_B_PID" || nest_fail "could not bring up the payload loopback."'
+fi
+# The EXIT trap is the one place every teardown path meets: B, its relays,
+# and (with a net profile) dnsmasq. kill on an empty/unset DNSMASQ_PID (no
+# net profile started one) just fails quietly. This does not reach a
+# SIGKILLed launch.sh — dnsmasq has no --pdeathsig, unlike the holder and
+# the relays — but it is exact for every path that does trigger a bash EXIT
+# trap, and it keeps the reap logic in one place now that this prelude
+# always runs.
+NEST_PRELUDE=$(cat <<EOF
 # The payload namespace B, nested in this one (lib/userns.sh, lib/nestnet.sh).
 source $(printf '%q' "$SCRIPT_DIR/lib/userns.sh")
 source $(printf '%q' "$SCRIPT_DIR/lib/nestnet.sh")
@@ -2110,7 +2097,7 @@ nest_fail() {
     echo "Error: \$1" >&2
     exit 1
 }
-trap 'sbx_nestnet_release; sbx_userns_release "\$SBX_B_PID"' EXIT
+trap 'sbx_nestnet_release; sbx_userns_release "\$SBX_B_PID"; kill "\${DNSMASQ_PID:-}" 2>/dev/null' EXIT
 sbx_userns_hold || nest_fail "could not create the payload user namespace."
 $NEST_MAP || nest_fail "could not map the payload user namespace."
 $NEST_NET
@@ -2118,42 +2105,32 @@ $NEST_NET
 exec {SBX_BFD}</proc/\$SBX_B_PID/ns/user
 EOF
 )
-fi
 
 # Generate the launch script with properly escaped BWRAP_ARGS.
-# pasta runs this inside the session's user and net namespaces, so the
-# network prelude lands there — outside every namespace bwrap creates.
+# launch.sh runs in A: pasta's user and net namespaces, or unshare's for a
+# session without networking. The network prelude lands there — outside
+# every namespace bwrap creates.
 {
     echo "#!/bin/bash"
     echo "# Start the sandbox"
-    if [[ -n "$NEST_PRELUDE" ]]; then
-        echo "$NEST_PRELUDE"
-    fi
+    echo "$NEST_PRELUDE"
     if [[ -n "$NET_PRELUDE" ]]; then
         echo "$NET_PRELUDE"
     fi
 } > "$LAUNCH_SCRIPT"
 
-# With a net profile the script must outlive bwrap to reap dnsmasq, and with
-# a nested payload to release B and the relays, so it cannot exec. A
-# host-ports-only session without nesting has nothing to reap, so it can.
-if [[ "$SBX_NESTED" == "true" ]]; then
-    # bwrap starts in B's network namespace but A's user namespace, so every
-    # mount it makes belongs to A; --userns2 then moves the payload into B.
-    printf 'nsenter --net=/proc/"$SBX_B_PID"/ns/net -- bwrap ' >> "$LAUNCH_SCRIPT"
-elif [[ ${#NET_PROFILES[@]} -gt 0 ]]; then
-    printf "bwrap " >> "$LAUNCH_SCRIPT"
-else
-    printf "exec bwrap " >> "$LAUNCH_SCRIPT"
-fi
+# launch.sh always outlives bwrap now, to release B and the relays (and
+# dnsmasq, with a net profile) once the payload is done — never `exec`.
+#
+# bwrap starts in B's network namespace but A's user namespace, so every
+# mount it makes belongs to A; --userns2 then moves the payload into B.
+printf 'nsenter --net=/proc/"$SBX_B_PID"/ns/net -- bwrap ' >> "$LAUNCH_SCRIPT"
 for arg in "${BWRAP_ARGS[@]}"; do
     printf "%q " "$arg" >> "$LAUNCH_SCRIPT"
 done
-if [[ "$SBX_NESTED" == "true" ]]; then
-    # --userns2 alone. The man page pairs it with --userns; that form fails
-    # here ("Joining the specified user namespace failed").
-    printf -- '--userns2 "$SBX_BFD" ' >> "$LAUNCH_SCRIPT"
-fi
+# --userns2 alone. The man page pairs it with --userns; that form fails
+# here ("Joining the specified user namespace failed").
+printf -- '--userns2 "$SBX_BFD" ' >> "$LAUNCH_SCRIPT"
 # THE capability drop, applied exactly once and as high up as it can go.
 # bwrap's direct child is setpriv, which empties every capability set and
 # then execs session.sh as PID 1 — so the tmux server, the payload, every
@@ -2174,22 +2151,13 @@ fi
 # joins, which is why --join needs no capability logic of its own.
 if [[ "$CAPS_KEEP" != "true" ]]; then
     printf "setpriv --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- " >> "$LAUNCH_SCRIPT"
-elif [[ "$SBX_NESTED" == "true" ]]; then
+else
     # A mount namespace B owns, so podman can mount; the mounts inherited
     # from A stay locked. A capability-dropping payload could not run this
     # and has no use for it.
     printf "unshare --mount -- " >> "$LAUNCH_SCRIPT"
 fi
 printf "%q\n" "$SESSION_SCRIPT" >> "$LAUNCH_SCRIPT"
-
-if [[ ${#NET_PROFILES[@]} -gt 0 ]]; then
-    # Quoted heredoc: every expansion below belongs to launch.sh, not here.
-    cat >> "$LAUNCH_SCRIPT" <<'REAPEOF'
-SBX_RC=$?
-kill $DNSMASQ_PID 2>/dev/null || true
-exit $SBX_RC
-REAPEOF
-fi
 
 chmod +x "$LAUNCH_SCRIPT"
 
@@ -2247,12 +2215,8 @@ if [[ "$SBX_NETNS" == "true" ]]; then
     fi
 else
     echo "Starting session $SESSION_ID..."
-    if [[ "$SBX_NESTED" == "true" ]]; then
-        # The control namespace A for a session without networking: this user
-        # mapped to 0 in a new user namespace, and an empty network namespace.
-        # B gives the payload its host identity back (sbx_userns_map_outer_ids).
-        unshare --user --map-root-user --net -- "$LAUNCH_SCRIPT"
-    else
-        "$LAUNCH_SCRIPT"
-    fi
+    # The control namespace A for a session without networking: this user
+    # mapped to 0 in a new user namespace, and an empty network namespace.
+    # B gives the payload its host identity back (sbx_userns_map_outer_ids).
+    unshare --user --map-root-user --net -- "$LAUNCH_SCRIPT"
 fi

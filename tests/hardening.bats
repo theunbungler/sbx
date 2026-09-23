@@ -73,14 +73,15 @@ NETEOF
     [ "$(cat "$HOSTDIR/netran.txt")" = "netran" ]
 }
 
-# REGRESSION GUARDS, not a red-green cycle: bwrap zeroes every capability
-# set — effective and bounding — whenever it creates the user namespace
-# itself, which is what the no-net path does. So both capability tests
-# below pass before the change as well as after. They are here because
-# Task 2 rewrites capability handling for both modes and nothing else
-# would catch the no-net path regressing. The red for the capability
-# work lives in Task 2's networked tests, where bwrap joins pasta's
-# namespace instead and leaves every set full. Deliberate — do not
+# REGRESSION GUARDS, not a red-green cycle: no path has bwrap create the
+# user namespace any more — it always joins B with --userns2. What zeroes
+# every capability set on the no-net path now is --cap-drop ALL plus the
+# setpriv these tests guard, not bwrap's own namespace-creation default. So
+# both capability tests below pass before the change as well as after.
+# They are here because Task 2 rewrites capability handling for both modes
+# and nothing else would catch the no-net path regressing. The red for the
+# capability work lives in Task 2's networked tests, where bwrap joins
+# pasta's namespace instead and leaves every set full. Deliberate — do not
 # "fix" these into failing-first tests.
 @test "a no-net sandbox holds no capabilities" {
     run_sbx "--fs caps" "grep '^CapEff' /proc/self/status > /out/caps.txt"

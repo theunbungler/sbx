@@ -283,6 +283,73 @@ EOF
     [ "$(tail -1 "$HOSTDIR/run.txt")" = "hi" ]
 }
 
+@test "capless: the payload holds no capabilities" {
+    payload "--fs drop" <<'EOF'
+grep -E '^Cap(Eff|Bnd|Amb)' /proc/self/status > /out/caps.txt
+EOF
+    [ "$(grep -c '0000000000000000' "$HOSTDIR/caps.txt")" -eq 3 ]
+}
+
+@test "capless without networking: the payload sees the host uid" {
+    payload "--fs drop" <<'EOF'
+id -u > /out/id.txt
+EOF
+    [ "$(cat "$HOSTDIR/id.txt")" = "$(id -u)" ]
+}
+
+@test "capless with networking: the payload sees uid 0, as before" {
+    requires_net
+    payload "--fs drop --net nothing" <<'EOF'
+id -u > /out/id.txt
+EOF
+    [ "$(cat "$HOSTDIR/id.txt")" = "0" ]
+}
+
+@test "capless without networking: the payload is in its own user namespace, nested" {
+    payload "--fs drop" <<'EOF'
+cat /proc/self/uid_map > /out/map.txt
+EOF
+    # B's map is "<host uid> 0 1": the payload's uid maps to A's 0, not to
+    # the host's uid directly, as it did when bwrap created the namespace.
+    [ "$(tr -s ' ' < "$HOSTDIR/map.txt" | sed 's/^ //')" = "$(id -u) 0 1" ]
+}
+
+@test "capless: a granted TCP host port answers at 127.0.0.1 and localhost" {
+    requires_pasta
+    start_host_tcp
+    payload "--fs drop --host-port $TCP_PORT" <<EOF
+socat -T2 - TCP:127.0.0.1:$TCP_PORT </dev/null > /out/ip.txt
+socat -T2 - TCP:localhost:$TCP_PORT </dev/null > /out/name.txt
+EOF
+    [ "$(cat "$HOSTDIR/ip.txt")" = "host-tcp" ]
+    [ "$(cat "$HOSTDIR/name.txt")" = "host-tcp" ]
+}
+
+@test "capless: a granted UDP host port answers at 127.0.0.1" {
+    requires_pasta
+    start_host_udp
+    payload "--fs drop --host-port $UDP_PORT/udp" <<EOF
+echo q | socat -T2 - UDP:127.0.0.1:$UDP_PORT > /out/udp.txt
+EOF
+    # Same host quirk as "caps keep: a granted UDP host port answers at
+    # 127.0.0.1" above: this host's socat ",fork" UDP responder answers a
+    # single client datagram twice, independent of sandboxing. Check only
+    # that the relay actually delivered the answer, not how many times.
+    [ "$(head -1 "$HOSTDIR/udp.txt")" = "host-udp" ]
+}
+
+@test "capless with networking: DNS answers through resolv.conf and a denied target stays denied" {
+    requires_net
+    requires_denied_target
+    allowed_ip_profile
+    payload "--fs drop --net allowip" <<'EOF'
+getent ahostsv4 example.com > /out/dns.txt
+if curl -s -o /dev/null -m 5 http://1.1.1.1/; then echo BAD; else echo GOOD; fi > /out/denied.txt
+EOF
+    [ -s "$HOSTDIR/dns.txt" ]
+    [ "$(cat "$HOSTDIR/denied.txt")" = "GOOD" ]
+}
+
 @test "fs/podman-full keeps multi-uid fidelity and container DNS on an explicit network" {
     requires_net
     requires_podman_image
