@@ -168,8 +168,15 @@ launch.sh opens the namespace fd itself: `exec {SBX_BFD}</proc/$B_PID/ns/user`.
 Generates launch.sh fragments; `sbx` does not hand-assemble them.
 
 - **Wiring** (networked sessions): `sbx-a`/`sbx-b`, `sbx-b` moved into B's
-  network namespace, the fixed subnet `10.200.0.0/30` (A `10.200.0.1`, B
-  `10.200.0.2`; every session has its own pair of namespaces, so the same
+  network namespace, the fixed subnet `10.200.0.0/29` — A carries TWO
+  addresses, `10.200.0.1` for dnsmasq and `10.200.0.2` for the host-port
+  relays, and B has `10.200.0.3`. The second address exists because a
+  granted host port of 53 would otherwise collide with dnsmasq on the same
+  address: `so-bindtodevice` separates a relay from pasta's `lo`-bound
+  listener, but not from an unbound socket on the address the relay wants
+  (measured 2026-09-23, both bind orders). The README promises that naming
+  `53/udp` does not disturb the session's own DNS, so the two get one
+  address each. Every session has its own pair of namespaces, so the same
   addresses are reused without allocation), `ip_forward` in A, default route
   in B via A. The wiring happens before the ruleset and dnsmasq, because
   dnsmasq binds A's veth address; rules still match `iifname`, which does not
@@ -234,7 +241,10 @@ change, and no new state lands on disk.
   way for host-ports-only sessions that never start it. `unshare` moves from
   `podman` to `core` and `nsenter` joins `core`, since every session now runs
   both. (`ip` is already in `core`.)
-- **Payload DNS goes through dnsmasq only.** The payload's egress now crosses
+- **Payload DNS goes through dnsmasq only**, and the README's egress section
+  must say so: its "fixed exceptions" (loopback, established/related, the
+  upstream resolver on port 53) describe A's `output` chain, which the
+  payload no longer traverses. The payload's egress now crosses
   A's `forward` chain, which never carried the `output` chain's "upstream DNS
   on port 53" accepts. A payload that queried the upstream resolver directly
   used to succeed; it now fails. dnsmasq's own upstream queries are A's
