@@ -17,16 +17,18 @@ SBX_DEPS=(
     "envsubst   core    gettext     gettext-base  gettext-envsubst"
     "setpriv    core    util-linux  util-linux    util-linux-core"
     "flock      core    util-linux  util-linux    util-linux-core"
+    "unshare    core    util-linux  util-linux    util-linux-core"
+    "nsenter    core    util-linux  util-linux    util-linux-core"
     "realpath   core    coreutils   coreutils     coreutils"
     "sha256sum  core    coreutils   coreutils     coreutils"
     "ip         core    iproute2    iproute2      iproute"
     "pasta      net     passt       passt         passt"
     "nft        net     nftables    nftables      nftables"
     "dnsmasq    net     dnsmasq     dnsmasq       dnsmasq"
+    "socat      net     socat       socat         socat"
     "xpra       gui     xpra        xpra          xpra"
     "podman     podman  podman      podman        podman"
     "newuidmap  podman  shadow      uidmap        shadow-utils"
-    "unshare    podman  util-linux  util-linux    util-linux-core"
 )
 
 # Map /etc/os-release to a package family. ID is tried before ID_LIKE, so
@@ -250,6 +252,37 @@ sbx_deps_subids_ok() {
     return 0
 }
 
+sbx_deps_kernel_release() {
+    local rel="${SBX_KERNEL_RELEASE:-}"
+    if [[ -z "$rel" ]]; then
+        read -r rel < /proc/sys/kernel/osrelease
+    fi
+    echo "$rel"
+}
+
+# Every networked session joins its payload namespace to the control
+# namespace with a veth pair. veth is a kernel module, not a binary: the
+# RUNNING kernel must have it loaded, built in, or in its module tree. After
+# a kernel upgrade without a reboot the running kernel's tree is often gone,
+# and `ip link add ... type veth` then fails with "Unknown device type".
+sbx_deps_veth_ok() {
+    local mods="${SBX_LIB_MODULES:-/lib/modules}" rel f
+    [[ -d "${SBX_SYS_MODULE_DIR:-/sys/module}/veth" ]] && return 0
+    rel=$(sbx_deps_kernel_release)
+    for f in "$mods/$rel/kernel/drivers/net/veth.ko"*; do
+        [[ -e "$f" ]] && return 0
+    done
+    if awk '/\/veth\.ko$/ { found = 1 } END { exit !found }' "$mods/$rel/modules.builtin" 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+sbx_deps_veth_explain() {
+    echo "veth kernel module is not available to the running kernel ($(sbx_deps_kernel_release))."
+    echo "  After a kernel upgrade, reboot so the running kernel matches its modules."
+}
+
 sbx_deps_require() {
     local -a missing
     local line
@@ -271,6 +304,15 @@ sbx_deps_require() {
     if [[ " $* " == *" core "* ]]; then
         sbx_deps_userns_check >&2 || return 1
     fi
+    if [[ " $* " == *" net "* ]] && ! sbx_deps_veth_ok; then
+        local -a veth_lines
+        mapfile -t veth_lines < <(sbx_deps_veth_explain)
+        {
+            echo "Error: the ${veth_lines[0]}"
+            printf '%s\n' "${veth_lines[@]:1}"
+        } >&2
+        return 1
+    fi
     return 0
 }
 
@@ -289,7 +331,7 @@ sbx_deps_doctor() {
     local json=false
     [[ "${1:-}" == "--json" ]] && json=true
 
-    local family group rc=0 userns=null userns_msg="" subids=false user line
+    local family group rc=0 userns=null userns_msg="" subids=false veth=false user line
     local -a missing tools all_missing=() hint=()
     local -A group_missing=()
 
@@ -314,6 +356,9 @@ sbx_deps_doctor() {
     if sbx_deps_subids_ok; then
         subids=true
     fi
+    if sbx_deps_veth_ok; then
+        veth=true
+    fi
     if [[ ${#all_missing[@]} -gt 0 ]]; then
         mapfile -t hint < <(sbx_deps_install_hint "$family" "${all_missing[@]}")
     fi
@@ -327,7 +372,7 @@ sbx_deps_doctor() {
             printf '"%s":%s' "$group" "$(sbx_deps_json_list ${group_missing[$group]})"
             first=0
         done
-        printf '},"userns":%s,"subids":%s,"install":%s}\n' "$userns" "$subids" "$(sbx_deps_json_list "${hint[@]}")"
+        printf '},"userns":%s,"subids":%s,"veth":%s,"install":%s}\n' "$userns" "$subids" "$veth" "$(sbx_deps_json_list "${hint[@]}")"
         return $rc
     fi
 
@@ -353,6 +398,16 @@ sbx_deps_doctor() {
                         ;;
                 esac
                 ;;
+            net)
+                if [[ "$veth" == "true" ]]; then
+                    echo "         ✓ veth kernel module"
+                else
+                    local -a veth_lines
+                    mapfile -t veth_lines < <(sbx_deps_veth_explain)
+                    echo "         ✗ ${veth_lines[0]}"
+                    echo "           ${veth_lines[1]#  }"
+                fi
+                ;;
             podman)
                 if [[ "$subids" == "false" ]]; then
                     echo "         ✗ no subordinate UID/GID range for $user (needed by \"userns\": \"full\")"
@@ -374,12 +429,13 @@ sbx_deps_doctor() {
 
 # Report-only form of sbx_deps_require, for --dry-run: which of the given
 # groups' tools are missing, whether the user-namespace probe passes (only
-# when core is requested and bwrap exists), and whether subordinate IDs
-# exist (only with --subids). Prints one JSON object and returns 0 either
+# when core is requested and bwrap exists), whether subordinate IDs exist
+# (only with --subids), and whether the running kernel has the veth module
+# (only when net is requested). Prints one JSON object and returns 0 either
 # way — .ok carries the verdict, so the caller can show everything before
 # deciding its exit status.
 sbx_deps_status() {   # [--subids] <group>...
-    local want_subids=false group ok=true userns=null subids=null groups_json=""
+    local want_subids=false group ok=true userns=null subids=null veth=null groups_json=""
     local -a missing all_missing=() hint=()
     if [[ "${1:-}" == "--subids" ]]; then
         want_subids=true
@@ -413,6 +469,14 @@ sbx_deps_status() {   # [--subids] <group>...
             ok=false
         fi
     fi
-    printf '{"groups":{%s},"userns":%s,"subids":%s,"install":%s,"ok":%s}\n' \
-        "$groups_json" "$userns" "$subids" "$(sbx_deps_json_list "${hint[@]}")" "$ok"
+    if [[ " $* " == *" net "* ]]; then
+        if sbx_deps_veth_ok; then
+            veth=true
+        else
+            veth=false
+            ok=false
+        fi
+    fi
+    printf '{"groups":{%s},"userns":%s,"subids":%s,"veth":%s,"install":%s,"ok":%s}\n' \
+        "$groups_json" "$userns" "$subids" "$veth" "$(sbx_deps_json_list "${hint[@]}")" "$ok"
 }

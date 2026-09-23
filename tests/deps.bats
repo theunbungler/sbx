@@ -50,16 +50,26 @@ os_release() {   # <file> <ID> [<ID_LIKE>]
     [ "$output" = "unknown" ]
 }
 
+veth_loaded() {   # a /sys/module fixture where veth is loaded
+    mkdir -p "$FIX/sysmod/veth"
+    export SBX_SYS_MODULE_DIR="$FIX/sysmod"
+}
+
+veth_absent() {   # no veth anywhere: not loaded, no module file, not built in
+    mkdir -p "$FIX/sysmod" "$FIX/modules/6.0.0-test"
+    export SBX_SYS_MODULE_DIR="$FIX/sysmod" SBX_LIB_MODULES="$FIX/modules" SBX_KERNEL_RELEASE=6.0.0-test
+}
+
 @test "tools lists a group in table order" {
     run sbx_deps_tools net
-    [ "$output" = "$(printf 'pasta\nnft\ndnsmasq')" ]
+    [ "$output" = "$(printf 'pasta\nnft\ndnsmasq\nsocat')" ]
 }
 
 @test "missing reports only absent tools of the requested groups" {
     mkdir -p "$FIX/bin"
     ln -s "$(command -v nft)" "$FIX/bin/nft"
     PATH="$FIX/bin" run sbx_deps_missing net
-    [ "$output" = "$(printf 'pasta\ndnsmasq')" ]
+    [ "$output" = "$(printf 'pasta\ndnsmasq\nsocat')" ]
 }
 
 @test "packages dedupes tools that share a package" {
@@ -192,6 +202,7 @@ fake_sysctl() {   # <relative path under /proc/sys> <value>
 }
 
 @test "require passes silently when nothing is missing" {
+    veth_loaded
     fake_bwrap 0
     PATH="$FIX/bin:$PATH" run sbx_deps_require core net
     [ "$status" -eq 0 ]
@@ -203,12 +214,13 @@ fake_sysctl() {   # <relative path under /proc/sys> <value>
     mkdir -p "$FIX/bin"
     PATH="$FIX/bin" SBX_OS_RELEASE="$FIX/os" run sbx_deps_require net
     [ "$status" -eq 1 ]
-    [[ "${lines[0]}" == "Error: sbx requires pasta nft dnsmasq, which are not on PATH." ]]
-    [[ "$output" == *"sudo apt install passt nftables dnsmasq"* ]]
+    [[ "${lines[0]}" == "Error: sbx requires pasta nft dnsmasq socat, which are not on PATH." ]]
+    [[ "$output" == *"sudo apt install passt nftables dnsmasq socat"* ]]
     if [[ "$output" == *pacman* ]]; then return 1; fi
 }
 
 @test "require skips the userns probe for optional groups" {
+    veth_loaded
     fake_bwrap 1 "should not run"
     PATH="$FIX/bin:$PATH" run sbx_deps_require net
     [ "$status" -eq 0 ]
@@ -220,6 +232,49 @@ fake_sysctl() {   # <relative path under /proc/sys> <value>
     PATH="$FIX/bin:$PATH" SBX_PROC_SYS="$FIX/sys" run sbx_deps_require core
     [ "$status" -eq 1 ]
     [[ "$output" == *"unprivileged user namespace"* ]]
+}
+
+@test "veth ok when the module is loaded" {
+    veth_loaded
+    run sbx_deps_veth_ok
+    [ "$status" -eq 0 ]
+}
+
+@test "veth ok when the running kernel has the module file" {
+    veth_absent
+    mkdir -p "$FIX/modules/6.0.0-test/kernel/drivers/net"
+    : > "$FIX/modules/6.0.0-test/kernel/drivers/net/veth.ko.zst"
+    run sbx_deps_veth_ok
+    [ "$status" -eq 0 ]
+}
+
+@test "veth ok when it is built into the running kernel" {
+    veth_absent
+    echo "kernel/drivers/net/veth.ko" > "$FIX/modules/6.0.0-test/modules.builtin"
+    run sbx_deps_veth_ok
+    [ "$status" -eq 0 ]
+}
+
+@test "veth not ok when the running kernel's module tree lacks it" {
+    veth_absent
+    run sbx_deps_veth_ok
+    [ "$status" -eq 1 ]
+}
+
+@test "require net fails with a reboot hint when veth is unavailable" {
+    veth_absent
+    fake_bwrap 0
+    PATH="$FIX/bin:$PATH" run sbx_deps_require net
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"veth kernel module is not available to the running kernel (6.0.0-test)"* ]]
+    [[ "$output" == *reboot* ]]
+}
+
+@test "require core does not check veth" {
+    veth_absent
+    fake_bwrap 0
+    PATH="$FIX/bin:$PATH" run sbx_deps_require core
+    [ "$status" -eq 0 ]
 }
 
 doctor_bin() {   # <tool to omit>...: a PATH holding every table tool except those named
@@ -236,6 +291,7 @@ doctor_bin() {   # <tool to omit>...: a PATH holding every table tool except tho
 
 @test "doctor: all present exits 0 and reports each group" {
     doctor_bin bwrap
+    veth_loaded
     fake_bwrap 0
     os_release "$FIX/os" manjaro arch
     PATH="$FIX/bin" SBX_OS_RELEASE="$FIX/os" run sbx_deps_doctor
@@ -279,8 +335,30 @@ doctor_bin() {   # <tool to omit>...: a PATH holding every table tool except tho
     [[ "$output" == *"kernel.unprivileged_userns_clone=1"* ]]
 }
 
+@test "doctor reports veth under net" {
+    doctor_bin bwrap
+    fake_bwrap 0
+    veth_absent
+    PATH="$FIX/bin" run sbx_deps_doctor
+    [[ "$output" == *"✗ veth kernel module"* ]]
+    PATH="$FIX/bin" run sbx_deps_doctor --json
+    [ "$(jq -r .veth <<< "$output")" = "false" ]
+}
+
+@test "status: veth is null without net and false when net needs it" {
+    doctor_bin bwrap
+    fake_bwrap 0
+    veth_absent
+    PATH="$FIX/bin" run sbx_deps_status core
+    [ "$(jq -r .veth <<< "$output")" = "null" ]
+    PATH="$FIX/bin" run sbx_deps_status core net
+    [ "$(jq -r .veth <<< "$output")" = "false" ]
+    [ "$(jq -r .ok <<< "$output")" = "false" ]
+}
+
 @test "doctor --json is parseable and matches the text report" {
     doctor_bin bwrap pasta
+    veth_loaded
     fake_bwrap 0
     os_release "$FIX/os" ubuntu debian
     : > "$FIX/subuid"; : > "$FIX/subgid"
@@ -296,6 +374,7 @@ doctor_bin() {   # <tool to omit>...: a PATH holding every table tool except tho
 
 @test "status: everything present is ok" {
     doctor_bin bwrap
+    veth_loaded
     fake_bwrap 0
     PATH="$FIX/bin" run sbx_deps_status core net
     [ "$status" -eq 0 ]
@@ -308,6 +387,7 @@ doctor_bin() {   # <tool to omit>...: a PATH holding every table tool except tho
 
 @test "status: a missing tool is listed with the distro's command, and returns 0" {
     doctor_bin bwrap pasta
+    veth_loaded
     fake_bwrap 0
     os_release "$FIX/os" manjaro arch
     PATH="$FIX/bin" SBX_OS_RELEASE="$FIX/os" run sbx_deps_status core net
@@ -329,6 +409,7 @@ doctor_bin() {   # <tool to omit>...: a PATH holding every table tool except tho
 
 @test "status: the probe does not run without core" {
     doctor_bin bwrap
+    veth_loaded
     fake_bwrap 1 "bwrap: nope"
     PATH="$FIX/bin" run sbx_deps_status net
     [ "$(jq -r .userns <<< "$output")" = "null" ]

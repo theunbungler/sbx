@@ -128,6 +128,13 @@ line() {   # <prefix> -> the first output line starting with it
     [ "$(line Result)" = "Result     the launch would stop" ]
 }
 
+@test "needs shows veth only when it was checked" {
+    render '.needs = {groups:{core:[], net:[]}, userns:true, subids:null, veth:false, install:[], ok:false}'
+    [ "$(line Needs)" = "Needs      core ✓ · net ✓ · userns ✓ · veth ✗" ]
+    render '.needs = {groups:{core:[]}, userns:true, subids:null, veth:null, install:[], ok:true}'
+    [ "$(line Needs)" = "Needs      core ✓ · userns ✓" ]
+}
+
 @test "errors are listed, the plan sections are omitted, and the launch would stop" {
     render '.errors = ["/p.json: .mount: unknown field for a fs profile"] | .proceed = false'
     [ "$(line Errors)" = "Errors     /p.json: .mount: unknown field for a fs profile" ]

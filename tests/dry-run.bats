@@ -23,6 +23,8 @@ setup() {
     mkdir -p "$HOME/.config/sbx/profiles/fs" "$HOME/.config/sbx/profiles/cli" "$PROJ" "$ROOT/src"
     echo data > "$ROOT/src/f"
     printf 'ID=manjaro\nID_LIKE=arch\n' > "$ROOT/arch"
+    mkdir -p "$ROOT/sysmod/veth"
+    export SBX_SYS_MODULE_DIR="$ROOT/sysmod"
 }
 
 teardown() {

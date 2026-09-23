@@ -88,6 +88,8 @@ case "$*" in
 esac
 exit 0
 EOF
+    printf '#!/bin/bash\nexit 0\n' > "$STUB/socat"
+    mkdir -p "$ROOT/sysmod/veth"
     chmod +x "$STUB"/*
 }
 
@@ -185,6 +187,7 @@ run_case() {   # <case name> <sbx args...>
         TERM=xterm LANG=C.UTF-8 \
         SBX_CAPTURE="$CAP/$name" \
         SBX_SUBUID="$ROOT/subuid" SBX_SUBGID="$ROOT/subgid" \
+        SBX_SYS_MODULE_DIR="$ROOT/sysmod" \
         SBX_SNAP_TOKEN=snaptoken \
         script -qec "$cmd" /dev/null < /dev/null > "$ROOT/$name.out" 2>&1 ) || true
     if [[ -d "$CAP/$name" ]]; then
