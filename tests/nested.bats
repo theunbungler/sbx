@@ -130,9 +130,17 @@ EOF
     payload "--fs keep" <<'EOF'
 grep '^CapEff' /proc/self/status > /out/caps.txt
 EOF
+    [ -s "$HOSTDIR/caps.txt" ]
     [[ "$(cat "$HOSTDIR/caps.txt")" != *"0000000000000000" ]]
 }
 
+# These three (no --net) pass whether or not the payload runs nested in B:
+# without networking, bwrap already creates its own user namespace here, so
+# its ro binds are already MNT_LOCKED against this same process either way.
+# They are not evidence the payload runs in B — the podman-nonet snapshot
+# golden is what pins that shape. The networked variants below are the ones
+# this task exists to fix (bwrap joins pasta's user namespace there, so
+# without nesting its ro binds are not locked against the payload).
 @test "caps keep: a ro mount cannot be remounted writable" {
     payload "--fs keep" <<'EOF'
 if mount -o remount,bind,rw /ro 2>/dev/null; then echo BAD; else echo GOOD; fi > /out/r.txt
@@ -149,6 +157,33 @@ EOF
 
 @test "caps keep: a ro mount's host file survives an attack" {
     payload "--fs keep" <<'EOF'
+mount -o remount,bind,rw /ro 2>/dev/null
+umount /ro 2>/dev/null
+echo pwned > /ro/f.txt 2>/dev/null
+true
+EOF
+    [ "$(cat "$RODIR/f.txt")" = "readonly" ]
+}
+
+@test "caps keep with networking: a ro mount cannot be remounted writable" {
+    requires_net
+    payload "--fs keep --net nothing" <<'EOF'
+if mount -o remount,bind,rw /ro 2>/dev/null; then echo BAD; else echo GOOD; fi > /out/r.txt
+EOF
+    [ "$(cat "$HOSTDIR/r.txt")" = "GOOD" ]
+}
+
+@test "caps keep with networking: a ro mount cannot be unmounted" {
+    requires_net
+    payload "--fs keep --net nothing" <<'EOF'
+if umount /ro 2>/dev/null; then echo BAD; else echo GOOD; fi > /out/u.txt
+EOF
+    [ "$(cat "$HOSTDIR/u.txt")" = "GOOD" ]
+}
+
+@test "caps keep with networking: a ro mount's host file survives an attack" {
+    requires_net
+    payload "--fs keep --net nothing" <<'EOF'
 mount -o remount,bind,rw /ro 2>/dev/null
 umount /ro 2>/dev/null
 echo pwned > /ro/f.txt 2>/dev/null
@@ -248,7 +283,7 @@ EOF
     [ "$(tail -1 "$HOSTDIR/run.txt")" = "hi" ]
 }
 
-@test "fs/podman-full keeps multi-uid fidelity and container DNS" {
+@test "fs/podman-full keeps multi-uid fidelity and container DNS on an explicit network" {
     requires_net
     requires_podman_image
     # DNS runs on an explicitly created network, not the containers.conf
