@@ -141,6 +141,12 @@ sbx_net_merge() {   # <net profile path>...
              cidrs: ([$rows[] | select(.type == "c") | {key: .key, value: .ports}] | from_entries),
              allow_all: $allow_all,
              allow_all_ports: $allow_all_ports,
-             test_domain: $test_domain }' \
+             test_domain: $test_domain }
+         # One nftables set per distinct port signature, named in a fixed
+         # order: domains by name, then the wildcard.
+         | .sets = ( [ (.domains | to_entries | sort_by(.key)[] | .value.ports),
+                       (if .allow_all then .allow_all_ports else empty end) ]
+                     | reduce .[] as $s ([]; if any(.[]; . == $s) then . else . + [$s] end)
+                     | to_entries | map({name: "allowed4_\(.key + 1)", ports: .value}) )' \
         --args "${upstreams[@]}"
 }

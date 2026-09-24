@@ -18,4 +18,5 @@ snap0
 24
 --
 /bin/bash
-@ROOT@/h/.local/state/sbx/sessions/proj/launch.sh
+@REPO@/lib/launch.sh
+@ROOT@/h/.local/state/sbx/sessions/proj/launch.env

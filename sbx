@@ -29,6 +29,8 @@ source "$SCRIPT_DIR/lib/sessions.sh"
 # A's extra chains and the A/B addresses (nested payload networking).
 # shellcheck source=lib/nestnet.sh
 source "$SCRIPT_DIR/lib/nestnet.sh"
+# shellcheck source=lib/egress.sh
+source "$SCRIPT_DIR/lib/egress.sh"
 
 GUI_MODE=false
 XPRA_DISPLAY=""
@@ -972,7 +974,7 @@ if [[ "$USERNS_FULL" == "true" ]]; then
     # is taken now, before the [network] section is appended, so it holds
     # only the settings above and cannot inherit that section no matter
     # how large it later grows. It is used for exactly one command: the
-    # network create in USERNS_NET_SETUP. Created under this config, sbx0
+    # network create in lib/wrapper.sh. Created under this config, sbx0
     # keeps dns_enabled=true even once the real config below names it as
     # the default. Measured on podman 6.1.1.
     cp "$VIRT_DIR/containers.conf" "$VIRT_DIR/containers-bootstrap.conf"
@@ -985,7 +987,7 @@ if [[ "$USERNS_FULL" == "true" ]]; then
     # sandbox's own /etc/resolv.conf (127.0.0.1 -> sbx's dnsmasq) as its
     # upstream, so routing containers through it is what lets
     # hostname-based `allow` entries populate the forward chain's
-    # allowed4 set (see USERNS_NET_SETUP below, which creates this
+    # allowed4 set (see lib/wrapper.sh, which creates this
     # network). Without this, container DNS goes straight to public
     # resolvers, which the forward chain correctly drops (no egress
     # leak) but which also means hostname-based allow entries never
@@ -1297,67 +1299,14 @@ if [[ "$SBX_NETNS" == "true" ]]; then
     # untouched by pasta and is local via lo's 127.0.0.1/8.
     SBX_DNS_ADDR="127.0.0.2"
 
-    # Everything from here to the resolv.conf bind is DNS machinery, which
-    # only a net profile needs: a host-ports-only session resolves nothing,
-    # because its one reachable destination is a loopback address.
-    if [[ ${#NET_PROFILES[@]} -gt 0 ]]; then
-
-    # Composition rules for stacked net profiles live in lib/net-merge.sh.
-    declare -A DOMAIN_PORTS=()      # domain -> port signature ("*" or "80,443")
-    declare -A DOMAIN_UPSTREAM=()   # domain -> resolver that profile chose
-    declare -A CIDR_PORTS=()        # cidr   -> port signature
-    while IFS= read -r -d '' domain && IFS= read -r -d '' sig && IFS= read -r -d '' upstream; do
-        DOMAIN_PORTS["$domain"]="$sig"
-        DOMAIN_UPSTREAM["$domain"]="$upstream"
-    done < <(jq -j 'def nul: [0] | implode; .net.domains | to_entries[] | .key, nul, .value.ports, nul, .value.upstream, nul' <<< "$PLAN")
-    while IFS= read -r -d '' cidr && IFS= read -r -d '' sig; do
-        CIDR_PORTS["$cidr"]="$sig"
-    done < <(jq -j 'def nul: [0] | implode; .net.cidrs | to_entries[] | .key, nul, .value, nul' <<< "$PLAN")
-    ALLOW_ALL=$(plan_get '.net.allow_all')
-    ALLOW_ALL_PORTS=$(plan_get '.net.allow_all_ports')
-    mapfile -t DNS_UPSTREAMS < <(plan_get '.net.upstreams[]')
-    DNS_UPSTREAM="${DNS_UPSTREAMS[0]}"
-    TEST_DOMAIN=$(plan_get '.net.test_domain')
-
-    # Assign every distinct port signature its own set name, then build the
-    # dnsmasq flags: one --server and one --nftset per domain.
-    declare -A PORTS_SETNAME=()
-    SET_INDEX=0
-    DNSMASQ_DOMAIN_ARGS=()
-    for domain in "${!DOMAIN_PORTS[@]}"; do
-        sig="${DOMAIN_PORTS[$domain]}"
-        if [[ -z "${PORTS_SETNAME[$sig]:-}" ]]; then
-            SET_INDEX=$((SET_INDEX + 1))
-            PORTS_SETNAME["$sig"]="allowed4_$SET_INDEX"
-        fi
-        DNSMASQ_DOMAIN_ARGS+=("--server=/$domain/${DOMAIN_UPSTREAM[$domain]}")
-        DNSMASQ_DOMAIN_ARGS+=("--nftset=/$domain/inet#sbx_filter#${PORTS_SETNAME[$sig]}")
-    done
-
-    if [[ "$ALLOW_ALL" == "true" ]]; then
-        if [[ -z "${PORTS_SETNAME[$ALLOW_ALL_PORTS]:-}" ]]; then
-            SET_INDEX=$((SET_INDEX + 1))
-            PORTS_SETNAME["$ALLOW_ALL_PORTS"]="allowed4_$SET_INDEX"
-        fi
-        ALLOW_ALL_SET="${PORTS_SETNAME[$ALLOW_ALL_PORTS]}"
-    fi
-
-    # resolv.conf points into the sandbox at our dnsmasq instance.
-    printf 'nameserver %s\n' "$SBX_DNS_ADDR" > "$DNS_DIR/resolv.conf"
-
+    if [[ "$(plan_get '.net.enabled')" == "true" ]]; then
+        printf 'nameserver %s\n' "$SBX_DNS_ADDR" > "$DNS_DIR/resolv.conf"
     else
-        # Host-ports-only: no resolver runs and no destination outside
-        # loopback is reachable, so an empty resolv.conf is the honest
-        # description. Name lookups fail immediately instead of hanging on
-        # a nameserver the ruleset drops; "localhost" still resolves,
-        # because that comes from /etc/hosts rather than DNS.
+        # Host ports only: no resolver runs and nothing outside loopback is
+        # reachable, so lookups fail at once instead of hanging on a
+        # nameserver the ruleset drops. "localhost" still resolves, from
+        # /etc/hosts.
         : > "$DNS_DIR/resolv.conf"
-        ALLOW_ALL=false
-        TEST_DOMAIN=""
-        DNSMASQ_DOMAIN_ARGS=()
-        DNS_UPSTREAMS=()
-        declare -A PORTS_SETNAME=()
-        declare -A CIDR_PORTS=()
     fi
 
     # /etc is bound read-only above, so whatever /etc/resolv.conf is on the
@@ -1376,95 +1325,7 @@ if [[ "$SBX_NETNS" == "true" ]]; then
     fi
     BWRAP_ARGS+=(--ro-bind "$DNS_DIR/resolv.conf" "$RESOLV_DEST")
 
-    # nftables egress rules — default-drop, permit only:
-    #   lo / established / DNS to $SBX_DNS_ADDR / upstream DNS on port 53
-    #   explicit CIDRs from profile / @allowed4 (auto-populated by dnsmasq --nftset)
-    # Raw IP connections and all IPv6 egress are dropped.
-    # Shared egress accept rules, emitted into both the output chain
-    # (process-originated traffic) and the forward chain. The forward
-    # chain exists because rootful podman under userns:full uses the
-    # netavark bridge backend: bridge-forwarded container traffic
-    # traverses the kernel forward hook, never output, so an output-only
-    # table would leave podman-full container egress completely ungated.
-    # One accept per destination, carrying the ports that destination was
-    # actually granted. A "*" signature means any port.
-    emit_dest_rule() {
-        local dest="$1" sig="$2"
-        if [[ "$sig" == "*" ]]; then
-            echo "        ip daddr $dest accept"
-        else
-            echo "        ip daddr $dest tcp dport { $sig } accept"
-            echo "        ip daddr $dest udp dport { $sig } accept"
-        fi
-    }
-
-    emit_egress_allow_rules() {
-        # Explicit CIDRs, each gated by the ports of the profile that
-        # allowed it.
-        local cidr sig
-        for cidr in "${!CIDR_PORTS[@]}"; do
-            emit_dest_rule "$cidr" "${CIDR_PORTS[$cidr]}"
-        done
-
-        # One rule per port signature, naming that signature's set. Domains
-        # were sorted into these sets by dnsmasq --nftset as answers arrived.
-        for sig in "${!PORTS_SETNAME[@]}"; do
-            emit_dest_rule "@${PORTS_SETNAME[$sig]}" "$sig"
-        done
-    }
-
-    NFT_RULES="$DNS_DIR/rules.nft"
-    {
-        echo "table inet sbx_filter {"
-        for sig in "${!PORTS_SETNAME[@]}"; do
-            echo "    set ${PORTS_SETNAME[$sig]} {"
-            echo "        type ipv4_addr"
-            echo "        flags timeout"
-            echo "    }"
-        done
-        echo "    chain output {"
-        echo "        type filter hook output priority 0; policy drop;"
-        # Loopback carries the host-port splice: pasta binds each named
-        # host port inside this namespace, so reaching a host service is
-        # loopback traffic and needs no destination rule of its own. The
-        # allow-list for it is pasta's -T list, not this table.
-        echo "        oif \"lo\" accept"
-        echo "        ct state established,related accept"
-
-        if [[ ${#NET_PROFILES[@]} -gt 0 ]]; then
-            echo "        ip daddr $SBX_DNS_ADDR udp dport 53 accept"
-            echo "        ip daddr $SBX_DNS_ADDR tcp dport 53 accept"
-            for upstream in "${DNS_UPSTREAMS[@]}"; do
-                echo "        ip daddr $upstream udp dport 53 accept"
-                echo "        ip daddr $upstream tcp dport 53 accept"
-            done
-
-            emit_egress_allow_rules
-        fi
-
-        echo "        meta nfproto ipv6 drop"
-        echo "    }"
-
-        # Forward chain: gates bridge-forwarded container egress (netavark,
-        # used by rootful podman under userns:full). Deliberately omits the
-        # lo/DNS-to-$SBX_DNS_ADDR/DNS-to-upstream accepts above: container->
-        # aardvark DNS is delivered via the input hook, and aardvark's own
-        # upstream queries originate from a session process and hit output.
-        echo "    chain forward {"
-        echo "        type filter hook forward priority 0; policy drop;"
-        echo "        ct state established,related accept"
-        if [[ ${#NET_PROFILES[@]} -gt 0 ]]; then
-            emit_egress_allow_rules
-        fi
-        echo "        meta nfproto ipv6 drop"
-        echo "    }"
-
-        # A's side of the nested payload: what B may reach on A, and the
-        # masquerade for B's egress (lib/nestnet.sh).
-        sbx_nestnet_a_rules "$([[ ${#NET_PROFILES[@]} -gt 0 ]] && echo true || echo false)" "$NEST_TCP" "$NEST_UDP"
-
-        echo "}"
-    } > "$NFT_RULES"
+    sbx_egress_rules "$(plan_get '.net')" "$SBX_DNS_ADDR" "$NEST_TCP" "$NEST_UDP" > "$DNS_DIR/rules.nft"
 fi
 
 # Session State Persistence
@@ -1689,197 +1550,27 @@ teardown() {
 trap teardown EXIT
 
 # Execution
-TMUX_SOCK="$SESSION_DIR/tmux.sock"
-TMUX_CONF="$SESSION_DIR/tmux.conf"
-SESSION_SCRIPT="$SESSION_DIR/session.sh"
-LAUNCH_SCRIPT="$SESSION_DIR/launch.sh"
-CAT_WRAPPER="$SESSION_DIR/wrapper.sh"
-DNSMASQ_BIN=$(which dnsmasq)
+#
+# The scripts that run the session are fixed files in lib/: launch.sh runs
+# in the control namespace A, and session.sh and wrapper.sh inside the
+# sandbox, so those two are copied into the session directory (the one host
+# path every sandbox has). What differs per session is written beside them
+# as data: bwrap.args, launch.env, wrapper.env and command.
 
-# Opt-in podman docker-API service ("docker_api": true in any profile).
-# Startup failure is a WARNING, not fatal — the docker CLI shim works
-# without the service (contrast: nft/dnsmasq failures stay hard errors;
-# egress safety is never best-effort). Killed when the command exits.
-DOCKER_API_START=""
-DOCKER_API_STOP=""
-if [[ "$DOCKER_API" == "true" ]]; then
-    DOCKER_API_START=$(cat <<APIEOF
-mkdir -p "$(dirname "$PODMAN_SOCK")"
-podman system service --time=0 "unix://$PODMAN_SOCK" > "$SESSION_DIR/podman-api.log" 2>&1 &
-PODMAN_API_PID=\$!
-for i in {1..10}; do
-    [[ -S "$PODMAN_SOCK" ]] && break
-    sleep 0.5
-done
-if [[ ! -S "$PODMAN_SOCK" ]]; then
-    echo "Warning: podman API socket did not appear at $PODMAN_SOCK; docker SDK clients will fail (the docker CLI shim still works)." >&2
-    cat "$SESSION_DIR/podman-api.log" >&2 || true
-fi
-APIEOF
-)
-    DOCKER_API_STOP='[[ -n "$PODMAN_API_PID" ]] && kill $PODMAN_API_PID 2>/dev/null || true'
-fi
-
-# userns:full only (which requires --net, enforced earlier): create the
-# DNS-enabled "sbx0" network that containers.conf's default_network now
-# points at. Idempotent — a repeat "already exists" failure is expected
-# and harmless (confirmed: if creation ever failed for a real reason,
-# podman fails loudly downstream with "network not found" when a
-# container runs, not silently — but stderr is still logged here so the
-# actual cause isn't lost). Only reachable via the net-profile wrapper
-# below, since userns:full without --net is a hard error before session
-# state is even created.
-USERNS_NET_SETUP=""
-if [[ "$USERNS_FULL" == "true" ]]; then
-    USERNS_NET_SETUP="CONTAINERS_CONF=\"$VIRT_DIR/containers-bootstrap.conf\" podman network create sbx0 >/dev/null 2>> \"$VIRT_DIR/network-create.log\" || true"
-fi
-
-NET_PRELUDE=""
-if [[ "$SBX_NETNS" == "true" && ${#NET_PROFILES[@]} -eq 0 ]]; then
-    # Host-ports-only: load the ruleset (which permits loopback and nothing
-    # else) and start no resolver. Same hard-fail contract as the net path —
-    # a session must never come up with the egress table missing.
-    NET_PRELUDE=$(cat <<EOF
-ip link set lo up >/dev/null 2>&1
-
-if ! NFT_ERR=\$(nft -f "$NFT_RULES" 2>&1); then
-    echo "Error: nftables rules failed to load — aborting." >&2
-    echo "  nft: \$NFT_ERR" >&2
-    exit 1
-fi
-EOF
-)
-elif [[ ${#NET_PROFILES[@]} -gt 0 ]]; then
-    # Serialise per-domain flags for expansion inside the heredoc. A
-    # wildcard profile adds a catch-all server and set on top of the
-    # per-domain flags rather than replacing them: dnsmasq prefers the more
-    # specific match, so a domain another profile named on narrow ports
-    # keeps its own set (and its own ports) even alongside `allow: ["*"]`.
-    DNSMASQ_DOMAIN_FLAGS=""
-    if [[ ${#DNSMASQ_DOMAIN_ARGS[@]} -gt 0 ]]; then
-        DNSMASQ_DOMAIN_FLAGS=$(printf '%s ' "${DNSMASQ_DOMAIN_ARGS[@]}")
-    fi
-    if [[ "$ALLOW_ALL" == "true" ]]; then
-        DNSMASQ_DOMAIN_FLAGS+="--server=$DNS_UPSTREAM --nftset=//inet#sbx_filter#$ALLOW_ALL_SET"
-    fi
-
-    # Runs in launch.sh: inside pasta's namespaces, before bwrap, with the
-    # capabilities nft and dnsmasq need. Everything started here lives
-    # outside the sandbox's PID and mount namespaces, so the payload can
-    # neither signal dnsmasq nor alter the ruleset.
-    NET_PRELUDE=$(cat <<EOF
-ip link set lo up >/dev/null 2>&1
-
-# Hard-fail if nftables rules cannot be loaded — never proceed with open egress.
-if ! NFT_ERR=\$(nft -f "$NFT_RULES" 2>&1); then
-    echo "Error: nftables rules failed to load — aborting." >&2
-    echo "  nft: \$NFT_ERR" >&2
-    exit 1
-fi
-
-# dnsmasq on $SBX_DNS_ADDR:53 (see SBX_DNS_ADDR above).
-# All options are CLI flags: AppArmor's usr.sbin.dnsmasq profile restricts
-# config-file paths to /etc/dnsmasq.d/*, making arbitrary paths unreadable.
-# --conf-file=/dev/null  suppress any host /etc/dnsmasq.conf
-# --filter-AAAA          return only A records; IPv6 egress is nft-dropped anyway
-# --nftset               auto-populates @allowed4 from A-record answers —
-#                        no bespoke sniffer needed
-"$DNSMASQ_BIN" \\
-    --conf-file=/dev/null \\
-    -d \\
-    --port=53 \\
-    --listen-address=$SBX_DNS_ADDR --listen-address=$SBX_NEST_A_ADDR \\
-    --bind-interfaces \\
-    --no-resolv \\
-    --no-hosts \\
-    --filter-AAAA \\
-    $DNSMASQ_DOMAIN_FLAGS \\
-    > "$DNS_DIR/dnsmasq.log" 2>&1 &
-DNSMASQ_PID=\$!
-
-# The probe must query this session's dnsmasq, but launch.sh sees the host
-# /etc/resolv.conf. A throwaway bwrap binds the session resolv.conf so the
-# check is accurate and every setup failure still prints before the session
-# multiplexer starts.
-probe_dns() {
-    bwrap --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib \\
-        --symlink usr/lib64 /lib64 --ro-bind /etc /etc \\
-        --ro-bind "$DNS_DIR/resolv.conf" "$RESOLV_DEST" \\
-        --proc /proc --dev /dev \\
-        -- getent ahostsv4 "$TEST_DOMAIN" >/dev/null 2>&1
-}
-
-DNS_READY=false
-for i in {1..20}; do
-    if ! kill -0 \$DNSMASQ_PID 2>/dev/null; then
-        echo "Error: dnsmasq failed to start:" >&2
-        cat "$DNS_DIR/dnsmasq.log" >&2
-        exit 1
-    fi
-    if [[ -z "$TEST_DOMAIN" ]] || probe_dns; then
-        DNS_READY=true
-        break
-    fi
-    sleep 0.5
-done
-if [[ "\$DNS_READY" != "true" ]]; then
-    echo "Error: dnsmasq did not become ready (could not resolve '$TEST_DOMAIN')." >&2
-    cat "$DNS_DIR/dnsmasq.log" >&2
-    kill \$DNSMASQ_PID 2>/dev/null
-    exit 1
-fi
-EOF
-)
-fi
-
-# The wrapper is now the payload and nothing else — network setup has moved
-# to launch.sh, so both modes generate the same shape.
-if [[ "$CAPS_KEEP" == "true" ]]; then
-    cat > "$CAT_WRAPPER" <<EOF
-#!/bin/bash
-$USERNS_NET_SETUP
-$DOCKER_API_START
-$(printf "%q " "${COMMAND[@]}")
-$DOCKER_API_STOP
-EOF
-else
-    # No setpriv here any more. The drop used to sit in this wrapper, which
-    # covered the payload and nothing else — the tmux server, being started
-    # by session.sh, kept CAP_SETPCAP and handed it to every pane it forked
-    # (new-window and split-window are default key bindings). It now happens
-    # once in launch.sh, above session.sh, so this process is already capless
-    # before it starts and a second --bounding-set=-all would fail with
-    # EPERM: emptying a bounding set itself requires CAP_SETPCAP.
-    # exec because a capless session has no docker-API service to stop
-    # afterwards. USERNS_NET_SETUP and DOCKER_API_START are both podman
-    # operations and are unreachable without capabilities, so they are
-    # absent here by construction.
-    cat > "$CAT_WRAPPER" <<EOF
-#!/bin/bash
-exec $(printf "%q " "${COMMAND[@]}")
-EOF
-fi
-chmod +x "$CAT_WRAPPER"
-
-# Per-session tmux config. The -f that loads this is not cosmetic: the
-# sandbox usually has $HOME mounted, so without it the server would read
-# the user's ~/.tmux.conf and session behaviour would depend on host
-# dotfiles. Every setting here is load-bearing:
-#   update-environment  SECURITY. A tmux client ships its environment to the
-#                  server, and this list is what gets applied to new
-#                  sessions — by default DISPLAY, SSH_AUTH_SOCK and friends.
-#                  Leaving it at the default drives a host-env hole straight
-#                  through the --clearenv policy above. Emptied deliberately.
-#                  NOT sufficient on its own: tmux copies the client's PATH
-#                  into a spawned pane regardless of this list, which is why
-#                  --join re-imposes the session's PATH itself.
-#   exit-empty     the session-lifetime rule — server exits with its last
-#                  session, which is what lets session.sh stop waiting.
-#   prefix C-\     a host tmux keeps C-b, so nesting needs no doubled
-#                  prefix. C-\ is also abduco's old detach chord.
+# Per-session tmux config. The -f that loads it keeps the server off the
+# user's ~/.tmux.conf, which a mounted $HOME would otherwise supply.
+#   update-environment  SECURITY. A client ships its environment to the
+#                  server, and by default DISPLAY, SSH_AUTH_SOCK and friends
+#                  are applied to new sessions — a hole straight through
+#                  --clearenv. Not sufficient alone: tmux copies the client's
+#                  PATH into a pane regardless, which is why --join
+#                  re-imposes the session's PATH itself.
+#   exit-empty     the server exits with its last session, which is what
+#                  lets session.sh stop waiting.
+#   prefix C-\     a host tmux keeps C-b, so nesting needs no doubled prefix.
 #   window-size    per-client sizing, so one join cannot resize another.
 #   status-left    makes "you are inside a sandbox" visible at a glance.
-cat > "$TMUX_CONF" <<EOF
+cat > "$SESSION_DIR/tmux.conf" <<EOF
 set -g update-environment ''
 set -g exit-empty on
 set -g escape-time 0
@@ -1892,173 +1583,45 @@ set -g status-left ' sbx:$SESSION_ID '
 set -g status-left-length 40
 EOF
 
-# PID 1 inside the sandbox. This script — not the tmux server, and not the
-# payload — is what bwrap waits on, and that is the whole implementation of
-# the session-lifetime rule: the server daemonizes, so if this exited,
-# bwrap's direct child would be gone and the pid namespace would take every
-# live session with it, joins included. Instead it hangs around until the
-# server is gone, which (with exit-empty on) means the last session — payload
-# or join, whichever ends last — has exited. Only then does bwrap return and
-# launch.sh proceed to teardown and the record-mount change archive. Note
-# what this does and does not promise: it keeps the sandbox alive for joins
-# the payload has finished outliving, but its liveness test is socket
-# connectivity, and the payload can delete the socket or run
-# `tmux kill-server` to end its own sandbox whenever it likes. That does not
-# in fact let a live join get missed by the archive: killing this waiter is
-# what makes bwrap return, and bwrap returning destroys the pid namespace
-# the join's pane runs in, so the join has no process left to write with —
-# measured in tests/join.bats "writeback waits on the host lock when
-# teardown is not gated by the sandbox". The overlap this waiter genuinely
-# cannot prevent is teardown running as an EXIT trap on a signal (Ctrl-C,
-# a CI timeout) while this script and the whole sandbox are still alive and
-# running normally — a path this waiter is never on, since bwrap hasn't
-# returned yet. The host-side flock in teardown() is what closes that gap.
-#
-# No `set -e`: attach is expected to fail when the payload is short-lived
-# enough to have exited before we get here, and that is not an error. A
-# failure to start the server is a different thing entirely and is checked
-# explicitly: without it, `attach` fails into `|| true`, the loop's first
-# list-sessions fails, this script exits 0 and sbx reports a session whose
-# payload never ran as one whose changes were saved.
-cat > "$SESSION_SCRIPT" <<EOF
-#!/bin/bash
-if ! tmux -f $(printf '%q' "$TMUX_CONF") -S $(printf '%q' "$TMUX_SOCK") \\
-    new-session -d -s main -- $(printf '%q' "$CAT_WRAPPER"); then
-    echo "sbx: the in-sandbox tmux server failed to start; the payload did not run." >&2
-    exit 1
-fi
-tmux -S $(printf '%q' "$TMUX_SOCK") attach -t main || true
-while tmux -S $(printf '%q' "$TMUX_SOCK") list-sessions >/dev/null 2>&1; do
-    sleep 0.5
-done
-EOF
-chmod +x "$SESSION_SCRIPT"
+install -m 0755 "$SCRIPT_DIR/lib/session.sh" "$SESSION_DIR/session.sh"
+install -m 0755 "$SCRIPT_DIR/lib/wrapper.sh" "$SESSION_DIR/wrapper.sh"
+printf '%s\0' "${COMMAND[@]}" > "$SESSION_DIR/command"
+printf '%s\0' "${BWRAP_ARGS[@]}" > "$SESSION_DIR/bwrap.args"
 
-# The payload namespace B, set up by launch.sh in A before anything else, so
-# that A's veth address exists when dnsmasq binds it. See lib/userns.sh and
-# lib/nestnet.sh for what each step is for.
+# wrapper.sh's settings. The podman ones matter only to a "caps": "keep"
+# session; the socket path is pinned to the sbx-computed /run/user/<uid>,
+# not $XDG_RUNTIME_DIR, which a profile may override away from DOCKER_HOST.
+declare -p CAPS_KEEP USERNS_FULL DOCKER_API PODMAN_SOCK VIRT_DIR > "$SESSION_DIR/wrapper.env"
+
+# launch.sh's settings.
+#   NET_MODE  none      no network namespace beyond B's loopback
+#             loopback  host ports only: A's ruleset, no resolver
+#             dns       a net profile: ruleset, dnsmasq, readiness probe
+NET_MODE=none
+DNSMASQ_BIN=""
+DNSMASQ_ARGS=()
+TEST_DOMAIN=""
 if [[ "$SBX_NETNS" == "true" ]]; then
-    NEST_MAP='sbx_userns_map_identity "$SBX_B_PID"'
-    NEST_B_DNS=""
-    if [[ ${#NET_PROFILES[@]} -gt 0 ]]; then
-        NEST_B_DNS="$SBX_DNS_ADDR"
+    NET_MODE=loopback
+    if [[ "$(plan_get '.net.enabled')" == "true" ]]; then
+        NET_MODE=dns
+        DNSMASQ_BIN=$(command -v dnsmasq)
+        mapfile -t DNSMASQ_ARGS < <(sbx_egress_dnsmasq_args "$(plan_get '.net')")
+        TEST_DOMAIN=$(plan_get '.net.test_domain')
     fi
-    NEST_NET=$(cat <<EOF
-sbx_nestnet_wire "\$SBX_B_PID" || nest_fail "could not connect the payload network namespace. Is the veth module available? Run: sbx --doctor"
-sbx_nestnet_b_rules "\$SBX_B_PID" "$NEST_B_DNS" "$NEST_TCP" "$NEST_UDP" || nest_fail "could not load the payload loopback rules."
-sbx_nestnet_relays "$NEST_TCP" "$NEST_UDP" || nest_fail "could not start the host-port relays."
-EOF
-)
 else
-    NEST_MAP='sbx_userns_map_outer_ids "$SBX_B_PID"'
-    NEST_NET='sbx_nestnet_lo_up "$SBX_B_PID" || nest_fail "could not bring up the payload loopback."'
+    SBX_DNS_ADDR=""
+    RESOLV_DEST=""
 fi
-# The EXIT trap is the one place every teardown path meets: B, its relays,
-# and (with a net profile) dnsmasq — guarded, since most sessions never set
-# DNSMASQ_PID and an unguarded `kill ''` would just fail quietly instead of
-# stating that there is nothing to kill. This does not reach a SIGKILLed
-# launch.sh — dnsmasq has no --pdeathsig, unlike the holder and the relays
-# — but it is exact for every path that does trigger a bash EXIT
-# trap, and it keeps the reap logic in one place now that this prelude
-# always runs.
-NEST_PRELUDE=$(cat <<EOF
-# The payload namespace B, nested in this one (lib/userns.sh, lib/nestnet.sh).
-source $(printf '%q' "$SCRIPT_DIR/lib/userns.sh")
-source $(printf '%q' "$SCRIPT_DIR/lib/nestnet.sh")
-nest_fail() {
-    echo "Error: \$1" >&2
-    exit 1
-}
-trap 'sbx_nestnet_release; sbx_userns_release "\${SBX_B_PID:-}"; [[ -n "\${DNSMASQ_PID:-}" ]] && kill "\$DNSMASQ_PID" 2>/dev/null' EXIT
-sbx_userns_hold || nest_fail "could not create the payload user namespace."
-$NEST_MAP || nest_fail "could not map the payload user namespace."
-$NEST_NET
-# bwrap moves the payload into B through this descriptor (--userns2 below).
-# Guarded: a failed exec here is only redirections, so it would otherwise
-# print an error, leave SBX_BFD unset, and let control reach bwrap with
-# --userns2 "" — bwrap would still refuse it, but by its own argument
-# parser rather than this script's contract.
-#
-# The payload inherits this fd across its own exec()s (it is not
-# close-on-exec on purpose: bwrap needs it open for --userns2). That is
-# harmless: a payload that unshares a further namespace C and tries
-# setns(SBX_BFD) to climb back into B needs CAP_SYS_ADMIN *in B*'s user
-# namespace, which nothing in C holds — B's capability sets are already
-# empty by the time session.sh runs (setpriv below).
-exec {SBX_BFD}</proc/\$SBX_B_PID/ns/user || nest_fail "could not open the payload user namespace."
-EOF
-)
+declare -p NET_MODE CAPS_KEEP NEST_TCP NEST_UDP SBX_DNS_ADDR DNSMASQ_BIN DNSMASQ_ARGS \
+    TEST_DOMAIN RESOLV_DEST > "$SESSION_DIR/launch.env"
 
-# Generate the launch script with properly escaped BWRAP_ARGS.
-# launch.sh runs in A: pasta's user and net namespaces, or unshare's for a
-# session without networking. The network prelude lands there — outside
-# every namespace bwrap creates.
-{
-    echo "#!/bin/bash"
-    echo "# Start the sandbox"
-    echo "$NEST_PRELUDE"
-    if [[ -n "$NET_PRELUDE" ]]; then
-        echo "$NET_PRELUDE"
-    fi
-} > "$LAUNCH_SCRIPT"
-
-# launch.sh always outlives bwrap now, to release B and the relays (and
-# dnsmasq, with a net profile) once the payload is done — never `exec`.
-#
-# bwrap starts in B's network namespace but A's user namespace, so every
-# mount it makes belongs to A; --userns2 then moves the payload into B.
-printf 'nsenter --net=/proc/"$SBX_B_PID"/ns/net -- bwrap ' >> "$LAUNCH_SCRIPT"
-for arg in "${BWRAP_ARGS[@]}"; do
-    printf "%q " "$arg" >> "$LAUNCH_SCRIPT"
-done
-# --userns2 alone. The man page pairs it with --userns; that form fails
-# here ("Joining the specified user namespace failed").
-printf -- '--userns2 "$SBX_BFD" ' >> "$LAUNCH_SCRIPT"
-# THE capability drop, applied exactly once and as high up as it can go.
-# bwrap's direct child is setpriv, which empties every capability set and
-# then execs session.sh as PID 1 — so the tmux server, the payload, every
-# join, and every pane the server forks by any route (new-window,
-# split-window, respawn-pane, run-shell, hooks, default-command) is capless
-# by construction rather than because some wrapper remembered to re-apply a
-# drop. This is deliberately not done in tmux.conf's default-command: the
-# payload holds the server socket and could simply `tmux set -g
-# default-command` its way out of that one.
-#
-# The retained CAP_SETPCAP (--cap-add CAP_SETPCAP above) is spent here, by
-# this setpriv, and is gone before any of the session's own code runs. If
-# setpriv is missing or fails, the exec fails and nothing runs: the failure
-# mode is closed, not open.
-#
-# "caps": "keep" sessions are deliberately not wrapped — keeping
-# capabilities is the entire point of that opt-out, and it extends to their
-# joins, which is why --join needs no capability logic of its own.
-if [[ "$CAPS_KEEP" != "true" ]]; then
-    printf "setpriv --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- " >> "$LAUNCH_SCRIPT"
-else
-    # A mount namespace B owns, so podman can mount; the mounts inherited
-    # from A stay locked. A capability-dropping payload could not run this
-    # and has no use for it.
-    printf "unshare --mount -- " >> "$LAUNCH_SCRIPT"
-fi
-printf "%q\n" "$SESSION_SCRIPT" >> "$LAUNCH_SCRIPT"
-
-chmod +x "$LAUNCH_SCRIPT"
-
-# -T / -U: the explicit host-port forward lists, or "none". Between them
-# they are the whole of the host-access allow-list — pasta binds exactly
-# these ports inside the namespace and splices them to the host's loopback,
-# so an unnamed host service has nothing listening for it to reach. "none"
-# on both is the default, and is what replaces pasta's -T/-U auto, which
-# would forward every port bound on the host. Keeping the two lists separate
-# is what stops a TCP grant from quietly carrying its UDP twin along, and
-# what keeps a host resolver from claiming the port dnsmasq needs unless the
-# session actually asked for udp/53.
-#
-# --no-map-gw on every call: pasta otherwise translates the gateway address
-# to the host's loopback, which would let the sandbox reach host-local
-# services through $HOST_GW without ever traversing a rule that names them.
-# Host access goes through -T/-U, which is per-port and per-protocol;
-# --map-gw is all-or-nothing.
+# pasta's -T / -U are the whole host-access allow-list: pasta binds exactly
+# these ports inside the namespace and splices them to the host's loopback.
+# "none" replaces pasta's default of forwarding every port bound on the
+# host, and keeping the lists separate stops a TCP grant from carrying its
+# UDP twin. --no-map-gw: otherwise the gateway address reaches every
+# host-local service without a rule naming it.
 join_ports() {
     if [[ $# -eq 0 ]]; then
         echo none
@@ -2068,67 +1631,44 @@ join_ports() {
 }
 PASTA_FWD_TCP=$(join_ports "${HOST_PORTS_TCP[@]}")
 PASTA_FWD_UDP=$(join_ports "${HOST_PORTS_UDP[@]}")
-PASTA_PORT_ARGS=(-T "$PASTA_FWD_TCP" -U "$PASTA_FWD_UDP")
 
-# Human-readable summary for the startup line, protocols named explicitly.
-HOST_PORT_DESC=""
-[[ "$PASTA_FWD_TCP" != "none" ]] && HOST_PORT_DESC="tcp $PASTA_FWD_TCP"
-if [[ "$PASTA_FWD_UDP" != "none" ]]; then
-    [[ -n "$HOST_PORT_DESC" ]] && HOST_PORT_DESC+=", "
-    HOST_PORT_DESC+="udp $PASTA_FWD_UDP"
-fi
+# pasta is handed "/bin/bash <script>", not the script: Ubuntu's AppArmor
+# profile for pasta allows exec only under /bin and /usr/bin (measured on
+# Ubuntu 26.04, 2026-09-23), and Ux there still runs the script unconfined.
+LAUNCH=(/bin/bash "$SCRIPT_DIR/lib/launch.sh" "$SESSION_DIR/launch.env")
 
-# pasta is handed "/bin/bash <launch script>" rather than the script itself.
-# Ubuntu ships an AppArmor profile for pasta that grants exec only under /bin
-# and /usr/bin ("/{usr/,}bin/** Ux") and gives $HOME write access without
-# exec, so pasta exec-ing the generated launch script is refused outright
-# ("Failed to start command or shell: Permission denied"; measured on Ubuntu
-# 26.04, 2026-09-23). Naming the interpreter keeps the exec inside what the
-# profile allows, and Ux means the script still runs unconfined, exactly as it
-# does where no such profile exists. Harmless on every other distribution.
-#
-# setpriv --pdeathsig KILL is applied uniformly across every dispatch below.
-# For the no-net shape it genuinely closes a gap: launch.sh now always
-# outlives bwrap (to release B and the relays), so a bash process sits
-# between sbx and bwrap and needs its own parent-death signal — the role
-# bwrap's own --die-with-parent used to play when launch.sh `exec`ed bwrap
-# directly. For the pasta-based shapes, pasta forks the namespaced child
-# rather than exec'ing into it, so a killed sbx can still orphan that
-# child; this does not claim to fix that pre-existing gap, only to avoid
-# singling out the no-net case. setpriv is a plain exec: it sets the
-# signal, then execs the rest of the command line in the same process, so
-# the setting survives every further exec in the chain (unshare into
-# pasta, or unshare into launch.sh). For the pasta-based shapes, then, a
-# SIGKILLed sbx kills pasta while its forked child (launch.sh and
-# everything under it) survives orphaned but networkless, since pasta's
-# own namespace and interface go away with it — that orphan is expected to
-# look dead-ish rather than healthy, and --gc already treats a session
-# whose top-level process is gone as dead regardless of what its children
-# are still doing.
+# setpriv --pdeathsig KILL on every shape: launch.sh outlives bwrap, so the
+# process between sbx and bwrap needs its own parent-death signal. Under
+# pasta, which forks its child, a SIGKILLed sbx still orphans launch.sh —
+# networkless once pasta is gone, and --gc judges the session by sbx's pid.
 if [[ "$SBX_NETNS" == "true" ]]; then
+    PASTA=(pasta -f --config-net --no-map-gw -T "$PASTA_FWD_TCP" -U "$PASTA_FWD_UDP"
+           --interface "$HOST_IFACE" --no-ndp --no-dhcpv6 --no-ra
+           -a "$HOST_IP" -g "$HOST_GW" -n "$HOST_MASK")
     if [[ "$USERNS_FULL" == "true" ]]; then
         echo "Starting session $SESSION_ID with networking (full userns)..."
-        # unshare claims the user's /etc/subuid range up front, via the
-        # setuid newuidmap helper — still permitted here because bwrap's
-        # no_new_privs only applies further down the chain. pasta must
-        # then NOT create its own user namespace (that would discard the
-        # multi-UID mapping): --netns-only.
-        setpriv --pdeathsig KILL -- \
-            unshare --map-auto --map-root-user -- \
-            pasta -f --config-net --netns-only --no-map-gw "${PASTA_PORT_ARGS[@]}" --interface "$HOST_IFACE" --no-ndp --no-dhcpv6 --no-ra -a "$HOST_IP" -g "$HOST_GW" -n "$HOST_MASK" -- /bin/bash "$LAUNCH_SCRIPT"
+        # unshare claims the user's /etc/subuid range through the setuid
+        # newuidmap, so pasta must not create a user namespace of its own,
+        # which would discard the multi-UID mapping: --netns-only.
+        setpriv --pdeathsig KILL -- unshare --map-auto --map-root-user -- \
+            "${PASTA[@]}" --netns-only -- "${LAUNCH[@]}"
     else
-        if [[ ${#NET_PROFILES[@]} -gt 0 ]]; then
+        if [[ "$NET_MODE" == "dns" ]]; then
             echo "Starting session $SESSION_ID with networking..."
         else
+            HOST_PORT_DESC=""
+            [[ "$PASTA_FWD_TCP" != "none" ]] && HOST_PORT_DESC="tcp $PASTA_FWD_TCP"
+            if [[ "$PASTA_FWD_UDP" != "none" ]]; then
+                [[ -n "$HOST_PORT_DESC" ]] && HOST_PORT_DESC+=", "
+                HOST_PORT_DESC+="udp $PASTA_FWD_UDP"
+            fi
             echo "Starting session $SESSION_ID with host ports $HOST_PORT_DESC (no internet)..."
         fi
-        setpriv --pdeathsig KILL -- \
-            pasta -f --config-net --no-map-gw "${PASTA_PORT_ARGS[@]}" --interface "$HOST_IFACE" --no-ndp --no-dhcpv6 --no-ra -a "$HOST_IP" -g "$HOST_GW" -n "$HOST_MASK" -- /bin/bash "$LAUNCH_SCRIPT"
+        setpriv --pdeathsig KILL -- "${PASTA[@]}" -- "${LAUNCH[@]}"
     fi
 else
     echo "Starting session $SESSION_ID..."
     # The control namespace A for a session without networking: this user
     # mapped to 0 in a new user namespace, and an empty network namespace.
-    # B gives the payload its host identity back (sbx_userns_map_outer_ids).
-    setpriv --pdeathsig KILL -- unshare --user --map-root-user --net -- "$LAUNCH_SCRIPT"
+    setpriv --pdeathsig KILL -- unshare --user --map-root-user --net -- "${LAUNCH[@]}"
 fi

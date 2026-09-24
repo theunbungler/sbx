@@ -1,11 +1,11 @@
 #!/usr/bin/env bats
 
 # Golden-file snapshots of everything a launch generates: bwrap's argument
-# list, launch.sh, session.sh, the nft ruleset, podman confs and the join
-# sidecar. They pin the launch exactly, so that moving profile reading into
-# lib/resolve.sh can be shown to change nothing. Nothing is sandboxed:
-# bwrap, pasta, unshare and ip are stubs that copy the generated files out
-# and exit.
+# list, the payload command, the settings lib/launch.sh and lib/wrapper.sh
+# read, the nft ruleset, podman confs and the join sidecar. They pin the
+# launch exactly, so a refactor can be shown to change nothing. Nothing is
+# sandboxed: pasta, unshare and ip are stubs that copy the generated files
+# out and exit before lib/launch.sh would run.
 #
 # After an intentional change to what a launch generates, regenerate with:
 #   SBX_UPDATE_SNAPSHOTS=1 bats tests/snapshot.bats
@@ -42,11 +42,17 @@ write_stubs() {
 sdir="$1"
 name=$(basename "$sdir")
 mkdir -p "$SBX_CAPTURE"
-for f in launch.sh session.sh wrapper.sh tmux.conf session.json \
+for f in launch.env wrapper.env tmux.conf session.json \
          dns/rules.nft dns/resolv.conf virt/storage.conf virt/containers.conf \
          virt/containers-bootstrap.conf; do
     if [[ -f "$sdir/$f" ]]; then
         cp "$sdir/$f" "$SBX_CAPTURE/${f//\//_}"
+    fi
+done
+# NUL-separated argument lists, one argument per line for diffing.
+for f in bwrap.args command; do
+    if [[ -f "$sdir/$f" ]]; then
+        tr '\0' '\n' < "$sdir/$f" > "$SBX_CAPTURE/$f"
     fi
 done
 join="$(dirname "$(dirname "$sdir")")/join/$name.json"
@@ -75,7 +81,7 @@ EOF
 #!/bin/bash
 mkdir -p "$SBX_CAPTURE"
 printf '%s\n' "$@" > "$SBX_CAPTURE/pasta.args"
-# pasta's last argument is launch.sh, inside the session directory.
+# pasta's last argument is launch.env, inside the session directory.
 exec "$(dirname "$0")/sbx-capture" "$(dirname "${@: -1}")"
 EOF
     cat > "$STUB/unshare" <<'EOF'
@@ -89,10 +95,10 @@ while [[ $# -gt 0 && "$1" != "--" ]]; do
     shift
 done
 shift
-if [[ "$1" == */launch.sh ]]; then
+if [[ "$2" == */lib/launch.sh ]]; then
     mkdir -p "$SBX_CAPTURE"
     printf '%s\n' "${args[@]}" > "$SBX_CAPTURE/unshare.args"
-    exec "$(dirname "$0")/sbx-capture" "$(dirname "$1")"
+    exec "$(dirname "$0")/sbx-capture" "$(dirname "$3")"
 fi
 exec "$@"
 EOF
@@ -175,6 +181,7 @@ normalize() {   # <capture dir>
             -e "s#$dnsmasq#@DNSMASQ@#g" \
             -e "s#(dns/resolv\\.conf\"?) (\"?)$resolv_dest(\"?)#\\1 \\2@RESOLV_DEST@\\3#g" \
             -e "s#/run/user/$uid#/run/user/@UID@#g" \
+            -e "s#(RESOLV_DEST=\")$resolv_dest\"#\\1@RESOLV_DEST@\"#" \
             -e "s#(_CONTAINERS_ROOTLESS_UID )$uid#\\1@UID@#g" \
             -e "s#(_CONTAINERS_ROOTLESS_GID )$gid#\\1@GID@#g" \
             -e 's#("pid": )[0-9]+#\1@PID@#' \

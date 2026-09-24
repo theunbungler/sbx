@@ -1,6 +1,5 @@
 -f
 --config-net
---netns-only
 --no-map-gw
 -T
 none
@@ -17,6 +16,8 @@ snap0
 10.99.0.1
 -n
 24
+--netns-only
 --
 /bin/bash
-@ROOT@/h/.local/state/sbx/sessions/proj/launch.sh
+@REPO@/lib/launch.sh
+@ROOT@/h/.local/state/sbx/sessions/proj/launch.env

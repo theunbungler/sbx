@@ -13,20 +13,20 @@ table inet sbx_filter {
         ip daddr 1.1.1.1 tcp dport 53 accept
         ip daddr 9.9.9.9 udp dport 53 accept
         ip daddr 9.9.9.9 tcp dport 53 accept
-        ip daddr 192.168.1.0/24 tcp dport { 80,443 } accept
-        ip daddr 192.168.1.0/24 udp dport { 80,443 } accept
         ip daddr 10.0.0.0/8 tcp dport { 5432 } accept
         ip daddr 10.0.0.0/8 udp dport { 5432 } accept
+        ip daddr 192.168.1.0/24 tcp dport { 80,443 } accept
+        ip daddr 192.168.1.0/24 udp dport { 80,443 } accept
         ip daddr @allowed4_1 accept
         meta nfproto ipv6 drop
     }
     chain forward {
         type filter hook forward priority 0; policy drop;
         ct state established,related accept
-        ip daddr 192.168.1.0/24 tcp dport { 80,443 } accept
-        ip daddr 192.168.1.0/24 udp dport { 80,443 } accept
         ip daddr 10.0.0.0/8 tcp dport { 5432 } accept
         ip daddr 10.0.0.0/8 udp dport { 5432 } accept
+        ip daddr 192.168.1.0/24 tcp dport { 80,443 } accept
+        ip daddr 192.168.1.0/24 udp dport { 80,443 } accept
         ip daddr @allowed4_1 accept
         meta nfproto ipv6 drop
     }
