@@ -689,14 +689,15 @@ while IFS= read -r msg; do
     fi
 done < <(plan_get '.warnings[]')
 
-USERNS_FULL=$(plan_get '.security.userns_full')
-USERNS_PROFILE=$(plan_get '.security.userns_profile')
-CAPS_KEEP=$(plan_get '.security.caps_keep')
-CAPS_PROFILE=$(plan_get '.security.caps_profile')
-DOCKER_API=$(plan_get '.security.docker_api')
+# The plan's scalar settings in one read. @sh quotes every string, so the
+# eval sees only assignments whatever a profile path contains.
+eval "$(jq -r '@sh "USERNS_FULL=\(.security.userns_full) USERNS_PROFILE=\(.security.userns_profile)
+    CAPS_KEEP=\(.security.caps_keep) CAPS_PROFILE=\(.security.caps_profile)
+    DOCKER_API=\(.security.docker_api) SBX_NETNS=\(.netns) NET_ENABLED=\(.net.enabled)
+    TEST_DOMAIN=\(.net.test_domain // "") SANDBOX_PATH=\(.path)
+    NEED_SUBIDS=\(.checks | index("subids") != null)"' <<< "$PLAN")"
 mapfile -t HOST_PORTS_TCP < <(plan_get '.host_ports.tcp[]')
 mapfile -t HOST_PORTS_UDP < <(plan_get '.host_ports.udp[]')
-SBX_NETNS=$(plan_get '.netns')
 
 # The payload runs in a user namespace B nested in the session's control
 # namespace A (lib/userns.sh, lib/nestnet.sh): mounts made in A are locked
@@ -712,7 +713,7 @@ mapfile -t DEP_GROUPS < <(plan_get '(.deps[] | select(. != "core")), (.checks[] 
 if [[ ${#DEP_GROUPS[@]} -gt 0 ]]; then
     sbx_deps_require "${DEP_GROUPS[@]}" || exit 1
 fi
-if [[ "$(plan_get '.checks | index("subids") != null')" == "true" ]] && ! sbx_deps_subids_ok; then
+if [[ "$NEED_SUBIDS" == "true" ]] && ! sbx_deps_subids_ok; then
     echo "Error: profile '$USERNS_PROFILE' sets \"userns\": \"full\", which needs a subordinate UID and GID range for $(id -un)." >&2
     echo "  Add one:  sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $(id -un)" >&2
     echo "  (choose a range not already used by another user in /etc/subuid)" >&2
@@ -1266,7 +1267,6 @@ if [[ -n "$WORKDIR" ]]; then
     BWRAP_ARGS+=(--chdir "$WORKDIR")
 fi
 
-SANDBOX_PATH=$(plan_get '.path')
 # $SESSION_DIR/bin holds the docker shim; first on PATH so `docker` always
 # resolves to it (the host docker socket is never reachable in a sandbox).
 BWRAP_ARGS+=(--setenv PATH "$SESSION_DIR/bin:$SANDBOX_PATH")
@@ -1299,7 +1299,7 @@ if [[ "$SBX_NETNS" == "true" ]]; then
     # untouched by pasta and is local via lo's 127.0.0.1/8.
     SBX_DNS_ADDR="127.0.0.2"
 
-    if [[ "$(plan_get '.net.enabled')" == "true" ]]; then
+    if [[ "$NET_ENABLED" == "true" ]]; then
         printf 'nameserver %s\n' "$SBX_DNS_ADDR" > "$DNS_DIR/resolv.conf"
     else
         # Host ports only: no resolver runs and nothing outside loopback is
@@ -1600,14 +1600,12 @@ declare -p CAPS_KEEP USERNS_FULL DOCKER_API PODMAN_SOCK VIRT_DIR > "$SESSION_DIR
 NET_MODE=none
 DNSMASQ_BIN=""
 DNSMASQ_ARGS=()
-TEST_DOMAIN=""
 if [[ "$SBX_NETNS" == "true" ]]; then
     NET_MODE=loopback
-    if [[ "$(plan_get '.net.enabled')" == "true" ]]; then
+    if [[ "$NET_ENABLED" == "true" ]]; then
         NET_MODE=dns
         DNSMASQ_BIN=$(command -v dnsmasq)
         mapfile -t DNSMASQ_ARGS < <(sbx_egress_dnsmasq_args "$(plan_get '.net')")
-        TEST_DOMAIN=$(plan_get '.net.test_domain')
     fi
 else
     SBX_DNS_ADDR=""

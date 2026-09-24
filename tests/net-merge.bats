@@ -9,13 +9,14 @@ profile() {   # <name> <json>
     printf '%s\n' "$2" > "$D/$1.json"
 }
 
-@test "merge_ports unions, sorts and lets * absorb" {
-    run sbx_net_merge_ports "" "80,443"
-    [ "$output" = "80,443" ]
-    run sbx_net_merge_ports "443,80" "22,80"
-    [ "$output" = "22,80,443" ]
-    run sbx_net_merge_ports "80" "*"
-    [ "$output" = "*" ]
+@test "a domain named twice gets the union of both port lists, sorted; * absorbs" {
+    profile a '{"allow":["x.example"],"ports":[443,80]}'
+    profile b '{"allow":["x.example"],"ports":[22,80]}'
+    profile c '{"allow":["x.example"],"ports":["*"]}'
+    run sbx_net_merge "$D/a.json" "$D/b.json"
+    [ "$(jq -r '.domains["x.example"].ports' <<< "$output")" = "22,80,443" ]
+    run sbx_net_merge "$D/a.json" "$D/c.json"
+    [ "$(jq -r '.domains["x.example"].ports' <<< "$output")" = "*" ]
 }
 
 @test "one profile: domains and cidrs carry its ports; default ports are 80,443" {

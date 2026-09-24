@@ -18,12 +18,24 @@ sbx_resolve_strings() {   # <string>... -> JSON array
     jq -cn '$ARGS.positional' --args -- "$@"
 }
 
-sbx_resolve_objects() {   # <json object>... -> JSON array
-    if [[ $# -eq 0 ]]; then
-        echo '[]'
-        return 0
+# A flat list of strings, <n> fields per record, as a JSON array of arrays.
+# Fields travel as arguments, so any character but NUL survives.
+sbx_resolve_records() {   # <n> <field>...
+    local n="$1"
+    shift
+    jq -cn --argjson n "$n" '$ARGS.positional as $f | [range(0; $f | length; $n) as $i | $f[$i:$i + $n]]' \
+        --args -- "$@"
+}
+
+# PATH inside the sandbox: <cli path entries> in front of <env PATH>, then
+# the default. With no entries, an env PATH stands alone.
+sbx_resolve_path() {   # <entries, colon-joined> <env PATH>
+    local default="/usr/local/bin:/usr/bin:/bin"
+    if [[ -z "$1" ]]; then
+        printf '%s\n' "${2:-$default}"
+    else
+        printf '%s\n' "$1:${2:+$2:}$default"
     fi
-    printf '%s\n' "$@" | jq -cs .
 }
 
 sbx_resolve() {
@@ -92,8 +104,7 @@ sbx_resolve() {
         name=$(basename "$p" .json)
         origin=$(sbx_profile_origin "$p" "$launch_dir" "$config_dir" "$global_dir")
         origins+=("$origin")
-        profiles+=("$(jq -cn --arg type "$type" --arg name "$name" --arg path "$p" --arg origin "$origin" \
-            '{type: $type, name: $name, path: $path, origin: $origin}')")
+        profiles+=("$type" "$name" "$p" "$origin")
 
         while IFS=$'\t' read -r level msg; do
             case "$level" in
@@ -112,6 +123,9 @@ sbx_resolve() {
     done
 
     local caps_keep=false caps_profile="" userns_full=false userns_profile="" docker_api=false
+    local f_userns f_caps f_docker
+    # profiles, mounts and env hold flat field lists (sbx_resolve_records),
+    # turned into objects by one jq call each at the end.
     local -a mounts=() passthrough=() env=() tcp=() udp=()
     local sandbox_path="" sandbox_path_raw="" netns=false net_json='{"enabled":false}'
     local -a deps=(core) checks=()
@@ -138,17 +152,19 @@ sbx_resolve() {
                 continue
             fi
             p="${paths[$i]}"
-            if [[ "$(jq -r '.userns // empty' "$p")" == "full" ]]; then
+            IFS=$'\t' read -r f_userns f_caps f_docker < <(
+                jq -r '[.userns // "-", .caps // "-", (.docker_api // false | tostring)] | @tsv' "$p")
+            if [[ "$f_userns" == "full" ]]; then
                 userns_full=true
                 userns_profile="$p"
                 caps_keep=true
                 caps_profile="$p"
             fi
-            if [[ "$(jq -r '.caps // empty' "$p")" == "keep" ]]; then
+            if [[ "$f_caps" == "keep" ]]; then
                 caps_keep=true
                 caps_profile="$p"
             fi
-            if [[ "$(jq -r '.docker_api // false' "$p")" == "true" ]]; then
+            if [[ "$f_docker" == "true" ]]; then
                 docker_api=true
             fi
         done
@@ -158,7 +174,7 @@ sbx_resolve() {
     fi
 
     if [[ ${#errors[@]} -eq 0 ]]; then
-        local m source dest perm present from key value var extra
+        local kind f1 f2 f3 source dest perm present from value cli_path=""
         for i in "${!paths[@]}"; do
             if [[ "${types[$i]}" == "net" ]]; then
                 continue
@@ -167,83 +183,57 @@ sbx_resolve() {
             name=$(basename "$p" .json)
             from="${types[$i]}/$name"
 
-            while IFS= read -r m; do
-                if [[ -z "$m" ]]; then
-                    continue
-                fi
-                source=$(jq -r '.source' <<< "$m" | envsubst)
-                source=$(realpath -m "$source")
-                dest=$(jq -r '.dest' <<< "$m" | envsubst)
-                perm=$(jq -r '.perm' <<< "$m")
-                present=false
-                if [[ -e "$source" ]]; then
-                    present=true
-                fi
-                mounts+=("$(jq -cn --arg profile "$name" --arg from "$from" --arg source "$source" \
-                    --arg dest "$dest" --arg perm "$perm" --argjson present "$present" \
-                    '{profile: $profile, from: $from, source: $source, dest: $dest, perm: $perm, present: $present}')")
-                # rw mounts may point at a persistent host directory that doesn't
-                # exist yet (e.g. first-ever use of a profile's storage dir), so
-                # an absent rw source is created by the launch, not skipped, and
-                # not worth a warning.
-                if [[ "$present" == "false" && "$perm" != "rw" ]]; then
-                    if [[ "$perm" == "record" ]]; then
-                        warnings+=("$from: mount source not present on this host; an empty working copy is bound instead: record $source")
-                    else
-                        warnings+=("$from: mount source not present on this host, skipped: $perm $source")
-                    fi
-                fi
-            done < <(jq -c '.mounts[]?' "$p")
-
-            while IFS= read -r var; do
-                if [[ -n "$var" ]]; then
-                    passthrough+=("$var")
-                fi
-            done < <(jq -r '.passthrough[]?' "$p")
-
-            # NUL-separated so a value may hold any character, newlines included.
-            while IFS= read -r -d '' key && IFS= read -r -d '' value; do
-                if [[ -z "$key" ]]; then
-                    continue
-                fi
-                raw="$value"
-                value=$(printf '%s' "$value" | envsubst)
-                env+=("$(jq -cn --arg name "$key" --arg value "$value" --arg raw "$raw" --arg from "$from" \
-                    '{name: $name, value: $value, raw: $raw, from: $from}')")
-                if [[ "$key" == "PATH" ]]; then
-                    sandbox_path="$value"
-                    sandbox_path_raw="$raw"
-                fi
-            done < <(jq -j 'def nul: [0] | implode; .env // {} | to_entries[] | .key, nul, (.value | tostring), nul' "$p")
+            # One jq pass per profile: every mount, passthrough name and env
+            # entry, NUL-separated so a value may hold any character.
+            while IFS= read -r -d '' kind && IFS= read -r -d '' f1 &&
+                  IFS= read -r -d '' f2 && IFS= read -r -d '' f3; do
+                case "$kind" in
+                    mount)
+                        source=$(realpath -m "$(printf '%s' "$f1" | envsubst)")
+                        dest=$(printf '%s' "$f2" | envsubst)
+                        perm="$f3"
+                        present=false
+                        if [[ -e "$source" ]]; then
+                            present=true
+                        fi
+                        mounts+=("$name" "$from" "$source" "$dest" "$perm" "$present")
+                        # An absent rw source is a persistent directory the
+                        # launch creates, not one it skips: no warning.
+                        if [[ "$present" == "false" && "$perm" == "record" ]]; then
+                            warnings+=("$from: mount source not present on this host; an empty working copy is bound instead: record $source")
+                        elif [[ "$present" == "false" && "$perm" != "rw" ]]; then
+                            warnings+=("$from: mount source not present on this host, skipped: $perm $source")
+                        fi
+                        ;;
+                    pass)
+                        if [[ -n "$f1" ]]; then
+                            passthrough+=("$f1")
+                        fi
+                        ;;
+                    env)
+                        if [[ -n "$f1" ]]; then
+                            value=$(printf '%s' "$f2" | envsubst)
+                            env+=("$f1" "$value" "$f2" "$from")
+                            if [[ "$f1" == "PATH" ]]; then
+                                sandbox_path="$value"
+                                sandbox_path_raw="$f2"
+                            fi
+                        fi
+                        ;;
+                esac
+            done < <(jq -j 'def nul: [0] | implode;
+                (.mounts[]? | "mount", nul, .source, nul, .dest, nul, .perm, nul),
+                (.passthrough[]? | "pass", nul, ., nul, "", nul, "", nul),
+                (.env // {} | to_entries[] | "env", nul, .key, nul, (.value | tostring), nul, "", nul)' "$p")
         done
 
         # A cli profile's path entries go in front of any PATH an env block
-        # set, and the default always closes the list.
-        local default_path="/usr/local/bin:/usr/bin:/bin"
-        local extra_raw=""
-        extra=""
+        # set, and the default closes the list (see sbx_resolve_path).
         if [[ -n "$cli" ]]; then
-            extra=$(jq -r '.path[]?' "$cli" | envsubst | paste -sd: -)
-            extra_raw=$(jq -r '.path[]?' "$cli" | paste -sd: -)
+            cli_path=$(jq -r '.path[]?' "$cli")
         fi
-        if [[ -n "$extra" ]]; then
-            if [[ -n "$sandbox_path" ]]; then
-                sandbox_path="$extra:$sandbox_path:$default_path"
-            else
-                sandbox_path="$extra:$default_path"
-            fi
-        elif [[ -z "$sandbox_path" ]]; then
-            sandbox_path="$default_path"
-        fi
-        if [[ -n "$extra_raw" ]]; then
-            if [[ -n "$sandbox_path_raw" ]]; then
-                sandbox_path_raw="$extra_raw:$sandbox_path_raw:$default_path"
-            else
-                sandbox_path_raw="$extra_raw:$default_path"
-            fi
-        elif [[ -z "$sandbox_path_raw" ]]; then
-            sandbox_path_raw="$default_path"
-        fi
+        sandbox_path=$(sbx_resolve_path "$(envsubst <<< "$cli_path" | paste -sd: -)" "$sandbox_path")
+        sandbox_path_raw=$(sbx_resolve_path "$(paste -sd: - <<< "$cli_path")" "$sandbox_path_raw")
 
         # --- Host-service access ---
         # Ports named here are forwarded by pasta from the host's loopback into the
@@ -322,7 +312,8 @@ sbx_resolve() {
     fi
 
     jq -n \
-        --argjson profiles "$(sbx_resolve_objects "${profiles[@]}")" \
+        --argjson profiles "$(sbx_resolve_records 4 "${profiles[@]}" |
+            jq -c 'map({type: .[0], name: .[1], path: .[2], origin: .[3]})')" \
         --argjson errors "$(sbx_resolve_strings "${errors[@]}")" \
         --argjson warnings "$(sbx_resolve_strings "${warnings[@]}")" \
         --argjson confirm "$(sbx_resolve_strings "${confirm[@]}")" \
@@ -331,9 +322,11 @@ sbx_resolve() {
         --argjson caps_keep "$caps_keep" --arg caps_profile "$caps_profile" \
         --argjson userns_full "$userns_full" --arg userns_profile "$userns_profile" \
         --argjson docker_api "$docker_api" \
-        --argjson mounts "$(sbx_resolve_objects "${mounts[@]}")" \
+        --argjson mounts "$(sbx_resolve_records 6 "${mounts[@]}" |
+            jq -c 'map({profile: .[0], from: .[1], source: .[2], dest: .[3], perm: .[4], present: (.[5] == "true")})')" \
         --argjson passthrough "$(sbx_resolve_strings "${passthrough[@]}")" \
-        --argjson env "$(sbx_resolve_objects "${env[@]}")" \
+        --argjson env "$(sbx_resolve_records 4 "${env[@]}" |
+            jq -c 'map({name: .[0], value: .[1], raw: .[2], from: .[3]})')" \
         --arg path "$sandbox_path" --arg path_raw "$sandbox_path_raw" --arg wd "$wd" --argjson gui "$gui" \
         --argjson tcp "$(sbx_resolve_strings "${tcp[@]}" | jq -c 'map(tonumber)')" \
         --argjson udp "$(sbx_resolve_strings "${udp[@]}" | jq -c 'map(tonumber)')" \
