@@ -60,6 +60,15 @@ sbx_state_socket_probe() {   # <state_dir> <session_base>
     printf '%s\n' "$1/sessions/$2-99/tmux.sock"
 }
 
+# Prints why a launch must stop for this probe path, or nothing. Past ~108
+# bytes bind() fails, and tmux reports that only as a refused connection
+# long after the session directory exists.
+sbx_state_socket_problem() {   # <socket probe path>
+    if [[ ${#1} -gt 100 ]]; then
+        printf '%s\n' "session socket path is too long (${#1} bytes, limit 100): $1. A Unix socket path this long cannot be bound. Use a shorter \$HOME."
+    fi
+}
+
 # Every host location a launch of this plan writes, for --dry-run. Reads
 # the disk (does a forked store exist yet? how big is the source it would
 # be seeded from?) and writes nothing. The session name is already known

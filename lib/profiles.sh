@@ -154,12 +154,6 @@ sbx_profile_template() {   # <type> <description>
     esac
 }
 
-# Fields a project profile may not set. Same list as `restricted` in
-# lib/profile-check.sh — keep the two in step.
-sbx_profile_restricted_fields() {   # <file>
-    jq -r '["caps", "userns", "docker_api", "host_ports"][] as $f | select(has($f)) | $f' "$1"
-}
-
 # Other locations holding the same <type>/<name>, relative to <location>.
 # Precedence is project, then user, then global (see sbx_profile_resolve).
 sbx_profile_shadowing() {   # <type> <name> <location> <config_dir> <global_dir>

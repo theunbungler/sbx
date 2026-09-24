@@ -58,11 +58,11 @@ sbx_resolve() {
 
     local -a profiles=() errors=() warnings=() confirm=()
 
-    # --host-port flags are user-typed, so validate each one the same way
-    # sbx's add_host_port does, before it can reach a bucketing loop that
-    # assumes a well-formed spec: an out-of-range/non-numeric port or an
-    # unknown protocol becomes a plan error instead of a bad bucket or a
-    # jq crash on tonumber. Profile-supplied host_ports need no matching
+    # --host-port flags arrive exactly as typed; this is their only
+    # validation. An out-of-range/non-numeric port or an unknown protocol
+    # becomes a plan error instead of a bad bucket or a jq crash on
+    # tonumber. A bare port means TCP only: pasta's -T and -U are
+    # independent, so a UDP grant is always something someone asked for. Profile-supplied host_ports need no matching
     # check here: sbx_profile_check's schema already rejects any entry
     # that isn't a well-formed "N" or "N/tcp"|"N/udp" with N 1-65535, and
     # that rejection lands in $errors before the bucketing loop ever runs
@@ -114,7 +114,7 @@ sbx_resolve() {
     local caps_keep=false caps_profile="" userns_full=false userns_profile="" docker_api=false
     local -a mounts=() passthrough=() env=() tcp=() udp=()
     local sandbox_path="" sandbox_path_raw="" netns=false net_json='{"enabled":false}'
-    local -a deps=(core)
+    local -a deps=(core) checks=()
 
     if [[ ${#errors[@]} -eq 0 ]]; then
         # --- Profile feature-field scan (phase 2 virt) ---
@@ -304,6 +304,16 @@ sbx_resolve() {
         if [[ "$caps_keep" == "true" || "$userns_full" == "true" || "$docker_api" == "true" ]]; then
             deps+=(podman)
         fi
+        # Host checks beyond "is the tool installed" that this session's
+        # shape needs. unshare builds the control namespace for a session
+        # with no networking and for userns: full (a plain networked session
+        # gets it from pasta); userns: full also needs a subordinate id range.
+        if [[ "$netns" != "true" || "$userns_full" == "true" ]]; then
+            checks+=(nsunshare)
+        fi
+        if [[ "$userns_full" == "true" ]]; then
+            checks+=(subids)
+        fi
     fi
 
     if [[ ${#errors[@]} -gt 0 ]]; then
@@ -317,6 +327,7 @@ sbx_resolve() {
         --argjson warnings "$(sbx_resolve_strings "${warnings[@]}")" \
         --argjson confirm "$(sbx_resolve_strings "${confirm[@]}")" \
         --argjson deps "$(sbx_resolve_strings "${deps[@]}")" \
+        --argjson checks "$(sbx_resolve_strings "${checks[@]}")" \
         --argjson caps_keep "$caps_keep" --arg caps_profile "$caps_profile" \
         --argjson userns_full "$userns_full" --arg userns_profile "$userns_profile" \
         --argjson docker_api "$docker_api" \
@@ -327,7 +338,7 @@ sbx_resolve() {
         --argjson tcp "$(sbx_resolve_strings "${tcp[@]}" | jq -c 'map(tonumber)')" \
         --argjson udp "$(sbx_resolve_strings "${udp[@]}" | jq -c 'map(tonumber)')" \
         --argjson netns "$netns" --argjson net "$net_json" \
-        '{profiles: $profiles, errors: $errors, warnings: $warnings, confirm: $confirm, deps: $deps,
+        '{profiles: $profiles, errors: $errors, warnings: $warnings, confirm: $confirm, deps: $deps, checks: $checks,
           security: {caps_keep: $caps_keep, caps_profile: $caps_profile,
                      userns_full: $userns_full, userns_profile: $userns_profile,
                      docker_api: $docker_api},

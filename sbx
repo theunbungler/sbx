@@ -24,6 +24,8 @@ source "$SCRIPT_DIR/lib/profile-check.sh"
 source "$SCRIPT_DIR/lib/net-merge.sh"
 # shellcheck source=lib/resolve.sh
 source "$SCRIPT_DIR/lib/resolve.sh"
+# shellcheck source=lib/sessions.sh
+source "$SCRIPT_DIR/lib/sessions.sh"
 # A's extra chains and the A/B addresses (nested payload networking).
 # shellcheck source=lib/nestnet.sh
 source "$SCRIPT_DIR/lib/nestnet.sh"
@@ -42,23 +44,6 @@ XPRA_DISPLAY=""
 # join/.claim.lock. It is covered by the same --tmpfs mask as join/, and
 # --list-sessions ignores it because that requires a directory.
 CLAIM_LOCK="$STATE_DIR/claim.lock"
-
-# SBX_KEEP_CHANGES is inherited from the environment — plausibly from a
-# project .envrc — and reaches $(( )) in the archive pruning. Bash arithmetic
-# reads a non-numeric word as an unset variable, i.e. 0, which turns
-# "tail -n +$((keep + 1))" into "tail -n +1" and prunes EVERY archive; and it
-# expands command substitution inside an array subscript, so a value like
-# 'x[$(rm -rf ~)]' would run. Nothing may reach the arithmetic unvalidated,
-# and both pruning sites (--gc and teardown) go through here so the two can
-# never drift apart.
-sbx_keep_changes() {
-    local keep="${SBX_KEEP_CHANGES:-10}"
-    if [[ ! "$keep" =~ ^[0-9]+$ ]]; then
-        echo "Warning: ignoring non-numeric SBX_KEEP_CHANGES='$keep'; using 10." >&2
-        keep=10
-    fi
-    printf '%s\n' "$keep"
-}
 
 # Creates the state directory. Every path runs this before touching state —
 # except --dry-run, which must create nothing.
@@ -140,35 +125,9 @@ FS_PROFILES=()
 NET_PROFILES=()
 CLI_PROFILE=""
 WORKDIR=""
-HOST_PORTS_TCP=()
-HOST_PORTS_UDP=()
+HOST_PORT_SPECS=()   # as typed; lib/resolve.sh validates and buckets them
 COMMAND=()
 
-# Parse one host-port spec: "<port>", "<port>/tcp" or "<port>/udp".
-#
-# A bare number means TCP. The two protocols are kept as separate lists all
-# the way to pasta's -T and -U, which are genuinely independent — forwarding
-# a TCP port does not open its UDP twin (verified; pasta only pairs the two
-# under "-t auto", which sbx never uses). So a bare "8080" grants TCP and
-# nothing else, and reaching a UDP service is always something the profile
-# or command line said out loud. To get both, name the port twice.
-add_host_port() {
-    local spec="$1" origin="$2"
-    local port="${spec%%/*}" proto="tcp"
-    [[ "$spec" == */* ]] && proto="${spec#*/}"
-    proto="${proto,,}"
-
-    if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
-        echo "Error: $origin expects <port>[/tcp|/udp] with a port 1-65535, got '$spec'." >&2
-        exit 1
-    fi
-    case "$proto" in
-        tcp) HOST_PORTS_TCP+=("$port") ;;
-        udp) HOST_PORTS_UDP+=("$port") ;;
-        *)   echo "Error: $origin names unknown protocol '$proto' in '$spec' (expected tcp or udp)." >&2
-             exit 1 ;;
-    esac
-}
 GUI_FLAG=false
 DRY_RUN=false
 DRY_RUN_JSON=false
@@ -224,26 +183,9 @@ while [[ $# -gt 0 ]]; do
             for sdir in "$STATE_DIR"/sessions/*; do
                 [[ -d "$sdir" ]] || continue
                 sname=$(basename "$sdir")
-                # Liveness comes from the out-of-band pid record, never from
-                # session.json: that file lives inside a directory bound rw
-                # into the sandbox, so a payload can forge or delete it to
-                # make a live session look dead — and --gc deletes what it
-                # judges dead. Same rule as --list-sessions and the claim
-                # loop. Validated numeric before kill: an unchecked pid
-                # signals whoever it names.
-                gpid=""
-                spidf="$STATE_DIR/join/$sname.pid"
-                if [[ -f "$spidf" ]]; then
-                    read -r gpid < "$spidf" || true
-                fi
-                if [[ "$gpid" =~ ^[0-9]+$ ]] && kill -0 "$gpid" 2>/dev/null; then
-                    continue
-                fi
+                sbx_session_alive "$STATE_DIR" "$sname" && continue
                 echo "Removing crash residue: $sname"
-                rm -rf "${sdir:?}"
-                rm -f "${STATE_DIR:?}/join/$sname.json" \
-                      "${STATE_DIR:?}/join/$sname.lock" \
-                      "${STATE_DIR:?}/join/$sname.pid"
+                sbx_session_remove "$STATE_DIR" "$sname"
             done
 
             # Sidecars whose session directory does not exist at all — a
@@ -274,14 +216,7 @@ while [[ $# -gt 0 ]]; do
             for wdir in "$STATE_DIR"/work/*; do
                 [[ -d "$wdir" ]] || continue
                 wname=$(basename "$wdir")
-                wpid=""
-                wpidf="$STATE_DIR/join/$wname.pid"
-                if [[ -f "$wpidf" ]]; then
-                    read -r wpid < "$wpidf" || true
-                fi
-                if [[ "$wpid" =~ ^[0-9]+$ ]] && kill -0 "$wpid" 2>/dev/null; then
-                    continue
-                fi
+                sbx_session_alive "$STATE_DIR" "$wname" && continue
                 echo "Removing stranded work tree: $wname"
                 rm -rf "${wdir:?}"
             done
@@ -291,9 +226,7 @@ while [[ $# -gt 0 ]]; do
             keep=$(sbx_keep_changes)
             for cdir in "$STATE_DIR"/changes/*; do
                 [[ -d "$cdir" ]] || continue
-                find "$cdir" -mindepth 1 -maxdepth 1 -type d |
-                    LC_ALL=C sort -r | tail -n "+$((keep + 1))" |
-                    while IFS= read -r old; do rm -rf "${old:?}"; done
+                sbx_prune_changes "$cdir" "$keep"
             done
 
             # Never removed automatically: a forked store is the user's
@@ -333,18 +266,9 @@ while [[ $# -gt 0 ]]; do
                 scwd=$(jq -r '.cwd' "$sdir/session.json" 2>/dev/null | tr -d '\000-\037')
                 [[ "$scwd" == "$PWD" ]] || continue
                 sid=$(jq -r '.id' "$sdir/session.json" 2>/dev/null | tr -d '\000-\037')
-                # Liveness comes from the pid record in the masked join/
-                # area, not from session.json: the sandbox can rewrite its
-                # own session.json to claim any pid it likes, or delete it
-                # to feign death. Only display fields come from inside.
-                pid=""
-                spidf="$STATE_DIR/join/$(basename "$sdir").pid"
-                if [[ -f "$spidf" ]]; then
-                    read -r pid < "$spidf" || true
-                fi
-                # Validated, not merely non-empty: an unchecked $pid
-                # reaching kill is a signal sent wherever it names.
-                if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+                # Only display fields come from session.json; liveness does
+                # not (see lib/sessions.sh).
+                if pid=$(sbx_session_live_pid "$STATE_DIR" "$(basename "$sdir")"); then
                     echo "  $sid (PID: $pid)"
                 fi
             done
@@ -388,14 +312,7 @@ while [[ $# -gt 0 ]]; do
                 shift
                 JOIN_CMD=("$@")
             fi
-            # The name is typed by hand and interpolated into several paths
-            # under $STATE_DIR, so "--join ../x" would reach outside
-            # sessions/ and join/. Same character set the launch-time
-            # derivation produces, minus "." and ".." which name directories
-            # rather than sessions. Inline rather than a helper: argument
-            # parsing runs before any function in this script is defined.
-            if [[ ! "$JOIN_SESSION" =~ ^[a-z0-9._-]+$ ||
-                  "$JOIN_SESSION" == "." || "$JOIN_SESSION" == ".." ]]; then
+            if ! sbx_session_name_valid "$JOIN_SESSION"; then
                 echo "Error: Invalid session name '$JOIN_SESSION'." >&2
                 exit 1
             fi
@@ -484,9 +401,7 @@ while [[ $# -gt 0 ]]; do
             sbx_state_init
             ATTACH_SESSION="$2"
             shift 2
-            # Same validation as --join, and for the same reason.
-            if [[ ! "$ATTACH_SESSION" =~ ^[a-z0-9._-]+$ ||
-                  "$ATTACH_SESSION" == "." || "$ATTACH_SESSION" == ".." ]]; then
+            if ! sbx_session_name_valid "$ATTACH_SESSION"; then
                 echo "Error: Invalid session name '$ATTACH_SESSION'." >&2
                 exit 1
             fi
@@ -518,7 +433,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --host-port)
-            add_host_port "$2" "--host-port"
+            HOST_PORT_SPECS+=("$2")
             shift 2
             ;;
         --wd)
@@ -675,11 +590,8 @@ fi
 for profile in "${NET_PROFILES[@]}"; do
     RESOLVE_ARGS+=(--net "$profile")
 done
-for port in "${HOST_PORTS_TCP[@]}"; do
-    RESOLVE_ARGS+=(--host-port "$port/tcp")
-done
-for port in "${HOST_PORTS_UDP[@]}"; do
-    RESOLVE_ARGS+=(--host-port "$port/udp")
+for spec in "${HOST_PORT_SPECS[@]}"; do
+    RESOLVE_ARGS+=(--host-port "$spec")
 done
 if [[ -n "$WORKDIR" ]]; then
     RESOLVE_ARGS+=(--wd "$WORKDIR")
@@ -707,16 +619,7 @@ SOCK_PROBE=$(sbx_state_socket_probe "$STATE_DIR" "$SESSION_BASE")
 # run stops here with the plan, the host locations it would write, and the
 # dependency check in report-only form.
 if [[ "$DRY_RUN" == "true" ]]; then
-    DRY_DEPS_ARGS=()
-    if [[ "$(plan_get '.security.userns_full')" == "true" ]]; then
-        DRY_DEPS_ARGS+=(--subids)
-    fi
-    # unshare builds the control namespace for a session with no networking,
-    # and for userns: full (where it claims the subuid range before pasta
-    # starts). A plain networked session gets that namespace from pasta.
-    if [[ "$(plan_get '.netns')" != "true" || "$(plan_get '.security.userns_full')" == "true" ]]; then
-        DRY_DEPS_ARGS+=(--nsunshare)
-    fi
+    mapfile -t DRY_DEPS_ARGS < <(plan_get '.checks[] | "--" + .')
     mapfile -t DRY_GROUPS < <(plan_get '.deps[]')
     DRY_NEEDS=$(sbx_deps_status "${DRY_DEPS_ARGS[@]}" "${DRY_GROUPS[@]}")
     DRY_WRITES=$(sbx_state_writes "$PLAN" "$STATE_DIR" "$PWD" "${XAUTHORITY:-$HOME/.Xauthority}")
@@ -727,8 +630,9 @@ if [[ "$DRY_RUN" == "true" ]]; then
     # not about the profiles at all — a stop here would follow no matter
     # which profiles were chosen.
     DRY_STOPS=()
-    if [[ ${#SOCK_PROBE} -gt 100 ]]; then
-        DRY_STOPS+=("session socket path is too long (${#SOCK_PROBE} bytes, limit 100): $SOCK_PROBE. A Unix socket path this long cannot be bound. Use a shorter \$HOME.")
+    SOCK_PROBLEM=$(sbx_state_socket_problem "$SOCK_PROBE")
+    if [[ -n "$SOCK_PROBLEM" ]]; then
+        DRY_STOPS+=("$SOCK_PROBLEM")
     fi
 
     # Passthrough names that are actually set in this environment — never
@@ -811,17 +715,13 @@ NEST_UDP=$(IFS=,; echo "${HOST_PORTS_UDP[*]}")
 
 # --- Dependency preflight: optional groups ---
 # "nsunshare" is not a tool group: it asks sbx_deps_require to prove that
-# unshare may create a user + network namespace, which the shapes below build
-# their control namespace with. A plain networked session gets that namespace
-# from pasta and needs no such proof.
-mapfile -t DEP_GROUPS < <(plan_get '.deps[] | select(. != "core")')
-if [[ "$SBX_NETNS" != "true" || "$USERNS_FULL" == "true" ]]; then
-    DEP_GROUPS+=(nsunshare)
-fi
+# unshare may create a user + network namespace (see .checks in
+# lib/resolve.sh for which sessions need it).
+mapfile -t DEP_GROUPS < <(plan_get '(.deps[] | select(. != "core")), (.checks[] | select(. == "nsunshare"))')
 if [[ ${#DEP_GROUPS[@]} -gt 0 ]]; then
     sbx_deps_require "${DEP_GROUPS[@]}" || exit 1
 fi
-if [[ "$USERNS_FULL" == "true" ]] && ! sbx_deps_subids_ok; then
+if [[ "$(plan_get '.checks | index("subids") != null')" == "true" ]] && ! sbx_deps_subids_ok; then
     echo "Error: profile '$USERNS_PROFILE' sets \"userns\": \"full\", which needs a subordinate UID and GID range for $(id -un)." >&2
     echo "  Add one:  sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $(id -un)" >&2
     echo "  (choose a range not already used by another user in /etc/subuid)" >&2
@@ -836,19 +736,11 @@ fi
 
 # Session Initialization
 #
-# Naming rules live in lib/state-paths.sh, shared with --dry-run. SESSION_BASE
-# and SOCK_PROBE were already computed above (before the "Dry run" branch),
-# so this check and --dry-run's "stops" entry read the exact same values.
-#
-# A Unix socket path over ~108 bytes fails at bind() with "File name too
-# long", and the failure surfaces only as tmux refusing to connect long
-# after a session directory exists. Check the worst case — the widest
-# numeric suffix the claim loop can append — before claiming anything, so a
-# long $HOME produces one clear error instead of a mystery.
-if [[ ${#SOCK_PROBE} -gt 100 ]]; then
-    echo "Error: session socket path is too long (${#SOCK_PROBE} bytes, limit 100):" >&2
-    echo "  $SOCK_PROBE" >&2
-    echo "  A Unix socket path this long cannot be bound. Use a shorter \$HOME." >&2
+# The socket check uses the widest name the claim loop can produce, before
+# anything is claimed; --dry-run's "stops" entry reads the same values.
+SOCK_PROBLEM=$(sbx_state_socket_problem "$SOCK_PROBE")
+if [[ -n "$SOCK_PROBLEM" ]]; then
+    echo "Error: $SOCK_PROBLEM" >&2
     exit 1
 fi
 
@@ -885,35 +777,11 @@ fi
 SESSION_NAME="$SESSION_BASE"
 session_n=1
 while ! mkdir "$STATE_DIR/sessions/$SESSION_NAME" 2>/dev/null; do
-    # Liveness comes from join/<name>.pid, never from session.json: that
-    # file lives inside a directory bound rw into the sandbox, so a payload
-    # can delete or rewrite it and make its own running session present as
-    # residue to the next launch, which would then delete it. The pid
-    # record is in the masked join/ area, unreachable from inside.
-    # Validated numeric before kill: an unchecked pid signals whoever it
-    # names.
-    stale_pid=""
-    if [[ -f "$STATE_DIR/join/$SESSION_NAME.pid" ]]; then
-        read -r stale_pid < "$STATE_DIR/join/$SESSION_NAME.pid" || true
-    fi
-    if [[ ! "$stale_pid" =~ ^[0-9]+$ ]] || ! kill -0 "$stale_pid" 2>/dev/null; then
-        # Every sidecar, not only the pid — the same set --gc removes, for
-        # the same reason. A stale join/<name>.json outlives its session and
-        # then describes ours: we are live from the pid write below, but do
-        # not write our own sidecar until much later, and in that window a
-        # concurrent --reseed reads the PREDECESSOR's forked_stores. If that
-        # list does not name the store --reseed is targeting, the "live pid
-        # but unknown mounts -> refuse" guard is bypassed and --reseed
-        # rm -rf's a store this launch has already seeded and is about to
-        # --bind, leaving bwrap to fail on a missing source. Judging the
-        # name dead is sufficient grounds: control only reaches here after
-        # kill -0 has failed, and the rm -rf above already takes the whole
-        # session directory including tmux.sock, which --join tests with -S
-        # before it ever opens the sidecar.
-        rm -rf "${STATE_DIR:?}/sessions/$SESSION_NAME"
-        rm -f "${STATE_DIR:?}/join/$SESSION_NAME.json" \
-              "${STATE_DIR:?}/join/$SESSION_NAME.lock" \
-              "${STATE_DIR:?}/join/$SESSION_NAME.pid"
+    # A dead name is reclaimed with every sidecar, not only its directory:
+    # a predecessor's join/<name>.json would otherwise describe this session
+    # to a concurrent --reseed until ours is written.
+    if ! sbx_session_alive "$STATE_DIR" "$SESSION_NAME"; then
+        sbx_session_remove "$STATE_DIR" "$SESSION_NAME"
         continue
     fi
     session_n=$((session_n + 1))
@@ -1264,13 +1132,7 @@ if [[ "$RESEED" == "true" ]]; then
     for spid in "$STATE_DIR"/join/*.pid; do
         [[ -f "$spid" ]] || continue
         sname=$(basename "$spid" .pid)
-        lpid=""
-        read -r lpid < "$spid" || true
-        # Validated numeric before kill: an unchecked pid signals whoever it
-        # names.
-        if [[ ! "$lpid" =~ ^[0-9]+$ ]] || ! kill -0 "$lpid" 2>/dev/null; then
-            continue
-        fi
+        sbx_session_alive "$STATE_DIR" "$sname" || continue
         # The sidecar is written long after the pid claim, so a session
         # caught in between is live with nothing recorded. Unknown means
         # refuse, not "no conflict": a refusal is recoverable, deleting a
@@ -1812,19 +1674,14 @@ teardown() {
         # Prune old archives here too, not only on an explicit --gc, so
         # they never accumulate unbounded just because nobody remembered to
         # run it.
-        keep=$(sbx_keep_changes)
-        find "$STATE_DIR/changes/$(sbx_copy_path_slug "$PWD")" \
-            -mindepth 1 -maxdepth 1 -type d 2>/dev/null |
-            LC_ALL=C sort -r | tail -n "+$((keep + 1))" |
-            while IFS= read -r old; do rm -rf "${old:?}"; done
+        sbx_prune_changes "$STATE_DIR/changes/$(sbx_copy_path_slug "$PWD")" "$(sbx_keep_changes)"
     fi
     rm -rf "$RECORD_WORK_DIR"
 
     # Nothing durable lives here: forked stores, change archives and the
     # join sidecar are all outside. Removing the directory outright is the
     # whole fix for --list-sessions accumulating dead entries.
-    rm -rf "${SESSION_DIR:?}"
-    rm -f "$STATE_DIR/join/$SESSION_ID.json" "$JOIN_LOCK" "$SESSION_PID_FILE"
+    sbx_session_remove "$STATE_DIR" "$SESSION_ID"
 
     if [[ -n "$XPRA_DISPLAY" ]]; then
         echo "Stopping xpra display $XPRA_DISPLAY..."

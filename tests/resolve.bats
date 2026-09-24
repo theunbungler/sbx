@@ -196,6 +196,24 @@ r() { jq -r "$1" <<< "$PLAN"; }
     [ "$(q .deps)" = '["core","net"]' ]
 }
 
+@test "a session without networking needs the unshare check" {
+    resolve
+    [ "$(q .checks)" = '["nsunshare"]' ]
+}
+
+@test "a plain networked session needs no extra host checks" {
+    resolve --host-port 8080
+    [ "$(q .checks)" = '[]' ]
+}
+
+@test "userns full needs the unshare and subordinate-id checks" {
+    local fs net
+    fs=$(user fs u '{"userns":"full"}')
+    net=$(user net n '{"allow":["github.com"]}')
+    resolve --fs "$fs" --net "$net"
+    [ "$(q .checks)" = '["nsunshare","subids"]' ]
+}
+
 @test "--wd and --gui pass through" {
     resolve --wd /work --gui
     [ "$(r .wd)" = "/work" ]

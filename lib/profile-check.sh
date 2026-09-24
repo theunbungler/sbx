@@ -3,12 +3,16 @@
 # for its type and reports every problem at once, each naming the JSON path
 # it is about.
 #
-# Sourced by sbx and directly by tests/. Defines a constant and a function
+# Sourced by sbx and directly by tests/. Defines constants and functions
 # only — no side effects at source time, no dependency on sbx globals.
 #
 # Unknown fields are errors, not ignored: a typo like "mount" would
 # otherwise silently grant or withhold nothing. There is deliberately no
 # comment convention.
+
+# Fields a project profile may not set: each one widens the boundary
+# (capabilities, a user namespace, the podman API, host services).
+SBX_PROFILE_RESTRICTED='["caps","userns","docker_api","host_ports"]'
 
 # shellcheck disable=SC2016  # jq program: $vars are jq's, not the shell's
 SBX_PROFILE_CHECK_JQ='
@@ -16,8 +20,6 @@ def known:
   { cli: ["description","env","path","mounts","passthrough","caps","userns","docker_api"],
     fs:  ["description","mounts","env","passthrough","caps","userns","docker_api"],
     net: ["description","dns","allow","ports","host_ports"] };
-# Same list as sbx_profile_restricted_fields in lib/profiles.sh — keep the two in step.
-def restricted: ["caps","userns","docker_api","host_ports"];
 def err($p; $m): {level: "error", path: $p, message: $m};
 def warn($p; $m): {level: "warning", path: $p, message: $m};
 def is_port: type == "number" and . == floor and . >= 1 and . <= 65535;
@@ -130,7 +132,7 @@ else
         else empty end ),
 
       ( if $origin == "project" then
-          restricted[] as $f
+          $restricted[] as $f
           | select(($p | has($f)) and (known[$type] | any(. == $f)))
           | err(".\($f)"; "project profiles may not set \($f); move the profile to ~/.config/sbx/profiles/ to grant it")
         else empty end )
@@ -141,7 +143,7 @@ end
 
 sbx_profile_check() {   # <type> <file> <origin>
     local type="$1" file="$2" origin="$3" out level rest
-    if ! out=$(jq -r --arg type "$type" --arg origin "$origin" "$SBX_PROFILE_CHECK_JQ" "$file" 2>&1); then
+    if ! out=$(jq -r --arg type "$type" --arg origin "$origin" --argjson restricted "$SBX_PROFILE_RESTRICTED" "$SBX_PROFILE_CHECK_JQ" "$file" 2>&1); then
         printf 'error\t%s: invalid JSON: %s\n' "$file" "${out%%$'\n'*}"
         return 0
     fi
@@ -151,4 +153,9 @@ sbx_profile_check() {   # <type> <file> <origin>
         fi
     done <<< "$out"
     return 0
+}
+
+# The restricted fields a profile file sets, in list order.
+sbx_profile_restricted_fields() {   # <file>
+    jq -r --argjson restricted "$SBX_PROFILE_RESTRICTED" '. as $p | $restricted[] | select(. as $f | $p | has($f))' "$1"
 }
