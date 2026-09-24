@@ -1,6 +1,11 @@
 #!/bin/bash
 
 # sbx - Portable Unprivileged Sandbox Orchestrator
+#
+# Layout: helpers and subcommands, then the launch as a sequence of phases,
+# then main. The launch builds its state in globals (BWRAP_ARGS, the plan
+# settings, the session paths), one phase after another, in the order bwrap
+# needs its mount arguments.
 
 set -e
 
@@ -26,29 +31,35 @@ source "$SCRIPT_DIR/lib/net-merge.sh"
 source "$SCRIPT_DIR/lib/resolve.sh"
 # shellcheck source=lib/sessions.sh
 source "$SCRIPT_DIR/lib/sessions.sh"
-# A's extra chains and the A/B addresses (nested payload networking).
 # shellcheck source=lib/nestnet.sh
 source "$SCRIPT_DIR/lib/nestnet.sh"
 # shellcheck source=lib/egress.sh
 source "$SCRIPT_DIR/lib/egress.sh"
 
-GUI_MODE=false
-XPRA_DISPLAY=""
-
-# Serializes every observation of the two-step session claim (see the claim
-# loop below for what the two steps are and why the gap between them must
-# never be seen). Defined here rather than beside the claim loop because
-# --gc, which runs during argument parsing, has to take the same lock: it is
-# exactly the observer the claim loop is protecting against.
-#
-# It lives directly under $STATE_DIR rather than in join/ because session
-# names may begin with "." — a session named ".claim" would collide with
-# join/.claim.lock. It is covered by the same --tmpfs mask as join/, and
-# --list-sessions ignores it because that requires a directory.
+# Serializes every observation of the two-step session claim (see
+# claim_session): --gc takes it too, since it is exactly the observer the
+# claim protects against. Directly under $STATE_DIR, not in join/, because a
+# session may be named ".claim". Masked inside the sandbox like join/.
 CLAIM_LOCK="$STATE_DIR/claim.lock"
 
-# Creates the state directory. Every path runs this before touching state —
-# except --dry-run, which must create nothing.
+# Flags. Profiles are resolved to paths as they are parsed.
+FS_PROFILES=()
+NET_PROFILES=()
+CLI_PROFILE=""
+WORKDIR=""
+HOST_PORT_SPECS=()   # as typed; lib/resolve.sh validates and buckets them
+COMMAND=()
+GUI_FLAG=false
+DRY_RUN=false
+DRY_RUN_JSON=false
+RESEED=false
+ASSUME_YES=false
+
+# Set by the GUI phase; read by teardown.
+XPRA_DISPLAY=""
+
+# Every path runs this before touching state — except --dry-run, which
+# must create nothing.
 sbx_state_init() {
     mkdir -p "$STATE_DIR"
 }
@@ -74,6 +85,17 @@ sbx_refuse_dry_run() {   # <this command> <remaining args...>
     if [[ "$DRY_RUN" == "true" ]]; then
         echo "Error: --dry-run applies only to a launch; it cannot be combined with $cmd." >&2
         exit 2
+    fi
+}
+
+# Takes the claim lock on fd 8, warning (not failing) if it cannot: a
+# filesystem without working flock should degrade visibly, not refuse every
+# launch. <consequence> finishes the warning.
+sbx_claim_lock() {   # <consequence>
+    if exec 8>>"$CLAIM_LOCK"; then
+        flock -x 8 || echo "Warning: could not lock $CLAIM_LOCK; $1" >&2
+    else
+        echo "Warning: could not open $CLAIM_LOCK; $1" >&2
     fi
 }
 
@@ -118,396 +140,395 @@ resolve_profile() {   # <type> <name>
     sbx_profile_resolve "$1" "$2" "$CONFIG_DIR" "$SCRIPT_DIR/profiles"
 }
 
-list_profiles() {
-    sbx_profile_list "$CONFIG_DIR" "$SCRIPT_DIR/profiles"
+# ---------------------------------------------------------------------------
+# Subcommands. Each runs when the parser reaches it, and exits.
+# ---------------------------------------------------------------------------
+
+cmd_doctor() {   # [--json]
+    if [[ -n "${1:-}" && "$1" != "--json" ]]; then
+        echo "Error: --doctor takes only --json." >&2
+        exit 2
+    fi
+    local rc=0
+    sbx_deps_doctor "${1:-}" || rc=$?
+    exit "$rc"
 }
 
-# Main Argument Parsing
-FS_PROFILES=()
-NET_PROFILES=()
-CLI_PROFILE=""
-WORKDIR=""
-HOST_PORT_SPECS=()   # as typed; lib/resolve.sh validates and buckets them
-COMMAND=()
+cmd_gc() {
+    local sdir sname sc scname wdir wname cdir keep forked_report
 
-GUI_FLAG=false
-DRY_RUN=false
-DRY_RUN_JSON=false
-CAPS_KEEP=false
-RESEED=false
-ASSUME_YES=false
+    # The sweeps judge a session dead by the absence of a liveness record,
+    # which is exactly the intermediate state the claim hides behind this
+    # lock. Held across all three; fd 8 is free, since --gc exits before
+    # the claim or teardown run.
+    sbx_claim_lock "a concurrent launch's session may be collected mid-claim."
 
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --doctor)
-            sbx_refuse_dry_run --doctor "${@:2}"
-            sbx_state_init
-            if [[ -n "${2:-}" && "${2:-}" != "--json" ]]; then
-                echo "Error: --doctor takes only --json." >&2
-                exit 2
-            fi
-            doctor_rc=0
-            sbx_deps_doctor "${2:-}" || doctor_rc=$?
-            exit "$doctor_rc"
-            ;;
-        --list-profiles)
-            sbx_refuse_dry_run --list-profiles "${@:2}"
-            sbx_state_init
-            list_profiles
-            exit 0
-            ;;
-        --gc)
-            sbx_refuse_dry_run --gc "${@:2}"
-            sbx_state_init
-            # Both sweeps below judge a session dead by the absence of a
-            # liveness record, which is exactly the intermediate state the
-            # claim loop hides behind this lock: between its mkdir and its
-            # pid write, a LIVE session looks like crash residue. Held
-            # across both sweeps rather than per entry — the per-entry work
-            # is a stat, a kill -0 and an rm -rf, and the claim loop already
-            # rm -rf's residue under this same lock, so the worst stall a
-            # launch can see here is the one the design already accepts.
-            #
-            # fd 8 is free: the claim loop uses 8 and teardown's join lock
-            # uses 9, and --gc exits before either runs.
-            #
-            # Warn and continue on failure, on both the open and the acquire
-            # path, exactly as the claim loop does: refusing to collect
-            # anything on a filesystem without working flock would be worse
-            # than collecting it unlocked, but a lock whose failure is
-            # invisible is not a lock.
-            if exec 8>>"$CLAIM_LOCK"; then
-                flock -x 8 || echo "Warning: could not lock $CLAIM_LOCK; a concurrent launch's session may be collected mid-claim." >&2
-            else
-                echo "Warning: could not open $CLAIM_LOCK; a concurrent launch's session may be collected mid-claim." >&2
-            fi
+    for sdir in "$STATE_DIR"/sessions/*; do
+        [[ -d "$sdir" ]] || continue
+        sname=$(basename "$sdir")
+        sbx_session_alive "$STATE_DIR" "$sname" && continue
+        echo "Removing crash residue: $sname"
+        sbx_session_remove "$STATE_DIR" "$sname"
+    done
 
-            for sdir in "$STATE_DIR"/sessions/*; do
-                [[ -d "$sdir" ]] || continue
-                sname=$(basename "$sdir")
-                sbx_session_alive "$STATE_DIR" "$sname" && continue
-                echo "Removing crash residue: $sname"
-                sbx_session_remove "$STATE_DIR" "$sname"
-            done
+    # Sidecars with no session directory can never belong to a live
+    # session. Confined to join/, so it never reaches claim.lock.
+    for sc in "$STATE_DIR"/join/*; do
+        [[ -f "$sc" ]] || continue
+        scname=$(basename "$sc")
+        scname="${scname%.pid}"
+        scname="${scname%.json}"
+        scname="${scname%.lock}"
+        [[ -d "$STATE_DIR/sessions/$scname" ]] && continue
+        rm -f "${sc:?}"
+    done
 
-            # Sidecars whose session directory does not exist at all — a
-            # crash between the claim mkdir and session start, or leftovers
-            # from an interrupted GC — can never belong to a live session,
-            # since a live session always has its directory. This glob is
-            # confined to join/, so it can never reach claim.lock, which
-            # lives directly under $STATE_DIR.
-            for sc in "$STATE_DIR"/join/*; do
-                [[ -f "$sc" ]] || continue
-                scbase=$(basename "$sc")
-                scname="${scbase%.pid}"
-                scname="${scname%.json}"
-                scname="${scname%.lock}"
-                [[ -d "$STATE_DIR/sessions/$scname" ]] && continue
-                rm -f "${sc:?}"
-            done
+    # Record-mount work trees stranded by a session that never ran teardown
+    # (SIGKILL, OOM, power loss). A live session's tree is bound into it.
+    for wdir in "$STATE_DIR"/work/*; do
+        [[ -d "$wdir" ]] || continue
+        wname=$(basename "$wdir")
+        sbx_session_alive "$STATE_DIR" "$wname" && continue
+        echo "Removing stranded work tree: $wname"
+        rm -rf "${wdir:?}"
+    done
 
-            # Record-mount working copies. Only teardown removed these, so a
-            # session killed by SIGKILL, OOM or power loss strands one — and
-            # a stranded tree is not merely wasted space: the next session of
-            # the same name seeds INTO it (cp -a merges) and folds its ghost
-            # files into the baseline. Launches clear their own work tree
-            # before seeding, which fixes the corruption going forward; this
-            # sweep is what reclaims what is already on disk. Same liveness
-            # rule and same lock as the sweeps above — a live session's work
-            # tree is bound into a running sandbox.
-            for wdir in "$STATE_DIR"/work/*; do
-                [[ -d "$wdir" ]] || continue
-                wname=$(basename "$wdir")
-                sbx_session_alive "$STATE_DIR" "$wname" && continue
-                echo "Removing stranded work tree: $wname"
-                rm -rf "${wdir:?}"
-            done
+    exec 8>&-
 
-            exec 8>&-
+    keep=$(sbx_keep_changes)
+    for cdir in "$STATE_DIR"/changes/*; do
+        [[ -d "$cdir" ]] || continue
+        sbx_prune_changes "$cdir" "$keep"
+    done
 
-            keep=$(sbx_keep_changes)
-            for cdir in "$STATE_DIR"/changes/*; do
-                [[ -d "$cdir" ]] || continue
-                sbx_prune_changes "$cdir" "$keep"
-            done
+    # Forked stores are the user's accumulated tool state and are never
+    # removed on a heuristic; they are listed so the space is visible.
+    # forked/ outlives its last store, so print only when there are rows.
+    forked_report=$(du -sh "$STATE_DIR"/forked/*/*/* 2>/dev/null | sed 's/^/  /')
+    if [[ -n "$forked_report" ]]; then
+        echo "Forked stores (not removed; use --reseed):"
+        echo "$forked_report"
+    fi
+    exit 0
+}
 
-            # Never removed automatically: a forked store is the user's
-            # accumulated tool state, and deleting it on a heuristic is not
-            # recoverable. Reported so the space is at least visible; use
-            # --reseed to actually discard one.
-            # The header is worth nothing without rows under it: forked/
-            # exists as soon as any store ever has, including after the last
-            # one is reseeded away, so "-d forked" alone announces a list
-            # that is empty. Collect first, print only if there is something
-            # to print.
-            forked_report=$(du -sh "$STATE_DIR"/forked/*/*/* 2>/dev/null | sed 's/^/  /')
-            if [[ -n "$forked_report" ]]; then
-                echo "Forked stores (not removed; use --reseed):"
-                echo "$forked_report"
-            fi
+cmd_list_sessions() {
+    local sdir scwd sid pid
+    echo "Active Sessions (this directory):"
+    for sdir in "$STATE_DIR"/sessions/*; do
+        [[ -d "$sdir" && -f "$sdir/session.json" ]] || continue
+        # session.json is inside the sandbox's rw session directory: every
+        # field is attacker-authored, so control characters are stripped,
+        # and liveness comes from the pid record instead (lib/sessions.sh).
+        scwd=$(jq -r '.cwd' "$sdir/session.json" 2>/dev/null | tr -d '\000-\037')
+        [[ "$scwd" == "$PWD" ]] || continue
+        sid=$(jq -r '.id' "$sdir/session.json" 2>/dev/null | tr -d '\000-\037')
+        if pid=$(sbx_session_live_pid "$STATE_DIR" "$(basename "$sdir")"); then
+            echo "  $sid (PID: $pid)"
+        fi
+    done
+    exit 0
+}
 
-            exit 0
-            ;;
-        --reseed)
-            RESEED=true
-            shift
-            ;;
-        --yes)
-            ASSUME_YES=true
-            shift
-            ;;
-        --list-sessions)
-            sbx_refuse_dry_run --list-sessions "${@:2}"
-            sbx_state_init
-            echo "Active Sessions (this directory):"
-            for sdir in "$STATE_DIR"/sessions/*; do
-                [[ -d "$sdir" && -f "$sdir/session.json" ]] || continue
-                # session.json lives inside a directory bound rw into the
-                # sandbox — every field is attacker-authored. Strip control
-                # characters before echoing them to a terminal.
-                scwd=$(jq -r '.cwd' "$sdir/session.json" 2>/dev/null | tr -d '\000-\037')
-                [[ "$scwd" == "$PWD" ]] || continue
-                sid=$(jq -r '.id' "$sdir/session.json" 2>/dev/null | tr -d '\000-\037')
-                # Only display fields come from session.json; liveness does
-                # not (see lib/sessions.sh).
-                if pid=$(sbx_session_live_pid "$STATE_DIR" "$(basename "$sdir")"); then
-                    echo "  $sid (PID: $pid)"
+cmd_changes() {   # [<id>]
+    local changes_dir target d
+    changes_dir="$STATE_DIR/changes/$(sbx_copy_path_slug "$PWD")"
+    if [[ -n "${1-}" && "$1" != -* ]]; then
+        target="$changes_dir/$1"
+    else
+        target=$(find "$changes_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null |
+                 LC_ALL=C sort | tail -n1)
+    fi
+    if [[ -z "$target" || ! -d "$target" ]]; then
+        echo "No recorded changes for this directory." >&2
+        exit 1
+    fi
+    echo "$target"
+    # A record mount's contents come from inside the sandbox: strip control
+    # characters before they reach a terminal.
+    find "$target" -mindepth 2 -type f -printf '  + %P\n' | tr -d '\000-\037'
+    for d in "$target"/*.deleted; do
+        [[ -f "$d" ]] || continue
+        sed 's/^/  - /' "$d" | tr -d '\000-\037'
+    done
+    exit 0
+}
+
+# Checks shared by --join and --attach; sets SDIR. The name is typed by
+# hand and interpolated into paths, so it is validated first.
+open_session() {   # <name>
+    if ! sbx_session_name_valid "$1"; then
+        echo "Error: Invalid session name '$1'." >&2
+        exit 1
+    fi
+    SDIR="$STATE_DIR/sessions/$1"
+    # -S: the server's rendezvous point is a unix socket.
+    if [[ ! -d "$SDIR" || ! -S "$SDIR/tmux.sock" ]]; then
+        echo "Error: Session '$1' not found or no socket available." >&2
+        exit 1
+    fi
+    if ! command -v tmux >/dev/null 2>&1; then
+        echo "Error: sbx requires tmux, which is not on PATH." >&2
+        exit 1
+    fi
+}
+
+cmd_join() {   # <name> [-- <cmd>...]
+    local name="$1" meta join_path join_wd lock
+    local -a cmd=(/bin/bash)
+    shift
+    if [[ "${1-}" == "--" && $# -gt 1 ]]; then
+        shift
+        cmd=("$@")
+    fi
+    open_session "$name"
+
+    # Everything --join needs comes from the host-written sidecar, never
+    # from the session directory: that is bound rw into the sandbox it is
+    # about to enter. Absent means a session this sbx did not start; fail
+    # closed rather than guess.
+    meta="$STATE_DIR/join/$name.json"
+    if [[ ! -f "$meta" ]]; then
+        echo "Error: Session '$name' has no join metadata; it was not started by this version of sbx." >&2
+        exit 1
+    fi
+    join_path=$(jq -r '.path' "$meta")
+    join_wd=$(jq -r '.workdir' "$meta")
+
+    # Shared for the life of the join (the fd survives the exec); teardown
+    # takes it exclusively before archiving record mounts. See teardown.
+    lock="$STATE_DIR/join/$name.lock"
+    if exec 9>>"$lock"; then
+        flock -s 9 || echo "Warning: could not lock $lock; teardown may not wait for this join." >&2
+    fi
+
+    # new-session, not attach: an independent client with its own pty and
+    # size, forked by the already-capless server (the drop happens once, in
+    # launch.sh). env PATH by absolute path: tmux hands a pane the client's
+    # PATH regardless of update-environment. -c: start where the payload
+    # did; a directory missing inside makes tmux fall back to $HOME.
+    exec tmux -S "$SDIR/tmux.sock" new-session -c "$join_wd" -- \
+        /usr/bin/env "PATH=$join_path" "${cmd[@]}"
+}
+
+# Mirroring, deliberately: the way back to a payload you detached from.
+cmd_attach() {   # <name>
+    open_session "$1"
+    exec tmux -S "$SDIR/tmux.sock" attach -t main
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --doctor)
+                sbx_refuse_dry_run --doctor "${@:2}"
+                sbx_state_init
+                cmd_doctor "${2:-}"
+                ;;
+            --list-profiles)
+                sbx_refuse_dry_run --list-profiles "${@:2}"
+                sbx_state_init
+                sbx_profile_list "$CONFIG_DIR" "$SCRIPT_DIR/profiles"
+                exit 0
+                ;;
+            --gc)
+                sbx_refuse_dry_run --gc "${@:2}"
+                sbx_state_init
+                cmd_gc
+                ;;
+            --list-sessions)
+                sbx_refuse_dry_run --list-sessions "${@:2}"
+                sbx_state_init
+                cmd_list_sessions
+                ;;
+            --changes)
+                sbx_refuse_dry_run --changes "${@:2}"
+                sbx_state_init
+                cmd_changes "${2-}"
+                ;;
+            --join)
+                sbx_refuse_dry_run --join "${@:2}"
+                sbx_state_init
+                cmd_join "${@:2}"
+                ;;
+            --attach)
+                sbx_refuse_dry_run --attach "${@:2}"
+                sbx_state_init
+                cmd_attach "$2"
+                ;;
+            --reseed)
+                RESEED=true
+                shift
+                ;;
+            --yes)
+                ASSUME_YES=true
+                shift
+                ;;
+            --fs)
+                FS_PROFILES+=("$(resolve_profile fs "$2")")
+                shift 2
+                ;;
+            --net)
+                NET_PROFILES+=("$(resolve_profile net "$2")")
+                shift 2
+                ;;
+            --cli)
+                CLI_PROFILE="$(resolve_profile cli "$2")"
+                shift 2
+                ;;
+            --host-port)
+                HOST_PORT_SPECS+=("$2")
+                shift 2
+                ;;
+            --wd)
+                # envsubst like every other path sbx accepts, so '$HOME/src'
+                # works quoted or expanded by the caller's shell.
+                WORKDIR="$(echo "$2" | envsubst)"
+                shift 2
+                ;;
+            --gui)
+                GUI_FLAG=true
+                shift
+                ;;
+            --dry-run)
+                DRY_RUN=true
+                shift
+                if [[ "${1:-}" == "--json" ]]; then
+                    DRY_RUN_JSON=true
+                    shift
                 fi
-            done
-            exit 0
-            ;;
-        --changes)
-            sbx_refuse_dry_run --changes "${@:2}"
-            sbx_state_init
-            CHANGES_DIR="$STATE_DIR/changes/$(sbx_copy_path_slug "$PWD")"
-            if [[ -n "${2-}" && "$2" != -* ]]; then
-                target="$CHANGES_DIR/$2"; shift 2
-            else
-                target=$(find "$CHANGES_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null |
-                         LC_ALL=C sort | tail -n1)
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            --)
                 shift
-            fi
-            if [[ -z "$target" || ! -d "$target" ]]; then
-                echo "No recorded changes for this directory." >&2
-                exit 1
-            fi
-            echo "$target"
-            # Paths are attacker-authored (a record mount's contents come
-            # from inside the sandbox), so strip control characters before
-            # echoing them to a terminal — same reasoning as --list-sessions.
-            find "$target" -mindepth 2 -type f -printf '  + %P\n' | tr -d '\000-\037'
-            for d in "$target"/*.deleted; do
-                [[ -f "$d" ]] || continue
-                sed 's/^/  - /' "$d" | tr -d '\000-\037'
-            done
-            exit 0
-            ;;
-        --join)
-            sbx_refuse_dry_run --join "${@:2}"
-            sbx_state_init
-            JOIN_SESSION="$2"
-            shift 2
-            # A trailing `-- cmd` has to be consumed here: this branch exits
-            # before the main loop ever reaches the `--` case.
-            JOIN_CMD=()
-            if [[ "${1-}" == "--" ]]; then
-                shift
-                JOIN_CMD=("$@")
-            fi
-            if ! sbx_session_name_valid "$JOIN_SESSION"; then
-                echo "Error: Invalid session name '$JOIN_SESSION'." >&2
-                exit 1
-            fi
-            SDIR="$STATE_DIR/sessions/$JOIN_SESSION"
-            # -S, not -f: the server's rendezvous point is a unix socket,
-            # which is never a regular file.
-            if [[ ! -d "$SDIR" || ! -S "$SDIR/tmux.sock" ]]; then
-                echo "Error: Session '$JOIN_SESSION' not found or no socket available." >&2
-                exit 1
-            fi
-            # Inline check, not sbx_deps_require: --join needs only tmux,
-            # and the preflight runs later, after argument parsing.
-            if ! command -v tmux >/dev/null 2>&1; then
-                echo "Error: sbx requires tmux, which is not on PATH." >&2
-                exit 1
-            fi
-            # No command means an interactive shell, matching the default
-            # sbx runs when launched with no command at all.
-            if [[ ${#JOIN_CMD[@]} -eq 0 ]]; then
-                JOIN_CMD=("/bin/bash")
-            fi
-            # Everything --join needs to know about the session comes from
-            # this sidecar. It deliberately does NOT live in $SESSION_DIR:
-            # that directory is bound rw into the sandbox, so session.json
-            # and any generated script in it are attacker-authored as far as
-            # the host is concerned. $STATE_DIR itself is masked by a
-            # --tmpfs inside the sandbox with only $SESSION_DIR bound back
-            # in, so a file at this path is unreachable from inside.
-            # Absent means the session was not launched by this sbx: fail
-            # closed rather than guess at its capability policy.
-            JOIN_META="$STATE_DIR/join/$JOIN_SESSION.json"
-            if [[ ! -f "$JOIN_META" ]]; then
-                echo "Error: Session '$JOIN_SESSION' has no join metadata; it was not started by this version of sbx." >&2
-                exit 1
-            fi
-            JOIN_PATH=$(jq -r '.path' "$JOIN_META")
-            JOIN_WD=$(jq -r '.workdir' "$JOIN_META")
-            # Held for the whole life of the join, and released by the kernel
-            # when this process finally exits. teardown() takes the same lock
-            # exclusively before archiving record-mount changes, and that
-            # pairing is what protects a teardown that runs while the
-            # sandbox is still fully alive: teardown() is an EXIT trap, and
-            # a SIGTERM to sbx (Ctrl-C on the launching terminal, a CI
-            # timeout) fires it before bwrap has any reason to exit, so the
-            # payload, the tmux server and this join can all still be
-            # writing when the archive would otherwise start. The
-            # in-sandbox PID-1 waiter (see session.sh's tmux conf and the
-            # comment above the session script) is not in that exit path at
-            # all — it only runs teardown once bwrap itself has already
-            # returned — so it cannot cover for this lock; see
-            # tests/join.bats "writeback waits on the host lock when
-            # teardown is not gated by the sandbox". The fd survives the
-            # exec below on purpose.
-            JOIN_LOCK="$STATE_DIR/join/$JOIN_SESSION.lock"
-            if exec 9>>"$JOIN_LOCK"; then
-                flock -s 9 || echo "Warning: could not lock $JOIN_LOCK; teardown may not wait for this join." >&2
-            fi
-            # new-session, NOT attach: a second client on the SAME session
-            # would mirror the payload's terminal, which is exactly the
-            # behaviour this flag exists to stop doing. A new session in the
-            # same server is an independent client with its own pty and its
-            # own size, and the server forks it.
-            #
-            # No capability drop here, and no on-disk wrapper to hold one:
-            # the drop happens once, at the top, where launch.sh starts
-            # session.sh under setpriv (see the comment there). The tmux
-            # server is therefore already capless and everything it forks —
-            # this join, and equally new-window/split-window/run-shell —
-            # inherits an empty bounding set by construction. Re-applying
-            # setpriv here would in fact fail with EPERM, since emptying a
-            # bounding set needs the CAP_SETPCAP that is already gone.
-            #
-            # env PATH: tmux copies the *client's* PATH into a spawned pane
-            # regardless of `update-environment ''`, so the host's PATH would
-            # otherwise reach every join. /usr/bin/env by absolute path for
-            # the same reason — it must not be resolved through that PATH.
-            # -c: without it tmux uses the host client's cwd, so a join would
-            # ignore the session's --wd. A directory that does not exist
-            # inside the sandbox makes tmux fall back to $HOME, which is the
-            # same default the payload gets.
-            exec tmux -S "$SDIR/tmux.sock" new-session -c "$JOIN_WD" -- \
-                /usr/bin/env "PATH=$JOIN_PATH" "${JOIN_CMD[@]}"
-            ;;
-        --attach)
-            sbx_refuse_dry_run --attach "${@:2}"
-            sbx_state_init
-            ATTACH_SESSION="$2"
-            shift 2
-            if ! sbx_session_name_valid "$ATTACH_SESSION"; then
-                echo "Error: Invalid session name '$ATTACH_SESSION'." >&2
-                exit 1
-            fi
-            SDIR="$STATE_DIR/sessions/$ATTACH_SESSION"
-            if [[ ! -d "$SDIR" || ! -S "$SDIR/tmux.sock" ]]; then
-                echo "Error: Session '$ATTACH_SESSION' not found or no socket available." >&2
-                exit 1
-            fi
-            if ! command -v tmux >/dev/null 2>&1; then
-                echo "Error: sbx requires tmux, which is not on PATH." >&2
-                exit 1
-            fi
-            # This one really is mirroring, deliberately and by name: it is
-            # the way back to a payload you detached from. --join is the
-            # non-mirroring door; without this, detaching the main session
-            # would lock you out of a still-running payload for good.
-            exec tmux -S "$SDIR/tmux.sock" attach -t main
-            ;;
-        --fs)
-            FS_PROFILES+=("$(resolve_profile fs "$2")")
-            shift 2
-            ;;
-        --net)
-            NET_PROFILES+=("$(resolve_profile net "$2")")
-            shift 2
-            ;;
-        --cli)
-            CLI_PROFILE="$(resolve_profile cli "$2")"
-            shift 2
-            ;;
-        --host-port)
-            HOST_PORT_SPECS+=("$2")
-            shift 2
-            ;;
-        --wd)
-            # envsubst for parity with every other path sbx accepts
-            # (mounts, env, path), so '$HOME/src' works whether it reaches
-            # us quoted from a script or expanded by the caller's shell.
-            WORKDIR="$(echo "$2" | envsubst)"
-            shift 2
-            ;;
-        --)
-            shift
-            COMMAND=("$@")
-            break
-            ;;
-        --gui)
-            GUI_FLAG=true
-            shift
-            ;;
-        --dry-run)
-            DRY_RUN=true
-            shift
-            if [[ "${1:-}" == "--json" ]]; then
-                DRY_RUN_JSON=true
-                shift
-            fi
-            ;;
-        -h|--help)
-            usage
-            exit 0
-            ;;
-        --*)
-            echo "Error: unknown option '$1'. Put the command after -- if it starts with a dash: sbx [options] -- <command>" >&2
-            exit 2
-            ;;
-        *)
-            if [[ ${#COMMAND[@]} -eq 0 ]]; then
                 COMMAND=("$@")
-                break
-            else
-                break
-            fi
-            ;;
-    esac
-done
+                return 0
+                ;;
+            --*)
+                echo "Error: unknown option '$1'. Put the command after -- if it starts with a dash: sbx [options] -- <command>" >&2
+                exit 2
+                ;;
+            *)
+                COMMAND=("$@")
+                return 0
+                ;;
+        esac
+    done
+}
 
-if [[ "$RESEED" == "true" && "$DRY_RUN" == "true" ]]; then
-    echo "Error: --dry-run applies only to a launch; it cannot be combined with --reseed." >&2
-    exit 2
-fi
-if [[ "$DRY_RUN" != "true" ]]; then
-    sbx_state_init
-fi
+# ---------------------------------------------------------------------------
+# The launch, phase by phase.
+# ---------------------------------------------------------------------------
 
-if [[ ${#COMMAND[@]} -eq 0 ]]; then
-    COMMAND=("/bin/bash")
-fi
+# Everything after this may exec a core tool, so they are checked first,
+# with the user-namespace and capability probes. A dry run needs only the
+# tools this script itself calls before the report; anything else missing
+# belongs in the report's Needs, as a reason the launch would stop.
+preflight_core() {
+    local tool
+    local -a missing=()
+    if [[ "$DRY_RUN" != "true" ]]; then
+        sbx_deps_require core || exit 1
+        return 0
+    fi
+    for tool in jq realpath envsubst; do
+        command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        sbx_deps_report_missing "${missing[@]}" >&2
+        exit 1
+    fi
+}
 
-# Prompts for a profile that lib/resolve.sh has already decided needs
-# confirmation (plan.confirm: project origin, git-tracked, trust not
-# granted — see the comment by "confirm+=" in lib/resolve.sh). This
-# function only performs the prompt; it does not recompute the trust
-# decision, so it and the plan it is driven from can never disagree about
-# which profiles land here (that used to be two independent
-# implementations — see the "trust decision is computed twice" finding).
-#
-# A version-controlled project directory is untrusted input: it can ship
-# .sbx/profiles that mount anything anywhere, authored by whoever wrote the
-# repository. Using one is a decision the user makes explicitly, outside the
-# repository.
-prompt_project_profile() {
-    local profile="$1"
-    local remote="" rname=""
+# Every decision about profiles is made here, without touching the disk
+# (lib/resolve.sh). Everything after this reads the plan, never a profile.
+resolve_plan() {
+    local profile spec
+    local -a args=(--launch-dir "$PWD" --config-dir "$CONFIG_DIR" --global-dir "$SCRIPT_DIR/profiles")
+    for profile in "${FS_PROFILES[@]}"; do
+        args+=(--fs "$profile")
+    done
+    if [[ -n "$CLI_PROFILE" ]]; then
+        args+=(--cli "$CLI_PROFILE")
+    fi
+    for profile in "${NET_PROFILES[@]}"; do
+        args+=(--net "$profile")
+    done
+    for spec in "${HOST_PORT_SPECS[@]}"; do
+        args+=(--host-port "$spec")
+    done
+    if [[ -n "$WORKDIR" ]]; then
+        args+=(--wd "$WORKDIR")
+    fi
+    if [[ "$GUI_FLAG" == "true" ]]; then
+        args+=(--gui)
+    fi
+    PLAN=$(sbx_resolve "${args[@]}")
+
+    # The name this launch would claim and the widest socket path it could
+    # need: the dry run's "stops" and the launch's own check read the same.
+    SESSION_BASE=$(sbx_state_session_base "$PWD")
+    SOCK_PROBE=$(sbx_state_socket_probe "$STATE_DIR" "$SESSION_BASE")
+}
+
+plan_get() {
+    jq -r "$1" <<< "$PLAN"
+}
+
+# The plan, the host locations the launch would write, and the dependency
+# check in report-only form. Exits 0 if the launch would proceed.
+dry_run_report() {
+    local needs writes doc var problem
+    local -a checks groups stops=() passthrough passthrough_set=()
+    mapfile -t checks < <(plan_get '.checks[] | "--" + .')
+    mapfile -t groups < <(plan_get '.deps[]')
+    needs=$(sbx_deps_status "${checks[@]}" "${groups[@]}")
+    writes=$(sbx_state_writes "$PLAN" "$STATE_DIR" "$PWD" "${XAUTHORITY:-$HOME/.Xauthority}")
+
+    # Launch-time gates that are not about the profiles.
+    problem=$(sbx_state_socket_problem "$SOCK_PROBE")
+    if [[ -n "$problem" ]]; then
+        stops+=("$problem")
+    fi
+
+    # Passthrough names set in this environment — never their values.
+    mapfile -t passthrough < <(plan_get '.passthrough[]')
+    for var in "${passthrough[@]}"; do
+        if [[ -n "$var" && -n "${!var-}" ]]; then
+            passthrough_set+=("$var")
+        fi
+    done
+
+    doc=$(jq -c --argjson needs "$needs" --argjson writes "$writes" \
+        --argjson stops "$(sbx_resolve_strings "${stops[@]}")" \
+        --argjson passthrough_set "$(sbx_resolve_strings "${passthrough_set[@]}")" \
+        --arg session_name "$SESSION_BASE" --arg session_dir "$STATE_DIR/sessions/$SESSION_BASE/" \
+        '. + {needs: $needs, writes: $writes, stops: $stops, passthrough_set: $passthrough_set,
+              session: {name: $session_name, dir: $session_dir}}
+             | .proceed = (((.errors | length) == 0) and .needs.ok and ((.stops | length) == 0))
+             | .env |= map(del(.value))
+             | del(.path)' \
+        <<< "$PLAN")
+    if [[ "$DRY_RUN_JSON" == "true" ]]; then
+        jq -a . <<< "$doc"
+    else
+        sbx_render_plan "$doc" "$HOME"
+    fi
+    if [[ "$(jq -r '.proceed' <<< "$doc")" == "true" ]]; then
+        exit 0
+    fi
+    exit 1
+}
+
+# Prompts for a profile lib/resolve.sh put in plan.confirm (project origin,
+# git-tracked, trust not granted). It only prompts; the trust decision is
+# the plan's. A cloned repository can ship profiles that mount anything, so
+# using one is a decision made outside the repository.
+prompt_project_profile() {   # <profile path>
+    local profile="$1" remote="" rname="" answer=""
     rname=$(git -C "$PWD" remote 2>/dev/null | head -n1)
     if [[ -n "$rname" ]]; then
         remote=$(git -C "$PWD" remote get-url "$rname" 2>/dev/null || true)
@@ -533,7 +554,6 @@ prompt_project_profile() {
         exit 1
     fi
 
-    local answer=""
     printf "Use this project profile? [y/N] " >&2
     read -r answer < /dev/tty
     if [[ "$answer" != "y" && "$answer" != "Y" ]]; then
@@ -542,407 +562,193 @@ prompt_project_profile() {
     fi
 }
 
-# --- Dependency preflight: core ---
-# Everything below this point may exec a core tool — the confirmation uses
-# realpath and the feature scan uses jq — so the core group is checked
-# first, along with whether bwrap can create a user namespace at all.
-# bwrap used to be discovered only when launch.sh tried to exec it, which
-# reported nothing but "bwrap: not found" after a session directory, an
-# xpra display and a pasta namespace had already been built.
-if [[ "$DRY_RUN" == "true" ]]; then
-    # Resolving needs only jq, realpath and envsubst to exist at all — those
-    # are the tools this script itself calls between here and the report.
-    # A missing bwrap, tmux or other core tool is not a reason to stop
-    # before the report: it belongs in the report's Needs, as a reason
-    # .proceed is false, same as a missing net/gui/podman tool.
-    DRY_RUN_CORE_MISSING=()
-    for dry_tool in jq realpath envsubst; do
-        command -v "$dry_tool" >/dev/null 2>&1 || DRY_RUN_CORE_MISSING+=("$dry_tool")
-    done
-    if [[ ${#DRY_RUN_CORE_MISSING[@]} -gt 0 ]]; then
-        sbx_deps_report_missing "${DRY_RUN_CORE_MISSING[@]}" >&2
+# Errors first — a rejected profile must never prompt — then the trust
+# prompts, then warnings: profile-authored warning text must not get the
+# chance to repaint or crowd out the prompt.
+check_plan() {
+    local msg profile
+    local -a confirm
+    if [[ "$(plan_get '.errors | length')" != "0" ]]; then
+        while IFS= read -r msg; do
+            echo "Error: $msg" >&2
+        done < <(plan_get '.errors[]')
         exit 1
     fi
-else
-    sbx_deps_require core || exit 1
-fi
 
-# --- Resolve ---
-# Every decision about profiles is made here, from the flags and the profile
-# files, without touching the disk (see lib/resolve.sh). Everything after
-# this point reads the plan, never a profile file.
-RESOLVE_ARGS=(--launch-dir "$PWD" --config-dir "$CONFIG_DIR" --global-dir "$SCRIPT_DIR/profiles")
-for profile in "${FS_PROFILES[@]}"; do
-    RESOLVE_ARGS+=(--fs "$profile")
-done
-if [[ -n "$CLI_PROFILE" ]]; then
-    RESOLVE_ARGS+=(--cli "$CLI_PROFILE")
-fi
-for profile in "${NET_PROFILES[@]}"; do
-    RESOLVE_ARGS+=(--net "$profile")
-done
-for spec in "${HOST_PORT_SPECS[@]}"; do
-    RESOLVE_ARGS+=(--host-port "$spec")
-done
-if [[ -n "$WORKDIR" ]]; then
-    RESOLVE_ARGS+=(--wd "$WORKDIR")
-fi
-if [[ "$GUI_FLAG" == "true" ]]; then
-    RESOLVE_ARGS+=(--gui)
-fi
-PLAN=$(sbx_resolve "${RESOLVE_ARGS[@]}")
+    # mapfile, then a plain for: a `while read` loop would point fd 0 at
+    # the process substitution, and the prompt tests fd 0 for a terminal.
+    mapfile -t confirm < <(plan_get '.confirm[]')
+    for profile in "${confirm[@]}"; do
+        if [[ -n "$profile" ]]; then
+            prompt_project_profile "$profile"
+        fi
+    done
 
-plan_get() {
-    jq -r "$1" <<< "$PLAN"
+    while IFS= read -r msg; do
+        if [[ -n "$msg" ]]; then
+            echo "Warning: $(sbx_sanitize_message "$msg")" >&2
+        fi
+    done < <(plan_get '.warnings[]')
 }
 
-# The session name a launch of this directory would claim, and the widest
-# tmux.sock path that name could still need (see sbx_state_socket_probe in
-# lib/state-paths.sh). Computed here — before the "Dry run" branch below —
-# because both the dry run's "stops" check and the real launch's own
-# too-long-socket check (further down) read the same two values and must
-# never disagree about them.
-SESSION_BASE=$(sbx_state_session_base "$PWD")
-SOCK_PROBE=$(sbx_state_socket_probe "$STATE_DIR" "$SESSION_BASE")
+read_plan_settings() {
+    # @sh quotes every string, so the eval sees only assignments whatever a
+    # profile path contains.
+    eval "$(jq -r '@sh "USERNS_FULL=\(.security.userns_full) USERNS_PROFILE=\(.security.userns_profile)
+        CAPS_KEEP=\(.security.caps_keep) CAPS_PROFILE=\(.security.caps_profile)
+        DOCKER_API=\(.security.docker_api) SBX_NETNS=\(.netns) NET_ENABLED=\(.net.enabled)
+        TEST_DOMAIN=\(.net.test_domain // "") SANDBOX_PATH=\(.path)
+        NEED_SUBIDS=\(.checks | index("subids") != null)"' <<< "$PLAN")"
+    mapfile -t HOST_PORTS_TCP < <(plan_get '.host_ports.tcp[]')
+    mapfile -t HOST_PORTS_UDP < <(plan_get '.host_ports.udp[]')
+    NEST_TCP=$(IFS=,; echo "${HOST_PORTS_TCP[*]}")
+    NEST_UDP=$(IFS=,; echo "${HOST_PORTS_UDP[*]}")
+}
 
-# --- Dry run ---
-# Everything below this point acts: prompts, creates state, launches. A dry
-# run stops here with the plan, the host locations it would write, and the
-# dependency check in report-only form.
-if [[ "$DRY_RUN" == "true" ]]; then
-    mapfile -t DRY_DEPS_ARGS < <(plan_get '.checks[] | "--" + .')
-    mapfile -t DRY_GROUPS < <(plan_get '.deps[]')
-    DRY_NEEDS=$(sbx_deps_status "${DRY_DEPS_ARGS[@]}" "${DRY_GROUPS[@]}")
-    DRY_WRITES=$(sbx_state_writes "$PLAN" "$STATE_DIR" "$PWD" "${XAUTHORITY:-$HOME/.Xauthority}")
-
-    # Launch-time gates that are not profile errors: today, only the
-    # session-socket-path length check the real launch does further down
-    # (see SOCK_PROBE above). Kept separate from .errors because these are
-    # not about the profiles at all — a stop here would follow no matter
-    # which profiles were chosen.
-    DRY_STOPS=()
-    SOCK_PROBLEM=$(sbx_state_socket_problem "$SOCK_PROBE")
-    if [[ -n "$SOCK_PROBLEM" ]]; then
-        DRY_STOPS+=("$SOCK_PROBLEM")
+# The optional dependency groups and host checks this session's shape
+# needs (see .deps and .checks in lib/resolve.sh), then the socket-length
+# check, all before anything is claimed.
+preflight_session() {
+    local problem
+    local -a groups
+    mapfile -t groups < <(plan_get '(.deps[] | select(. != "core")), (.checks[] | select(. == "nsunshare"))')
+    if [[ ${#groups[@]} -gt 0 ]]; then
+        sbx_deps_require "${groups[@]}" || exit 1
     fi
-
-    # Passthrough names that are actually set in this environment — never
-    # their values (see the "passthrough values never appear" test).
-    mapfile -t DRY_PASSTHROUGH < <(plan_get '.passthrough[]')
-    DRY_PASSTHROUGH_SET=()
-    for dry_var in "${DRY_PASSTHROUGH[@]}"; do
-        if [[ -n "$dry_var" && -n "${!dry_var-}" ]]; then
-            DRY_PASSTHROUGH_SET+=("$dry_var")
-        fi
-    done
-
-    DRY_DOC=$(jq -c --argjson needs "$DRY_NEEDS" --argjson writes "$DRY_WRITES" \
-        --argjson stops "$(sbx_resolve_strings "${DRY_STOPS[@]}")" \
-        --argjson passthrough_set "$(sbx_resolve_strings "${DRY_PASSTHROUGH_SET[@]}")" \
-        --arg session_name "$SESSION_BASE" --arg session_dir "$STATE_DIR/sessions/$SESSION_BASE/" \
-        '. + {needs: $needs, writes: $writes, stops: $stops, passthrough_set: $passthrough_set,
-              session: {name: $session_name, dir: $session_dir}}
-             | .proceed = (((.errors | length) == 0) and .needs.ok and ((.stops | length) == 0))
-             | .env |= map(del(.value))
-             | del(.path)' \
-        <<< "$PLAN")
-    if [[ "$DRY_RUN_JSON" == "true" ]]; then
-        jq -a . <<< "$DRY_DOC"
-    else
-        sbx_render_plan "$DRY_DOC" "$HOME"
-    fi
-    if [[ "$(jq -r '.proceed' <<< "$DRY_DOC")" == "true" ]]; then
-        exit 0
-    fi
-    exit 1
-fi
-
-# Errors are never profile-authored trust decisions — they gate the whole
-# launch — so they print and exit before anything else, including the
-# confirmation prompt: a rejected profile must never prompt.
-if [[ "$(plan_get '.errors | length')" != "0" ]]; then
-    while IFS= read -r msg; do
-        echo "Error: $msg" >&2
-    done < <(plan_get '.errors[]')
-    exit 1
-fi
-
-# Drive the confirmation loop from the plan's own list, not a
-# reimplementation of the trust decision beside it (see prompt_project_profile).
-# mapfile first, then a plain `for`: a `while read ... done < <(...)` loop
-# would redirect fd 0 to the process substitution for the loop body,
-# which is exactly the fd prompt_project_profile's `[[ ! -t 0 ]]` tests —
-# a real interactive launch would misreport itself as non-interactive.
-mapfile -t CONFIRM_PROFILES < <(plan_get '.confirm[]')
-for profile in "${CONFIRM_PROFILES[@]}"; do
-    [[ -n "$profile" ]] && prompt_project_profile "$profile"
-done
-
-# Warnings print only after the confirmation prompt above has run: before
-# Phase 2, nothing was echoed before that prompt, and profile-authored
-# warning text (see sbx_sanitize_message) must not be given the chance to
-# repaint or crowd out the one prompt standing between a cloned repository
-# and an arbitrary mount set.
-while IFS= read -r msg; do
-    if [[ -n "$msg" ]]; then
-        echo "Warning: $(sbx_sanitize_message "$msg")" >&2
-    fi
-done < <(plan_get '.warnings[]')
-
-# The plan's scalar settings in one read. @sh quotes every string, so the
-# eval sees only assignments whatever a profile path contains.
-eval "$(jq -r '@sh "USERNS_FULL=\(.security.userns_full) USERNS_PROFILE=\(.security.userns_profile)
-    CAPS_KEEP=\(.security.caps_keep) CAPS_PROFILE=\(.security.caps_profile)
-    DOCKER_API=\(.security.docker_api) SBX_NETNS=\(.netns) NET_ENABLED=\(.net.enabled)
-    TEST_DOMAIN=\(.net.test_domain // "") SANDBOX_PATH=\(.path)
-    NEED_SUBIDS=\(.checks | index("subids") != null)"' <<< "$PLAN")"
-mapfile -t HOST_PORTS_TCP < <(plan_get '.host_ports.tcp[]')
-mapfile -t HOST_PORTS_UDP < <(plan_get '.host_ports.udp[]')
-
-# The payload runs in a user namespace B nested in the session's control
-# namespace A (lib/userns.sh, lib/nestnet.sh): mounts made in A are locked
-# in B, and A's ruleset is out of B's reach.
-NEST_TCP=$(IFS=,; echo "${HOST_PORTS_TCP[*]}")
-NEST_UDP=$(IFS=,; echo "${HOST_PORTS_UDP[*]}")
-
-# --- Dependency preflight: optional groups ---
-# "nsunshare" is not a tool group: it asks sbx_deps_require to prove that
-# unshare may create a user + network namespace (see .checks in
-# lib/resolve.sh for which sessions need it).
-mapfile -t DEP_GROUPS < <(plan_get '(.deps[] | select(. != "core")), (.checks[] | select(. == "nsunshare"))')
-if [[ ${#DEP_GROUPS[@]} -gt 0 ]]; then
-    sbx_deps_require "${DEP_GROUPS[@]}" || exit 1
-fi
-if [[ "$NEED_SUBIDS" == "true" ]] && ! sbx_deps_subids_ok; then
-    echo "Error: profile '$USERNS_PROFILE' sets \"userns\": \"full\", which needs a subordinate UID and GID range for $(id -un)." >&2
-    echo "  Add one:  sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $(id -un)" >&2
-    echo "  (choose a range not already used by another user in /etc/subuid)" >&2
-    exit 1
-fi
-
-if [[ "$CAPS_KEEP" == "true" ]]; then
-    echo "Note: profile '$(basename "$CAPS_PROFILE" .json)' retains capabilities inside the payload's own namespace." >&2
-    echo "  ro mounts and the egress firewall are still enforced from outside it; the payload can" >&2
-    echo "  create further namespaces and hide paths from itself." >&2
-fi
-
-# Session Initialization
-#
-# The socket check uses the widest name the claim loop can produce, before
-# anything is claimed; --dry-run's "stops" entry reads the same values.
-SOCK_PROBLEM=$(sbx_state_socket_problem "$SOCK_PROBE")
-if [[ -n "$SOCK_PROBLEM" ]]; then
-    echo "Error: $SOCK_PROBLEM" >&2
-    exit 1
-fi
-
-mkdir -p "$STATE_DIR/sessions" "$STATE_DIR/join"
-
-# Claiming a name is two steps that must look like one: mkdir takes the
-# name, and the pid record proves the taker is alive. Everything between
-# here and session.json — profile parsing, xpra setup, the whole copy-mount
-# seeding, which on a large record tree is minutes — happens after the
-# mkdir, so without serialization a competitor entering this loop in that
-# window sees a directory with no liveness record, calls a LIVE session
-# crash residue, and rm -rf's it. The lock is held across both steps so that
-# intermediate state is never observable. $CLAIM_LOCK is defined at the top
-# of the script because --gc has to take the same lock.
-#
-# Both branches below must warn, and warn with the same specific
-# consequence, on failure. Failing to open the lock file is not a smaller
-# problem than failing to acquire it: either way the loop below runs
-# unlocked, silently reintroducing the exact race described above. A lock
-# whose open failure is invisible is not a lock.
-#
-# We still proceed rather than exit in either case. The race requires two
-# concurrent launches from the same directory, which is uncommon; refusing
-# to launch at all would instead break every single-launch user on a
-# filesystem whose flock is unsupported or whose state dir can't be opened
-# for append — common, and far worse than a warning. Making the degraded
-# state visible on stderr is the fix; declining to launch is not.
-if exec 8>>"$CLAIM_LOCK"; then
-    flock -x 8 || echo "Warning: could not lock $CLAIM_LOCK; a concurrent launch may race for this name." >&2
-else
-    echo "Warning: could not open $CLAIM_LOCK; a concurrent launch may race for this name." >&2
-fi
-
-SESSION_NAME="$SESSION_BASE"
-session_n=1
-while ! mkdir "$STATE_DIR/sessions/$SESSION_NAME" 2>/dev/null; do
-    # A dead name is reclaimed with every sidecar, not only its directory:
-    # a predecessor's join/<name>.json would otherwise describe this session
-    # to a concurrent --reseed until ours is written.
-    if ! sbx_session_alive "$STATE_DIR" "$SESSION_NAME"; then
-        sbx_session_remove "$STATE_DIR" "$SESSION_NAME"
-        continue
-    fi
-    session_n=$((session_n + 1))
-    if [[ $session_n -gt 99 ]]; then
-        echo "Error: too many live sessions named '$SESSION_BASE'." >&2
+    if [[ "$NEED_SUBIDS" == "true" ]] && ! sbx_deps_subids_ok; then
+        echo "Error: profile '$USERNS_PROFILE' sets \"userns\": \"full\", which needs a subordinate UID and GID range for $(id -un)." >&2
+        echo "  Add one:  sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $(id -un)" >&2
+        echo "  (choose a range not already used by another user in /etc/subuid)" >&2
         exit 1
     fi
-    SESSION_NAME="$SESSION_BASE-$session_n"
-done
 
-# Still under the lock: the claim is not complete until the name has a
-# liveness record to go with it.
-printf '%s\n' "$$" > "$STATE_DIR/join/$SESSION_NAME.pid"
-exec 8>&-
-
-SESSION_ID="$SESSION_NAME"   # retained: session.json's .id field
-SESSION_DIR="$STATE_DIR/sessions/$SESSION_NAME"
-SESSION_PID_FILE="$STATE_DIR/join/$SESSION_NAME.pid"
-mkdir -p "$SESSION_DIR/tmp"
-
-# Bwrap Arguments
-BWRAP_ARGS=(
-    --unshare-ipc
-    --unshare-pid
-    --unshare-uts
-    --unshare-cgroup
-    --new-session
-    --proc /proc
-    --dev /dev
-    --tmpfs /tmp
-    --tmpfs /run
-    --ro-bind /usr /usr
-    --ro-bind /opt /opt
-    --ro-bind /etc /etc
-    --symlink usr/bin /bin
-    --symlink usr/lib /lib
-    --symlink usr/lib64 /lib64
-)
-
-# Environment policy: clear everything, then reintroduce by name.
-# --clearenv is unconditional and has no opt-out — the host environment
-# routinely carries API keys, tokens and SSH_AUTH_SOCK, none of which a
-# sandbox should see unless a profile asks for them by name.
-BWRAP_ARGS+=(--clearenv)
-
-# Base set: what a shell needs to behave like a shell.
-SBX_BASE_ENV=(HOME USER LOGNAME TERM COLORTERM LANG TZ SHELL)
-for var in "${SBX_BASE_ENV[@]}"; do
-    # Explicit if, not `[[ ]] &&`: under `set -e` a trailing false test on
-    # the final iteration would exit the script.
-    if [[ -n "${!var-}" ]]; then
-        BWRAP_ARGS+=(--setenv "$var" "${!var}")
-    fi
-done
-
-# Locale variables travel as a family; ${!LC_@} lists the set ones by name.
-for var in ${!LC_@}; do
-    if [[ -n "${!var-}" ]]; then
-        BWRAP_ARGS+=(--setenv "$var" "${!var}")
-    fi
-done
-
-# Profile-declared passthrough: forwards named host variables. Applied
-# before the profile `env` block below, so an explicit `env` value wins.
-while IFS= read -r var; do
-    if [[ -n "$var" && -n "${!var-}" ]]; then
-        BWRAP_ARGS+=(--setenv "$var" "${!var}")
-    fi
-done < <(plan_get '.passthrough[]')
-
-# Every session's user and network namespaces now come from A: pasta's,
-# below, or `unshare`'s for a session without networking. bwrap joins A
-# without creating a user namespace of its own, in either case.
-if [[ "$SBX_NETNS" == "true" ]]; then
-    # pasta maps the host uid to 0 inside the namespace. bwrap does NOT drop
-    # inherited capabilities when it is not the namespace's creator, so
-    # without an explicit --cap-drop ALL (added below) the payload would run
-    # as uid 0 with a full ambient set — able to remount every ro bind rw and
-    # to flush the nftables ruleset. nft and dnsmasq now run in launch.sh,
-    # outside the sandbox, so nothing in here needs privilege.
     if [[ "$CAPS_KEEP" == "true" ]]; then
-        # podman/crun decide rootless-vs-rootful by checking geteuid()==0, not
-        # actual privilege. --cap-add ALL above makes the sandboxed process look
-        # like real root (uid 0, full capability bits) to podman, so it skips its
-        # normal single-UID-mapping fallback and assumes a genuine system gid=5
-        # exists for its default devpts mount — which fails with EINVAL, since
-        # this is still a single-identity-mapped namespace underneath. These
-        # containers/common env vars are the documented override for exactly
-        # this case (a process nested in a constrained namespace where EUID==0
-        # doesn't mean real privilege): they force podman back onto the correct
-        # rootless code path regardless of what geteuid() reports. Confirmed
-        # this doesn't touch networking — container egress is still fully
-        # gated by this session's own nftables allow-list either way.
-        # In userns-full mode these overrides are exactly wrong: there podman
-        # MUST run rootful-in-namespace (euid 0 backed by a real multi-UID
-        # mapping), and forcing the rootless code path would resurrect the
-        # single-UID limitation the outer userns exists to remove.
-        if [[ "$USERNS_FULL" != "true" ]]; then
-            BWRAP_ARGS+=(
-                --setenv _CONTAINERS_USERNS_CONFIGURED done
-                --setenv _CONTAINERS_ROOTLESS_UID "$(id -u)"
-                --setenv _CONTAINERS_ROOTLESS_GID "$(id -g)"
-            )
-        fi
+        echo "Note: profile '$(basename "$CAPS_PROFILE" .json)' retains capabilities inside the payload's own namespace." >&2
+        echo "  ro mounts and the egress firewall are still enforced from outside it; the payload can" >&2
+        echo "  create further namespaces and hide paths from itself." >&2
     fi
-fi
 
-# The payload never needs capabilities. Session setup does, but all of it
-# now runs outside the sandbox: nft and dnsmasq in launch.sh, inside
-# pasta's namespaces and before bwrap starts. So the drop applies to both
-# modes.
-#
-# CAP_SETPCAP is retained deliberately and is the ONLY capability kept.
-# It is the privilege setpriv needs to empty the bounding set, which bwrap
-# leaves full on every path now: bwrap always joins an existing user
-# namespace (B, via --userns2) instead of creating one. Dropping it here
-# makes setpriv fail with "apply bounding set: Operation not permitted" and
-# every session exit 127.
-#
-# Why that is not an escape surface: the setpriv that spends it is
-# launch.sh's, above session.sh (see the comment there), so CAP_SETPCAP is
-# held across one exec by one process and is gone before the tmux server,
-# the payload, or any join exists. This ordering is load-bearing and was
-# not always so — while the drop lived in wrapper.sh, the server ran
-# holding CAP_SETPCAP for the life of the sandbox and handed it to every
-# pane it forked, which is a long-lived RPC-reachable service parked on a
-# capability, not a single exec. CAP_SETPCAP cannot mount, configure
-# networking, or change ownership in any case.
-#
-# bwrap no longer creates the user namespace on any path — it always joins
-# B with --userns2, entering it holding B's full capability set. --cap-add
-# ALL / --cap-drop ALL are what then decide what the payload keeps (measured
-# 2026-09-21). Omitting them here would leave the payload holding
-# everything B has regardless of the "caps" profile field.
-if [[ "$CAPS_KEEP" == "true" ]]; then
-    BWRAP_ARGS+=(--cap-add ALL)
-else
-    BWRAP_ARGS+=(--cap-drop ALL --cap-add CAP_SETPCAP)
-fi
+    problem=$(sbx_state_socket_problem "$SOCK_PROBE")
+    if [[ -n "$problem" ]]; then
+        echo "Error: $problem" >&2
+        exit 1
+    fi
+}
 
-# Reap the sandbox if sbx itself dies, rather than leaking a detached
-# session with no supervisor.
-BWRAP_ARGS+=(--die-with-parent)
+# Claiming a name is two steps that must look like one: mkdir takes it and
+# the pid record proves the taker alive. Without the lock, a competitor in
+# the gap between them would see a live session with no liveness record,
+# call it crash residue and delete it.
+claim_session() {
+    local n=1
+    mkdir -p "$STATE_DIR/sessions" "$STATE_DIR/join"
+    sbx_claim_lock "a concurrent launch may race for this name."
 
-# --- Virt (podman/qemu) base plumbing ---
-# Always applied: adds no attack surface (nested single-UID userns was
-# already reachable; masking subuid/subgid only reduces surface). The
-# actual device access (/dev/kvm, /dev/net/tun) stays opt-in via the
-# podman/qemu fs profiles.
-VIRT_DIR="$SESSION_DIR/virt"
-mkdir -p "$VIRT_DIR"
+    SESSION_ID="$SESSION_BASE"
+    while ! mkdir "$STATE_DIR/sessions/$SESSION_ID" 2>/dev/null; do
+        # A dead name is reclaimed with every sidecar: a predecessor's
+        # join/<name>.json would otherwise describe this session to a
+        # concurrent --reseed until ours is written.
+        if ! sbx_session_alive "$STATE_DIR" "$SESSION_ID"; then
+            sbx_session_remove "$STATE_DIR" "$SESSION_ID"
+            continue
+        fi
+        n=$((n + 1))
+        if [[ $n -gt 99 ]]; then
+            echo "Error: too many live sessions named '$SESSION_BASE'." >&2
+            exit 1
+        fi
+        SESSION_ID="$SESSION_BASE-$n"
+    done
+    printf '%s\n' "$$" > "$STATE_DIR/join/$SESSION_ID.pid"
+    exec 8>&-
 
-if [[ "$USERNS_FULL" == "true" ]]; then
-    # userns-full sessions run podman rootful-in-namespace: rootful podman
-    # reads graphroot, not rootless_storage_path. Expanded at write time
-    # (HOME inside the sandbox equals host HOME). No ignore_chown_errors:
-    # ownership is real in this mode (full subordinate-UID range). This
-    # store is separate from the single-UID one by design — the ownership
-    # layouts are incompatible.
-    cat > "$VIRT_DIR/storage.conf" <<CONFEOF
+    SESSION_DIR="$STATE_DIR/sessions/$SESSION_ID"
+    mkdir -p "$SESSION_DIR/tmp"
+}
+
+# The fixed part of the sandbox: namespaces, the base filesystem, the
+# environment policy and the capability set.
+build_base_args() {
+    local var
+    BWRAP_ARGS=(
+        --unshare-ipc
+        --unshare-pid
+        --unshare-uts
+        --unshare-cgroup
+        --new-session
+        --proc /proc
+        --dev /dev
+        --tmpfs /tmp
+        --tmpfs /run
+        --ro-bind /usr /usr
+        --ro-bind /opt /opt
+        --ro-bind /etc /etc
+        --symlink usr/bin /bin
+        --symlink usr/lib /lib
+        --symlink usr/lib64 /lib64
+    )
+
+    # Clear everything, then reintroduce by name: the host environment
+    # routinely carries API keys, tokens and SSH_AUTH_SOCK. No opt-out.
+    BWRAP_ARGS+=(--clearenv)
+    for var in HOME USER LOGNAME TERM COLORTERM LANG TZ SHELL ${!LC_@}; do
+        if [[ -n "${!var-}" ]]; then
+            BWRAP_ARGS+=(--setenv "$var" "${!var}")
+        fi
+    done
+    # Profile passthrough, before the profile env blocks so those win.
+    while IFS= read -r var; do
+        if [[ -n "$var" && -n "${!var-}" ]]; then
+            BWRAP_ARGS+=(--setenv "$var" "${!var}")
+        fi
+    done < <(plan_get '.passthrough[]')
+
+    # "caps": "keep" with a single-id map: podman takes euid 0 for real
+    # root and fails its devpts mount, so these documented overrides put it
+    # back on the rootless path. Wrong under userns: full, where podman must
+    # run rootful over a real multi-id map.
+    if [[ "$SBX_NETNS" == "true" && "$CAPS_KEEP" == "true" && "$USERNS_FULL" != "true" ]]; then
+        BWRAP_ARGS+=(
+            --setenv _CONTAINERS_USERNS_CONFIGURED "done"
+            --setenv _CONTAINERS_ROOTLESS_UID "$(id -u)"
+            --setenv _CONTAINERS_ROOTLESS_GID "$(id -g)"
+        )
+    fi
+
+    # bwrap joins B (--userns2) holding B's full capability set, so these
+    # decide what the payload keeps. CAP_SETPCAP is the one exception to
+    # the drop: launch.sh's setpriv spends it emptying the bounding set,
+    # one exec before session.sh, so nothing in the session ever holds it.
+    if [[ "$CAPS_KEEP" == "true" ]]; then
+        BWRAP_ARGS+=(--cap-add ALL)
+    else
+        BWRAP_ARGS+=(--cap-drop ALL --cap-add CAP_SETPCAP)
+    fi
+
+    # No sandbox outlives sbx.
+    BWRAP_ARGS+=(--die-with-parent)
+}
+
+# podman/qemu plumbing, in every session so network profiles behave the
+# same whichever fs profile is loaded. It adds no reach: the device access
+# (/dev/kvm, /dev/net/tun) stays opt-in through the fs profiles.
+setup_virt() {
+    VIRT_DIR="$SESSION_DIR/virt"
+    mkdir -p "$VIRT_DIR"
+
+    if [[ "$USERNS_FULL" == "true" ]]; then
+        # Rootful-in-namespace podman reads graphroot. Real ownership (a full
+        # subordinate range), so a store of its own, incompatible with the
+        # single-id one.
+        cat > "$VIRT_DIR/storage.conf" <<CONFEOF
 [storage]
 driver = "overlay"
 graphroot = "$HOME/.local/state/sbx/virt/containers-full"
 CONFEOF
-else
-    # rootless_storage_path expands $HOME using podman's own runtime env (sbx
-    # doesn't clear or override HOME, so it resolves to the same value inside
-    # the sandbox as outside). Written literally — do not let bash expand it.
-    cat > "$VIRT_DIR/storage.conf" <<'CONFEOF'
+    else
+        # Written literally: podman expands $HOME itself, to the same value.
+        cat > "$VIRT_DIR/storage.conf" <<'CONFEOF'
 [storage]
 driver = "overlay"
 rootless_storage_path = "$HOME/.local/state/sbx/virt/containers"
@@ -950,12 +756,11 @@ rootless_storage_path = "$HOME/.local/state/sbx/virt/containers"
 [storage.options.overlay]
 ignore_chown_errors = "true"
 CONFEOF
-fi
+    fi
 
-# cgroupfs/disabled are the only values that can work inside bwrap: the
-# systemd cgroup manager needs a user systemd instance over dbus, which
-# can't exist here (--unshare-ipc, /run is tmpfs).
-cat > "$VIRT_DIR/containers.conf" <<'CONFEOF'
+    # The systemd cgroup manager needs a user systemd over dbus, which
+    # cannot exist here (--unshare-ipc, /run is tmpfs).
+    cat > "$VIRT_DIR/containers.conf" <<'CONFEOF'
 [containers]
 cgroups = "disabled"
 
@@ -964,201 +769,149 @@ cgroup_manager = "cgroupfs"
 events_logger = "file"
 CONFEOF
 
-if [[ "$USERNS_FULL" == "true" ]]; then
-    # podman materialises whatever containers.conf names as default_network
-    # itself, with dns_enabled=false, and then refuses to create it
-    # ("netavark: network already exists") — so creating sbx0 under the
-    # session's own config (which is about to gain a [network] section
-    # below) would yield a network with no DNS, and containers on it
-    # could not resolve anything (their resolv.conf names 127.0.0.2, which
-    # in a container's network namespace is its own loopback). This copy
-    # is taken now, before the [network] section is appended, so it holds
-    # only the settings above and cannot inherit that section no matter
-    # how large it later grows. It is used for exactly one command: the
-    # network create in lib/wrapper.sh. Created under this config, sbx0
-    # keeps dns_enabled=true even once the real config below names it as
-    # the default. Measured on podman 6.1.1.
-    cp "$VIRT_DIR/containers.conf" "$VIRT_DIR/containers-bootstrap.conf"
-
-    # Podman's implicit default "podman" bridge network ships with
-    # dns_enabled=false; only explicitly-created custom networks default
-    # to DNS-enabled (verified empirically — podman network inspect
-    # shows dns_enabled:true only for a network made via `podman network
-    # create`). aardvark-dns for containers on this network inherits the
-    # sandbox's own /etc/resolv.conf (127.0.0.1 -> sbx's dnsmasq) as its
-    # upstream, so routing containers through it is what lets
-    # hostname-based `allow` entries populate the forward chain's
-    # allowed4 set (see lib/wrapper.sh, which creates this
-    # network). Without this, container DNS goes straight to public
-    # resolvers, which the forward chain correctly drops (no egress
-    # leak) but which also means hostname-based allow entries never
-    # resolve for containers — only CIDR-based allow entries work.
-    cat >> "$VIRT_DIR/containers.conf" <<'CONFEOF2'
+    if [[ "$USERNS_FULL" == "true" ]]; then
+        # Containers resolve through the sandbox's dnsmasq only on a network
+        # with DNS enabled, which podman's default is not; so sbx0 becomes
+        # the default. podman creates whatever the config names as default
+        # itself, with DNS off, so lib/wrapper.sh creates sbx0 first under
+        # this copy, taken before the [network] section exists (podman 6.1.1).
+        cp "$VIRT_DIR/containers.conf" "$VIRT_DIR/containers-bootstrap.conf"
+        cat >> "$VIRT_DIR/containers.conf" <<'CONFEOF2'
 
 [network]
 default_network = "sbx0"
 CONFEOF2
-fi
+    fi
 
-: > "$VIRT_DIR/empty"
+    : > "$VIRT_DIR/empty"
+    BWRAP_ARGS+=(
+        --tmpfs /var
+        --dir /var/tmp
+        --dir "/run/user/$(id -u)"
+        --ro-bind /sys /sys
+        --ro-bind "$VIRT_DIR/empty" /etc/subuid
+        --ro-bind "$VIRT_DIR/empty" /etc/subgid
+        --setenv XDG_RUNTIME_DIR "/run/user/$(id -u)"
+        --setenv CONTAINERS_STORAGE_CONF "$VIRT_DIR/storage.conf"
+        --setenv CONTAINERS_CONF "$VIRT_DIR/containers.conf"
+    )
 
-BWRAP_ARGS+=(
-    --tmpfs /var
-    --dir /var/tmp
-    --dir "/run/user/$(id -u)"
-    --ro-bind /sys /sys
-    --ro-bind "$VIRT_DIR/empty" /etc/subuid
-    --ro-bind "$VIRT_DIR/empty" /etc/subgid
-    --setenv XDG_RUNTIME_DIR "/run/user/$(id -u)"
-    --setenv CONTAINERS_STORAGE_CONF "$VIRT_DIR/storage.conf"
-    --setenv CONTAINERS_CONF "$VIRT_DIR/containers.conf"
-)
-
-# Docker compat: a `docker` CLI shim (execs podman) and DOCKER_HOST are
-# always on — both are free (no processes; $SESSION_DIR is already bound
-# into every sandbox). The socket DOCKER_HOST points at only exists when
-# a profile sets "docker_api": true (see wrapper generation). The path is
-# pinned to the sbx-computed /run/user/<uid> — deliberately NOT
-# $XDG_RUNTIME_DIR, which a profile may override and silently diverge
-# from DOCKER_HOST.
-PODMAN_SOCK="/run/user/$(id -u)/podman/podman.sock"
-mkdir -p "$SESSION_DIR/bin"
-cat > "$SESSION_DIR/bin/docker" <<'SHIMEOF'
+    # A docker CLI shim and DOCKER_HOST, always: the socket behind it exists
+    # only with "docker_api": true (lib/wrapper.sh). Pinned to the computed
+    # /run/user/<uid>, not $XDG_RUNTIME_DIR, which a profile may override.
+    PODMAN_SOCK="/run/user/$(id -u)/podman/podman.sock"
+    mkdir -p "$SESSION_DIR/bin"
+    cat > "$SESSION_DIR/bin/docker" <<'SHIMEOF'
 #!/bin/sh
 exec podman "$@"
 SHIMEOF
-chmod +x "$SESSION_DIR/bin/docker"
-BWRAP_ARGS+=(--setenv DOCKER_HOST "unix://$PODMAN_SOCK")
+    chmod +x "$SESSION_DIR/bin/docker"
+    BWRAP_ARGS+=(--setenv DOCKER_HOST "unix://$PODMAN_SOCK")
+}
 
-FORKED_MOUNTS=()   # "profile<TAB>source<TAB>dest" — sandbox-owned, seeded once
-FORKED_STORES=()   # host store path per forked mount, filled by the seeding loop
-RECORD_MOUNTS=()   # "source<TAB>dest" — host-owned, reseeded, changes archived
+# Profile mounts. ro/rw/dev bind directly; forked and record are collected
+# for their own phases. sbx_state_writes (--dry-run) mirrors what each perm
+# writes on the host.
+add_profile_mounts() {
+    local profile_name source dest perm parent part curr
+    local -a parts
+    FORKED_MOUNTS=()   # "profile<TAB>source<TAB>dest"
+    RECORD_MOUNTS=()   # "source<TAB>dest"
+    while IFS= read -r -d '' profile_name && IFS= read -r -d '' source &&
+          IFS= read -r -d '' dest && IFS= read -r -d '' perm; do
+        # An rw source may be a persistent directory not created yet.
+        if [[ "$perm" == "rw" && ! -e "$source" ]]; then
+            mkdir -p "$source"
+        fi
 
-while IFS= read -r -d '' profile_name && IFS= read -r -d '' source &&
-      IFS= read -r -d '' dest && IFS= read -r -d '' perm; do
-    # rw mounts may point at a persistent host directory that doesn't
-    # exist yet (e.g. first-ever use of a profile's storage dir).
-    if [[ "$perm" == "rw" && ! -e "$source" ]]; then
-        mkdir -p "$source"
-    fi
+        parent=$(dirname "$dest")
+        if [[ "$parent" != "/" ]]; then
+            IFS='/' read -ra parts <<< "$parent"
+            curr=""
+            for part in "${parts[@]}"; do
+                if [[ -n "$part" ]]; then
+                    curr="$curr/$part"
+                    BWRAP_ARGS+=(--dir "$curr")
+                fi
+            done
+        fi
 
-    # Ensure parent directories exist in the sandbox
-    parent=$(dirname "$dest")
-    if [[ "$parent" != "/" ]]; then
-        IFS='/' read -ra ADDR <<< "$parent"
-        curr=""
-        for i in "${ADDR[@]}"; do
-            if [[ -n "$i" ]]; then
-                curr="$curr/$i"
-                BWRAP_ARGS+=(--dir "$curr")
-            fi
-        done
-    fi
+        # -try: profile sources are optional on any given host, and one
+        # absent toolchain must not take down the whole sandbox. The base
+        # binds stay strict.
+        case "$perm" in
+            ro)     BWRAP_ARGS+=(--ro-bind-try "$source" "$dest") ;;
+            rw)     BWRAP_ARGS+=(--bind-try "$source" "$dest") ;;
+            dev)    BWRAP_ARGS+=(--dev-bind-try "$source" "$dest") ;;
+            forked) FORKED_MOUNTS+=("$profile_name"$'\t'"$source"$'\t'"$dest") ;;
+            record) RECORD_MOUNTS+=("$source"$'\t'"$dest") ;;
+            *)
+                # Unreachable while profile validation holds; fail closed.
+                echo "Error: unknown perm '$perm' for mount $dest" >&2
+                exit 1
+                ;;
+        esac
+    done < <(jq -j 'def nul: [0] | implode; .mounts[] | .profile, nul, .source, nul, .dest, nul, .perm, nul' <<< "$PLAN")
+}
 
-    # The -try variants: a profile names paths that are optional on any
-    # given host ($HOME/.nvm, $HOME/.npm-global, /dev/kvm), and a plain
-    # --ro-bind on a missing source aborts the whole launch with
-    # "No such file or directory" — one absent toolchain takes down a
-    # sandbox that had no need of it. -try skips the mount instead.
-    # Only profile-declared mounts are made tolerant; the base binds
-    # (/usr, /etc, the session dir) stay strict, because a sandbox
-    # missing those is broken rather than merely reduced.
-    #
-    # This perm switch is mirrored, read-only, by sbx_state_writes in
-    # lib/state-paths.sh (--dry-run's report of what a launch would write):
-    # a change to what a perm does here belongs there too.
-    case "$perm" in
-        ro)     BWRAP_ARGS+=(--ro-bind-try "$source" "$dest") ;;
-        rw)     BWRAP_ARGS+=(--bind-try "$source" "$dest") ;;
-        dev)    BWRAP_ARGS+=(--dev-bind-try "$source" "$dest") ;;
-        forked) FORKED_MOUNTS+=("$profile_name"$'\t'"$source"$'\t'"$dest") ;;
-        record) RECORD_MOUNTS+=("$source"$'\t'"$dest") ;;
-        *)
-            # Unreachable while sbx_profile_check rejects any other perm,
-            # but this must fail closed, not open: a mount that falls
-            # through here silently would launch with less isolation than
-            # the profile asked for, and nobody would know.
-            echo "Error: unknown perm '$perm' for mount $dest" >&2
-            exit 1
-            ;;
-    esac
-done < <(jq -j 'def nul: [0] | implode; .mounts[] | .profile, nul, .source, nul, .dest, nul, .perm, nul' <<< "$PLAN")
-
-# Where a forked mount's store lives on the host: lib/state-paths.sh, shared
-# with --dry-run.
-sbx_forked_store() {   # <profile> <dest>
+forked_store() {   # <profile> <dest>
     sbx_state_forked_store "$STATE_DIR" "$PWD" "$1" "$2"
 }
 
-if [[ "$RESEED" == "true" ]]; then
-    # Give the session name back before anything else. --reseed never
-    # launches, and the EXIT trap that would release the claim is installed
-    # much further down, so every exit below would otherwise strand
-    # sessions/<name> and its pid record — residue that a later --gc or claim
-    # reclaim has to clean up. Releasing here also keeps our own pid record
-    # out of the liveness scan below, which would otherwise see a live
-    # session with no sidecar yet — us — and refuse.
+# Deletes this directory's forked stores after confirmation, and exits.
+reseed() {
+    local fm f_prof f_src f_dest f_store f_size spid sname lstore rt blocker="" reply i
+    local -a targets=()
+
+    # Give the claimed name back first: --reseed never launches, and our own
+    # pid record would otherwise be a live session with no sidecar below.
     rm -rf "${SESSION_DIR:?}"
-    rm -f "${SESSION_PID_FILE:?}"
+    rm -f "$STATE_DIR/join/$SESSION_ID.pid"
 
     if [[ ${#FORKED_MOUNTS[@]} -eq 0 ]]; then
         echo "No forked mounts in the selected profiles; nothing to reseed." >&2
         exit 1
     fi
-
-    RESEED_TARGETS=()
     for fm in "${FORKED_MOUNTS[@]}"; do
         IFS=$'\t' read -r f_prof f_src f_dest <<< "$fm"
-        RESEED_TARGETS+=("$(sbx_forked_store "$f_prof" "$f_dest")")
+        targets+=("$(forked_store "$f_prof" "$f_dest")")
     done
 
-    # A store is bind-mounted rw into its session for as long as that session
-    # runs. rm -rf here would empty the tree underneath a live sandbox,
-    # destroying the auth tokens and history it is using at that moment — the
-    # exact state `forked` exists to accumulate. There is no way to derive
-    # which store a session holds after the fact (the key includes the launch
-    # directory, and session.json is sandbox-writable and so forgeable), so
-    # the mapping is read back from the host-written join sidecar, which
-    # lives in the tmpfs-masked join/ area and records it at launch.
-    RESEED_BLOCKER=""
+    # A store is bound rw into every session using it; deleting it under a
+    # live one destroys the state it is using. Which stores a session holds
+    # is recorded in its host-written sidecar. A live session with no
+    # sidecar yet is still starting: unknown means refuse.
     for spid in "$STATE_DIR"/join/*.pid; do
         [[ -f "$spid" ]] || continue
         sname=$(basename "$spid" .pid)
         sbx_session_alive "$STATE_DIR" "$sname" || continue
-        # The sidecar is written long after the pid claim, so a session
-        # caught in between is live with nothing recorded. Unknown means
-        # refuse, not "no conflict": a refusal is recoverable, deleting a
-        # live session's auth store is not.
         if [[ ! -f "$STATE_DIR/join/$sname.json" ]]; then
-            RESEED_BLOCKER="$sname (still starting up — its mounts are not recorded yet)"
+            blocker="$sname (still starting up — its mounts are not recorded yet)"
             break
         fi
         while IFS= read -r lstore; do
             [[ -n "$lstore" ]] || continue
-            for rt in "${RESEED_TARGETS[@]}"; do
+            for rt in "${targets[@]}"; do
                 if [[ "$lstore" == "$rt" ]]; then
-                    RESEED_BLOCKER="$sname"
+                    blocker="$sname"
                 fi
             done
         done < <(jq -r '.forked_stores[]?' "$STATE_DIR/join/$sname.json" 2>/dev/null || true)
-        if [[ -n "$RESEED_BLOCKER" ]]; then
+        if [[ -n "$blocker" ]]; then
             break
         fi
     done
-    if [[ -n "$RESEED_BLOCKER" ]]; then
-        echo "Error: session '$RESEED_BLOCKER' is live and may have these stores mounted." >&2
+    if [[ -n "$blocker" ]]; then
+        echo "Error: session '$blocker' is live and may have these stores mounted." >&2
         echo "Refusing to reseed: deleting a store under a running session destroys the state it is using." >&2
         echo "End that session and try again." >&2
         exit 1
     fi
 
-    # Name the store, not just the mount: the store is the thing being
-    # deleted, and its size is the only hint of how much accumulated state
-    # goes with it.
     echo "This will delete the sandbox-owned copies of:"
     for i in "${!FORKED_MOUNTS[@]}"; do
         IFS=$'\t' read -r f_prof f_src f_dest <<< "${FORKED_MOUNTS[$i]}"
-        f_store="${RESEED_TARGETS[$i]}"
+        f_store="${targets[$i]}"
         if [[ -d "$f_store" ]]; then
             f_size=$(du -sh "$f_store" 2>/dev/null | cut -f1)
         else
@@ -1168,113 +921,94 @@ if [[ "$RESEED" == "true" ]]; then
         echo "    $f_store  [$f_size]"
     done
     if [[ "$ASSUME_YES" != "true" ]]; then
-        # `|| true`: read exits non-zero on EOF (e.g. a non-interactive
-        # invocation with no stdin), and under `set -e` that would exit the
-        # script right here, skipping the "Aborted." message below.
+        # read fails on EOF; under set -e that would skip "Aborted."
         read -r -p "Proceed? [y/N] " reply || true
         [[ "$reply" == [yY]* ]] || { echo "Aborted." >&2; exit 1; }
     fi
-    for f_store in "${RESEED_TARGETS[@]}"; do
+    for f_store in "${targets[@]}"; do
         rm -rf "${f_store:?}"
     done
     echo "Reseeded. The next launch will read from the host."
     exit 0
-fi
+}
 
-# Sandbox-owned mounts. Seeded from the host only when the store does not
-# yet exist; from then on the store IS the tree and the host source is
-# never consulted again. That is the defining property of `forked`, not an
-# optimization — see the design spec. Bound rw directly, so there is no
-# write-back at teardown and nothing to diff.
-for fm in "${FORKED_MOUNTS[@]}"; do
-    IFS=$'\t' read -r f_prof f_src f_dest <<< "$fm"
-    # An absent source is skipped outright, not seeded into an empty store.
-    # Creating the store here would be permanent damage: the store would
-    # exist, so `[[ ! -e "$f_store" ]]` below never fires again, and the
-    # empty DIRECTORY would be bound at a destination that wants a FILE —
-    # for every launch from now on, including after the host file finally
-    # appears. Under the old `copy` perm this self-healed because the host
-    # was re-read every time; `forked` reads it once, so getting it wrong
-    # once is getting it wrong forever. The trigger is ordinary: `sbx --cli
-    # claude` before Claude Code has ever written ~/.claude.json. Skipping
-    # also makes the mount match what the plan's warnings already told the
-    # user (a source-not-present mount is skipped, per lib/resolve.sh).
-    if [[ ! -e "$f_src" ]]; then
-        continue
-    fi
-    f_store=$(sbx_forked_store "$f_prof" "$f_dest")
-    # Recorded for the join sidecar, which is what tells a later --reseed
-    # that this store belongs to a running session.
-    FORKED_STORES+=("$f_store")
-
-    if [[ ! -e "$f_store" ]]; then
-        mkdir -p "$f_store"
-        sbx_copy_seed_progress "$f_src" "$f_store" "Seeding $f_dest"
-    fi
-
-    if [[ -f "$f_src" ]]; then
-        BWRAP_ARGS+=(--bind "$f_store/$(basename "$f_src")" "$f_dest")
+# Binds a seeded tree at <dest>: a file source was copied in under its own
+# name; a directory's contents are the tree.
+bind_seeded() {   # <tree> <source> <dest>
+    if [[ -f "$2" ]]; then
+        BWRAP_ARGS+=(--bind "$1/$(basename "$2")" "$3")
     else
-        BWRAP_ARGS+=(--tmpfs "$f_dest")
-        BWRAP_ARGS+=(--bind "$f_store" "$f_dest")
+        BWRAP_ARGS+=(--tmpfs "$3")
+        BWRAP_ARGS+=(--bind "$1" "$3")
     fi
-done
+}
 
-# Host-owned mounts with change detection. A private working copy is seeded
-# fresh every launch and hashed into a manifest; teardown diffs the working
-# copy against THAT manifest rather than against the live host source, so a
-# host edit made while the session runs cannot be misattributed to the
-# sandbox.
-RECORD_WORK_DIR="$STATE_DIR/work/$SESSION_ID"
+# forked: seeded from the host once, when the store does not exist; from
+# then on the store IS the tree. An absent source is skipped, not seeded
+# empty — an empty store would exist forever after, even once the host
+# file appears.
+seed_forked_mounts() {
+    local fm f_prof f_src f_dest f_store
+    FORKED_STORES=()   # recorded in the join sidecar for --reseed
+    for fm in "${FORKED_MOUNTS[@]}"; do
+        IFS=$'\t' read -r f_prof f_src f_dest <<< "$fm"
+        if [[ ! -e "$f_src" ]]; then
+            continue
+        fi
+        f_store=$(forked_store "$f_prof" "$f_dest")
+        FORKED_STORES+=("$f_store")
+        if [[ ! -e "$f_store" ]]; then
+            mkdir -p "$f_store"
+            sbx_copy_seed_progress "$f_src" "$f_store" "Seeding $f_dest"
+        fi
+        bind_seeded "$f_store" "$f_src" "$f_dest"
+    done
+}
 
-# Removed, not merely created. teardown() clears this at the end of a normal
-# session, but a session killed by SIGKILL, OOM or power loss never runs it,
-# and the next launch from the same directory reclaims the same name and so
-# lands on the same path. sbx_copy_seed_progress's `cp -a "$src/." "$tmp/"` MERGES
-# into a non-empty destination rather than replacing it, and the manifest is
-# built afterwards over the merged tree — so a ghost file from the dead
-# session is folded into the BASELINE, reads as unchanged host state, never
-# appears in --changes, and is visible to the sandbox although the host does
-# not have it. That contradicts what `record` promises: a fresh copy from
-# the host source, every launch. This one line is also what covers an exit
-# between here and the EXIT trap installed further down.
-rm -rf "${RECORD_WORK_DIR:?}"
+# record: a private working copy seeded fresh every launch and hashed into a
+# manifest; teardown diffs against that manifest, not the live host source,
+# so a host edit during the session is never blamed on the sandbox. The old
+# tree is removed first: cp merges into a stranded one from a killed
+# session, and its ghost files would join the baseline.
+seed_record_mounts() {
+    local rm_ r_src r_dest r_id r_work
+    RECORD_WORK_DIR="$STATE_DIR/work/$SESSION_ID"
+    rm -rf "${RECORD_WORK_DIR:?}"
+    for rm_ in "${RECORD_MOUNTS[@]}"; do
+        IFS=$'\t' read -r r_src r_dest <<< "$rm_"
+        r_id=$(sbx_copy_mount_id "$r_dest")
+        r_work="$RECORD_WORK_DIR/$r_id"
+        mkdir -p "$r_work"
+        sbx_copy_seed_progress "$r_src" "$r_work" "Seeding $r_dest"
+        sbx_manifest_build "$r_work" "$RECORD_WORK_DIR/$r_id.manifest"
+        bind_seeded "$r_work" "$r_src" "$r_dest"
+    done
+}
 
-for rm_ in "${RECORD_MOUNTS[@]}"; do
-    IFS=$'\t' read -r r_src r_dest <<< "$rm_"
-    r_id=$(sbx_copy_mount_id "$r_dest")
-    r_work="$RECORD_WORK_DIR/$r_id"
+add_env_and_path() {
+    local key val
+    # In profile order; bwrap keeps the last --setenv, so later profiles win.
+    while IFS= read -r -d '' key && IFS= read -r -d '' val; do
+        BWRAP_ARGS+=(--setenv "$key" "$val")
+    done < <(jq -j 'def nul: [0] | implode; .env[] | .name, nul, .value, nul' <<< "$PLAN")
 
-    mkdir -p "$r_work"
-    sbx_copy_seed_progress "$r_src" "$r_work" "Seeding $r_dest"
-    sbx_manifest_build "$r_work" "$RECORD_WORK_DIR/$r_id.manifest"
-
-    if [[ -f "$r_src" ]]; then
-        BWRAP_ARGS+=(--bind "$r_work/$(basename "$r_src")" "$r_dest")
-    else
-        BWRAP_ARGS+=(--tmpfs "$r_dest")
-        BWRAP_ARGS+=(--bind "$r_work" "$r_dest")
+    if [[ -n "$WORKDIR" ]]; then
+        BWRAP_ARGS+=(--chdir "$WORKDIR")
     fi
-done
 
-# Environment from profiles: every assignment, in profile order. bwrap keeps
-# the last --setenv for a name, which is what makes a later profile win.
-while IFS= read -r -d '' key && IFS= read -r -d '' val; do
-    BWRAP_ARGS+=(--setenv "$key" "$val")
-done < <(jq -j 'def nul: [0] | implode; .env[] | .name, nul, .value, nul' <<< "$PLAN")
+    # The docker shim first, so `docker` never resolves elsewhere.
+    BWRAP_ARGS+=(--setenv PATH "$SESSION_DIR/bin:$SANDBOX_PATH")
+}
 
-if [[ -n "$WORKDIR" ]]; then
-    BWRAP_ARGS+=(--chdir "$WORKDIR")
-fi
+setup_network() {
+    local dns_dir="$SESSION_DIR/dns"
+    SBX_DNS_ADDR=""
+    RESOLV_DEST=""
+    if [[ "$SBX_NETNS" != "true" ]]; then
+        return 0
+    fi
 
-# $SESSION_DIR/bin holds the docker shim; first on PATH so `docker` always
-# resolves to it (the host docker socket is never reachable in a sandbox).
-BWRAP_ARGS+=(--setenv PATH "$SESSION_DIR/bin:$SANDBOX_PATH")
-
-# Network Setup
-if [[ "$SBX_NETNS" == "true" ]]; then
-    # The host's default-route interface and address, handed to pasta
-    # explicitly (--interface, -a, -g, -n) so the namespace mirrors it.
+    # pasta mirrors the host's default-route interface and address.
     HOST_IFACE=$(ip route show default | awk '{print $5}' | head -n 1)
     if [[ -z "$HOST_IFACE" ]]; then
         echo "Error: networking needs a default route on the host, and there is none." >&2
@@ -1284,102 +1018,75 @@ if [[ "$SBX_NETNS" == "true" ]]; then
     HOST_GW=$(ip route show default | awk '{print $3}' | head -n 1)
     HOST_MASK=$(ip addr show "$HOST_IFACE" | grep "inet " | awk '{print $2}' | cut -d/ -f2 | head -n 1)
 
-    DNS_DIR="$SESSION_DIR/dns"
-    mkdir -p "$DNS_DIR"
+    mkdir -p "$dns_dir"
 
-    # Loopback address for this session's dnsmasq. Deliberately NOT
-    # 127.0.0.1: pasta's UDP handler binds 127.0.0.1:53 inside the network
-    # namespace it creates whenever the host has anything listening on port
-    # 53 (systemd-resolved's 127.0.0.53/127.0.0.54 stubs, and under WSL2 the
-    # 10.255.255.254 DNS proxy). dnsmasq then loses the race and dies with
-    # "failed to create listening socket for 127.0.0.1: Address already in
-    # use", taking the whole session with it. Neither -u none nor -t none
-    # suppresses that bind; only --no-udp does, and that would break
-    # dnsmasq's own upstream queries. Any other 127.0.0.0/8 address is
-    # untouched by pasta and is local via lo's 127.0.0.1/8.
+    # Not 127.0.0.1: pasta binds 127.0.0.1:53 in its namespace whenever the
+    # host listens on 53 (systemd-resolved, WSL2's proxy), and dnsmasq would
+    # lose that race. The rest of 127/8 is untouched and local.
     SBX_DNS_ADDR="127.0.0.2"
-
     if [[ "$NET_ENABLED" == "true" ]]; then
-        printf 'nameserver %s\n' "$SBX_DNS_ADDR" > "$DNS_DIR/resolv.conf"
+        printf 'nameserver %s\n' "$SBX_DNS_ADDR" > "$dns_dir/resolv.conf"
     else
-        # Host ports only: no resolver runs and nothing outside loopback is
-        # reachable, so lookups fail at once instead of hanging on a
-        # nameserver the ruleset drops. "localhost" still resolves, from
-        # /etc/hosts.
-        : > "$DNS_DIR/resolv.conf"
+        # Host ports only: no resolver, so lookups fail at once instead of
+        # hanging. "localhost" still resolves, from /etc/hosts.
+        : > "$dns_dir/resolv.conf"
     fi
 
-    # /etc is bound read-only above, so whatever /etc/resolv.conf is on the
-    # host appears in the sandbox — and on many hosts it is a symlink out of
-    # /etc entirely (/mnt/wsl/resolv.conf under WSL2, /run/systemd/resolve/
-    # stub-resolv.conf under systemd-resolved). The kernel resolves a bind
-    # mount's destination through symlinks, and neither target exists in the
-    # sandbox's fresh root, so binding at the /etc path fails outright with
-    # "mount point is a symbolic link to nowhere". Bind at the resolved
-    # target instead: bwrap creates the missing parents on the root tmpfs,
-    # and the inherited symlink then points at our file.
+    # /etc/resolv.conf is often a symlink out of /etc (systemd-resolved,
+    # WSL2), and a bind follows it to a target that does not exist in the
+    # sandbox. Binding at the resolved target lets the inherited symlink
+    # point at our file.
     RESOLV_DEST=/etc/resolv.conf
     if [[ -L /etc/resolv.conf ]]; then
         RESOLV_DEST=$(readlink -f /etc/resolv.conf 2>/dev/null) || RESOLV_DEST=""
         [[ -n "$RESOLV_DEST" ]] || RESOLV_DEST=/etc/resolv.conf
     fi
-    BWRAP_ARGS+=(--ro-bind "$DNS_DIR/resolv.conf" "$RESOLV_DEST")
+    BWRAP_ARGS+=(--ro-bind "$dns_dir/resolv.conf" "$RESOLV_DEST")
 
-    sbx_egress_rules "$(plan_get '.net')" "$SBX_DNS_ADDR" "$NEST_TCP" "$NEST_UDP" > "$DNS_DIR/rules.nft"
-fi
+    sbx_egress_rules "$(plan_get '.net')" "$SBX_DNS_ADDR" "$NEST_TCP" "$NEST_UDP" > "$dns_dir/rules.nft"
+}
 
-# Session State Persistence
-jq -n --indent 4 --arg id "$SESSION_ID" --arg cwd "$PWD" --argjson pid "$$" \
-    --argjson fs "$(sbx_resolve_strings "${FS_PROFILES[@]}")" \
-    --argjson net "$(sbx_resolve_strings "${NET_PROFILES[@]}")" \
-    --arg cli "$CLI_PROFILE" \
-    '{id: $id, cwd: $cwd, pid: $pid, fs_profiles: $fs, net_profiles: $net,
-      cli_profile: (if $cli == "" then null else $cli end)}' \
-    > "$SESSION_DIR/session.json"
+# session.json is for display (--list-sessions), inside the sandbox's rw
+# session directory. The join sidecar is outside it, in the masked join/
+# area, because --join and --reseed act on it:
+#   path          the session PATH, which --join re-imposes over tmux's
+#   workdir       where a join starts (the launch dir when --wd is empty)
+#   caps_keep     informational; the drop happens once, in launch.sh
+#   forked_stores the stores bound rw, which --reseed must not delete. Not
+#                 derivable later: the key includes the launch directory,
+#                 whose only other record is the forgeable session.json.
+write_session_records() {
+    jq -n --indent 4 --arg id "$SESSION_ID" --arg cwd "$PWD" --argjson pid "$$" \
+        --argjson fs "$(sbx_resolve_strings "${FS_PROFILES[@]}")" \
+        --argjson net "$(sbx_resolve_strings "${NET_PROFILES[@]}")" \
+        --arg cli "$CLI_PROFILE" \
+        '{id: $id, cwd: $cwd, pid: $pid, fs_profiles: $fs, net_profiles: $net,
+          cli_profile: (if $cli == "" then null else $cli end)}' \
+        > "$SESSION_DIR/session.json"
 
-# The join sidecar. Same information session.json would have carried, but
-# kept OUTSIDE $SESSION_DIR on purpose: that directory is bound rw into the
-# sandbox, so anything in it is attacker-authored, and --join must not take
-# security-relevant input from the sandbox it is about to enter. $STATE_DIR
-# is masked by a --tmpfs inside with only $SESSION_DIR bound back in, so
-# this path does not exist from the sandbox's point of view.
-#   path      the session's own PATH, which --join re-imposes because tmux
-#             otherwise hands the pane the host client's PATH.
-#   workdir   what `tmux new-session -c` should use, so a join starts where
-#             the payload did rather than in the host's cwd. Empty --wd means
-#             "wherever bwrap would have landed", which is the launch dir.
-#   caps_keep informational: the drop is applied (or not) once at launch, in
-#             launch.sh, so --join does not consult this. Recorded so a
-#             capful join is explainable without re-deriving the profiles.
-#   forked_stores
-#             the host paths this session has bind-mounted rw, so --reseed
-#             can refuse to rm -rf a store out from under a running sandbox.
-#             Recorded rather than derived because it cannot be recovered
-#             later: the store key is (profile, slug of the LAUNCH dir,
-#             mount id), and the only host-side record of a session's launch
-#             dir is session.json, which lives inside the sandbox and is
-#             therefore forgeable. workdir above is not a substitute — --wd
-#             makes it a different directory entirely.
-jq -n --indent 4 --arg path "$SESSION_DIR/bin:$SANDBOX_PATH" --arg workdir "${WORKDIR:-$PWD}" \
-    --argjson caps_keep "$CAPS_KEEP" \
-    --argjson forked_stores "$(sbx_resolve_strings "${FORKED_STORES[@]}")" \
-    '{path: $path, workdir: $workdir, caps_keep: $caps_keep, forked_stores: $forked_stores}' \
-    > "$STATE_DIR/join/$SESSION_ID.json"
+    jq -n --indent 4 --arg path "$SESSION_DIR/bin:$SANDBOX_PATH" --arg workdir "${WORKDIR:-$PWD}" \
+        --argjson caps_keep "$CAPS_KEEP" \
+        --argjson forked_stores "$(sbx_resolve_strings "${FORKED_STORES[@]}")" \
+        '{path: $path, workdir: $workdir, caps_keep: $caps_keep, forked_stores: $forked_stores}' \
+        > "$STATE_DIR/join/$SESSION_ID.json"
+}
 
-# GUI Setup (xpra virtual display)
-if [[ "$GUI_FLAG" == "true" ]]; then
-    # Find a free X11 display slot
-    DISPLAY_NUM=100
-    while [[ -S "/tmp/.X11-unix/X$DISPLAY_NUM" ]]; do
-        DISPLAY_NUM=$((DISPLAY_NUM + 1))
+# An xpra virtual display, bound into the sandbox with its own cookie.
+setup_gui() {
+    local display_num=100 xpra_log x11_sock ready=false host_xauth sbx_xauth
+    if [[ "$GUI_FLAG" != "true" ]]; then
+        return 0
+    fi
+    while [[ -S "/tmp/.X11-unix/X$display_num" ]]; do
+        display_num=$((display_num + 1))
     done
-    XPRA_DISPLAY=":$DISPLAY_NUM"
-    XPRA_LOG="$SESSION_DIR/xpra.log"
+    XPRA_DISPLAY=":$display_num"
+    xpra_log="$SESSION_DIR/xpra.log"
 
     echo "Starting xpra on display $XPRA_DISPLAY..."
     xpra start "$XPRA_DISPLAY" \
         --daemon=yes \
-        --log-file="$XPRA_LOG" \
+        --log-file="$xpra_log" \
         --mdns=no \
         --notifications=no \
         --bell=no \
@@ -1387,117 +1094,93 @@ if [[ "$GUI_FLAG" == "true" ]]; then
         --microphone=disabled \
         > /dev/null 2>&1
 
-    # Wait for the virtual X11 socket to appear
-    X11_SOCK="/tmp/.X11-unix/X$DISPLAY_NUM"
+    x11_sock="/tmp/.X11-unix/X$display_num"
     echo -n "Waiting for display"
-    XPRA_READY=false
-    for i in {1..40}; do
-        if [[ -S "$X11_SOCK" ]]; then
-            XPRA_READY=true
+    for _ in {1..40}; do
+        if [[ -S "$x11_sock" ]]; then
+            ready=true
             break
         fi
         sleep 0.25
         echo -n "."
     done
     echo
-
-    if [[ "$XPRA_READY" != "true" ]]; then
-        echo "Error: xpra display $XPRA_DISPLAY failed to start. Check $XPRA_LOG" >&2
+    if [[ "$ready" != "true" ]]; then
+        echo "Error: xpra display $XPRA_DISPLAY failed to start. Check $xpra_log" >&2
         xpra stop "$XPRA_DISPLAY" >/dev/null 2>&1 || true
         exit 1
     fi
 
-    # Build a session Xauthority cookie for the display.
-    # xpra writes its cookie to the host Xauthority keyed to the host hostname,
-    # but the sandbox runs under a different hostname (e.g. pasta-<host> when
-    # networking is on, or no UTS name otherwise). We rewrite the cookie's
-    # address family to FamilyWild (ffff) so it matches from any hostname.
-    HOST_XAUTH="${XAUTHORITY:-$HOME/.Xauthority}"
-    SBX_XAUTH="$SESSION_DIR/Xauthority"
-    rm -f "$SBX_XAUTH"
-
-    # The cookie may lag slightly behind the socket; retry briefly.
-    for i in {1..20}; do
-        if xauth -f "$HOST_XAUTH" nlist "$XPRA_DISPLAY" 2>/dev/null | grep -q .; then
+    # xpra keys its cookie to the host's hostname, which the sandbox does
+    # not share; FamilyWild (ffff) matches from any hostname. The cookie may
+    # lag the socket slightly.
+    host_xauth="${XAUTHORITY:-$HOME/.Xauthority}"
+    sbx_xauth="$SESSION_DIR/Xauthority"
+    rm -f "$sbx_xauth"
+    for _ in {1..20}; do
+        if xauth -f "$host_xauth" nlist "$XPRA_DISPLAY" 2>/dev/null | grep -q .; then
             break
         fi
         sleep 0.25
     done
-
-    if xauth -f "$HOST_XAUTH" nlist "$XPRA_DISPLAY" 2>/dev/null \
+    if ! xauth -f "$host_xauth" nlist "$XPRA_DISPLAY" 2>/dev/null \
         | sed -e 's/^..../ffff/' \
-        | xauth -f "$SBX_XAUTH" nmerge - 2>/dev/null; then
-        : # cookie installed
-    else
+        | xauth -f "$sbx_xauth" nmerge - 2>/dev/null; then
         echo "Warning: could not build X11 auth cookie; GUI apps may fail with auth errors." >&2
     fi
 
-    # Expose the X11 socket and auth cookie inside the sandbox
     BWRAP_ARGS+=(--dir /tmp/.X11-unix)
-    BWRAP_ARGS+=(--bind "$X11_SOCK" "/tmp/.X11-unix/X$DISPLAY_NUM")
+    BWRAP_ARGS+=(--bind "$x11_sock" "/tmp/.X11-unix/X$display_num")
     BWRAP_ARGS+=(--setenv DISPLAY "$XPRA_DISPLAY")
-    if [[ -f "$SBX_XAUTH" ]]; then
-        BWRAP_ARGS+=(--ro-bind "$SBX_XAUTH" /tmp/.sbx-Xauthority)
+    if [[ -f "$sbx_xauth" ]]; then
+        BWRAP_ARGS+=(--ro-bind "$sbx_xauth" /tmp/.sbx-Xauthority)
         BWRAP_ARGS+=(--setenv XAUTHORITY /tmp/.sbx-Xauthority)
     fi
-    # Prevent MIT-SHM errors (IPC is unshared, so SHM won't work)
+    # IPC is unshared, so MIT-SHM cannot work.
     BWRAP_ARGS+=(--setenv LIBGL_ALWAYS_INDIRECT 1)
 
-    GUI_MODE=true
     echo "GUI display $XPRA_DISPLAY is ready."
     echo "  Attach viewer : xpra attach $XPRA_DISPLAY"
     echo "  Stop display  : xpra stop $XPRA_DISPLAY"
-fi
+}
 
-# Masks, appended after every profile mount because bwrap applies mount
-# arguments in order: a profile mounting $HOME or $HOME/.local would
-# otherwise re-expose these. The sandbox gets its own session directory
-# and nothing else — no sibling sessions, no persistent cli stores, and
-# no ability to author the profiles that configure the next launch.
-BWRAP_ARGS+=(--tmpfs "$STATE_DIR")
-BWRAP_ARGS+=(--bind "$SESSION_DIR" "$SESSION_DIR")
-BWRAP_ARGS+=(--tmpfs "$CONFIG_DIR")
+# Last, because bwrap applies mounts in order and a profile mounting $HOME
+# would otherwise re-expose these: the sandbox sees its own session
+# directory and nothing else of sbx's state or config.
+add_masks() {
+    BWRAP_ARGS+=(--tmpfs "$STATE_DIR")
+    BWRAP_ARGS+=(--bind "$SESSION_DIR" "$SESSION_DIR")
+    BWRAP_ARGS+=(--tmpfs "$CONFIG_DIR")
+}
 
-# Teardown Logic
+# The EXIT trap of a launch: archive record-mount changes, then remove the
+# session.
 teardown() {
-    # Must be the first line: in an EXIT trap $? is the status the script is
-    # dying with, i.e. bwrap's. That is NOT the payload's exit code (a tmux
-    # session's status does not reach its client, and dropping it is
-    # deliberate) — it is the launch's own, and a caller has to be able to
-    # tell "the sandbox never came up" apart from "the session ran".
+    # First: $? here is the launch's own status (bwrap's), which is how a
+    # caller tells "never came up" from "ran". The payload's does not
+    # reach it.
     local exit_status=$?
+    local join_lock arch_dir rm_ r_src r_dest r_id r_work r_base r_cur rel
 
     # A seed interrupted mid-progress leaves a partial line on the terminal.
-    [[ -t 2 ]] && printf '\r\033[K' >&2
-
+    if [[ -t 2 ]]; then
+        printf '\r\033[K' >&2
+    fi
     echo "Tearing down session $SESSION_ID..."
 
-    # This is the lock that actually keeps writeback off a live join. The
-    # case it's for is teardown running as an EXIT trap on a fatal signal —
-    # Ctrl-C on the launching terminal, a CI timeout killing sbx — while the
-    # sandbox is still fully up: bwrap only dies with its parent once sbx
-    # has already exited, i.e. after this trap has run, so the in-sandbox
-    # PID-1 waiter (see session.sh) plays no part in that path and cannot
-    # order anything here. The tampering case the waiter genuinely is
-    # vulnerable to (`rm tmux.sock`, `tmux kill-server`) turns out not to
-    # need this lock at all: killing the waiter is what makes bwrap return,
-    # and bwrap returning tears down the pid namespace that the join's pane
-    # lives in, so the join has nothing left to write with by the time
-    # teardown runs — measured in tests/join.bats "writeback waits on the
-    # host lock when teardown is not gated by the sandbox". This lock is on
-    # the host side and on a path the sandbox cannot see (see the --join
-    # branch), so it holds regardless of what happens inside. Bounded,
-    # never an unbounded block: a stale lock must not be able to hang
-    # teardown forever.
-    JOIN_LOCK="$STATE_DIR/join/$SESSION_ID.lock"
-    if exec 9>>"$JOIN_LOCK"; then
+    # A join holds this lock shared for its whole life. It matters when
+    # teardown runs as the EXIT trap of a signal (Ctrl-C, a CI timeout)
+    # while the sandbox is still up; when the sandbox ends itself, its pid
+    # namespace goes with it and no join is left to write (tests/join.bats,
+    # "writeback waits on the host lock..."). Host-side, invisible to the
+    # sandbox, and bounded so a stale lock cannot hang teardown.
+    join_lock="$STATE_DIR/join/$SESSION_ID.lock"
+    if exec 9>>"$join_lock"; then
         if ! flock -w 30 -x 9; then
             echo "Warning: a --join still holds the session lock after 30s; archiving record-mount changes anyway." >&2
         fi
     fi
 
-    # Change archive for record mounts. The baseline is the launch-time
-    # manifest, not the host source, so this reports what the SANDBOX did.
     if [[ ${#RECORD_MOUNTS[@]} -gt 0 ]]; then
         arch_dir="$STATE_DIR/changes/$(sbx_copy_path_slug "$PWD")/$(date +%Y%m%d-%H%M%S)-$SESSION_ID"
         for rm_ in "${RECORD_MOUNTS[@]}"; do
@@ -1520,17 +1203,10 @@ teardown() {
             sbx_manifest_deleted "$r_base" "$r_cur" > "$arch_dir/$r_id.deleted"
             echo "Changes from this session: $arch_dir/$r_id"
         done
-
-        # Prune old archives here too, not only on an explicit --gc, so
-        # they never accumulate unbounded just because nobody remembered to
-        # run it.
         sbx_prune_changes "$STATE_DIR/changes/$(sbx_copy_path_slug "$PWD")" "$(sbx_keep_changes)"
     fi
     rm -rf "$RECORD_WORK_DIR"
 
-    # Nothing durable lives here: forked stores, change archives and the
-    # join sidecar are all outside. Removing the directory outright is the
-    # whole fix for --list-sessions accumulating dead entries.
     sbx_session_remove "$STATE_DIR" "$SESSION_ID"
 
     if [[ -n "$XPRA_DISPLAY" ]]; then
@@ -1539,38 +1215,27 @@ teardown() {
     fi
 
     if [[ "$exit_status" -ne 0 ]]; then
-        # Saying "changes saved" here would be a lie a CI job cannot see
-        # through: the sandbox may never have got as far as running anything.
         echo "Session $SESSION_ID ended with status $exit_status; the payload may never have run." >&2
     else
         echo "Session $SESSION_ID finished."
     fi
 }
 
-trap teardown EXIT
-
-# Execution
-#
 # The scripts that run the session are fixed files in lib/: launch.sh runs
-# in the control namespace A, and session.sh and wrapper.sh inside the
-# sandbox, so those two are copied into the session directory (the one host
-# path every sandbox has). What differs per session is written beside them
-# as data: bwrap.args, launch.env, wrapper.env and command.
-
-# Per-session tmux config. The -f that loads it keeps the server off the
-# user's ~/.tmux.conf, which a mounted $HOME would otherwise supply.
-#   update-environment  SECURITY. A client ships its environment to the
-#                  server, and by default DISPLAY, SSH_AUTH_SOCK and friends
-#                  are applied to new sessions — a hole straight through
-#                  --clearenv. Not sufficient alone: tmux copies the client's
-#                  PATH into a pane regardless, which is why --join
-#                  re-imposes the session's PATH itself.
-#   exit-empty     the server exits with its last session, which is what
-#                  lets session.sh stop waiting.
-#   prefix C-\     a host tmux keeps C-b, so nesting needs no doubled prefix.
-#   window-size    per-client sizing, so one join cannot resize another.
-#   status-left    makes "you are inside a sandbox" visible at a glance.
-cat > "$SESSION_DIR/tmux.conf" <<EOF
+# in the control namespace A; session.sh and wrapper.sh run inside the
+# sandbox, so they are copied into the session directory, the one host path
+# every sandbox has. What differs per session is written beside them.
+write_session_files() {
+    # The -f that loads this keeps the server off a mounted ~/.tmux.conf.
+    #   update-environment  SECURITY: by default a client's DISPLAY,
+    #                  SSH_AUTH_SOCK and friends reach new sessions, straight
+    #                  through --clearenv. (PATH is copied regardless, which
+    #                  is why --join re-imposes it.)
+    #   exit-empty     the server exits with its last session, which is what
+    #                  lets session.sh stop waiting.
+    #   prefix C-\     a host tmux keeps C-b.
+    #   window-size    per-client, so one join cannot resize another.
+    cat > "$SESSION_DIR/tmux.conf" <<EOF
 set -g update-environment ''
 set -g exit-empty on
 set -g escape-time 0
@@ -1583,90 +1248,135 @@ set -g status-left ' sbx:$SESSION_ID '
 set -g status-left-length 40
 EOF
 
-install -m 0755 "$SCRIPT_DIR/lib/session.sh" "$SESSION_DIR/session.sh"
-install -m 0755 "$SCRIPT_DIR/lib/wrapper.sh" "$SESSION_DIR/wrapper.sh"
-printf '%s\0' "${COMMAND[@]}" > "$SESSION_DIR/command"
-printf '%s\0' "${BWRAP_ARGS[@]}" > "$SESSION_DIR/bwrap.args"
+    install -m 0755 "$SCRIPT_DIR/lib/session.sh" "$SESSION_DIR/session.sh"
+    install -m 0755 "$SCRIPT_DIR/lib/wrapper.sh" "$SESSION_DIR/wrapper.sh"
+    printf '%s\0' "${COMMAND[@]}" > "$SESSION_DIR/command"
+    printf '%s\0' "${BWRAP_ARGS[@]}" > "$SESSION_DIR/bwrap.args"
+    declare -p CAPS_KEEP USERNS_FULL DOCKER_API PODMAN_SOCK VIRT_DIR > "$SESSION_DIR/wrapper.env"
 
-# wrapper.sh's settings. The podman ones matter only to a "caps": "keep"
-# session; the socket path is pinned to the sbx-computed /run/user/<uid>,
-# not $XDG_RUNTIME_DIR, which a profile may override away from DOCKER_HOST.
-declare -p CAPS_KEEP USERNS_FULL DOCKER_API PODMAN_SOCK VIRT_DIR > "$SESSION_DIR/wrapper.env"
-
-# launch.sh's settings.
-#   NET_MODE  none      no network namespace beyond B's loopback
-#             loopback  host ports only: A's ruleset, no resolver
-#             dns       a net profile: ruleset, dnsmasq, readiness probe
-NET_MODE=none
-DNSMASQ_BIN=""
-DNSMASQ_ARGS=()
-if [[ "$SBX_NETNS" == "true" ]]; then
-    NET_MODE=loopback
-    if [[ "$NET_ENABLED" == "true" ]]; then
-        NET_MODE=dns
-        DNSMASQ_BIN=$(command -v dnsmasq)
-        mapfile -t DNSMASQ_ARGS < <(sbx_egress_dnsmasq_args "$(plan_get '.net')")
+    #   NET_MODE  none      no network namespace beyond B's loopback
+    #             loopback  host ports only: A's ruleset, no resolver
+    #             dns       a net profile: ruleset, dnsmasq, readiness probe
+    NET_MODE=none
+    DNSMASQ_BIN=""
+    DNSMASQ_ARGS=()
+    if [[ "$SBX_NETNS" == "true" ]]; then
+        NET_MODE=loopback
+        if [[ "$NET_ENABLED" == "true" ]]; then
+            NET_MODE=dns
+            DNSMASQ_BIN=$(command -v dnsmasq)
+            mapfile -t DNSMASQ_ARGS < <(sbx_egress_dnsmasq_args "$(plan_get '.net')")
+        fi
     fi
-else
-    SBX_DNS_ADDR=""
-    RESOLV_DEST=""
-fi
-declare -p NET_MODE CAPS_KEEP NEST_TCP NEST_UDP SBX_DNS_ADDR DNSMASQ_BIN DNSMASQ_ARGS \
-    TEST_DOMAIN RESOLV_DEST > "$SESSION_DIR/launch.env"
+    declare -p NET_MODE CAPS_KEEP NEST_TCP NEST_UDP SBX_DNS_ADDR DNSMASQ_BIN DNSMASQ_ARGS \
+        TEST_DOMAIN RESOLV_DEST > "$SESSION_DIR/launch.env"
+}
 
-# pasta's -T / -U are the whole host-access allow-list: pasta binds exactly
-# these ports inside the namespace and splices them to the host's loopback.
-# "none" replaces pasta's default of forwarding every port bound on the
-# host, and keeping the lists separate stops a TCP grant from carrying its
-# UDP twin. --no-map-gw: otherwise the gateway address reaches every
-# host-local service without a rule naming it.
-join_ports() {
+port_list() {   # <port>...: comma-joined, or "none"
+    local joined
     if [[ $# -eq 0 ]]; then
         echo none
     else
-        local joined; joined=$(printf '%s,' "$@"); echo "${joined%,}"
+        joined=$(printf '%s,' "$@")
+        echo "${joined%,}"
     fi
 }
-PASTA_FWD_TCP=$(join_ports "${HOST_PORTS_TCP[@]}")
-PASTA_FWD_UDP=$(join_ports "${HOST_PORTS_UDP[@]}")
 
-# pasta is handed "/bin/bash <script>", not the script: Ubuntu's AppArmor
-# profile for pasta allows exec only under /bin and /usr/bin (measured on
-# Ubuntu 26.04, 2026-09-23), and Ux there still runs the script unconfined.
-LAUNCH=(/bin/bash "$SCRIPT_DIR/lib/launch.sh" "$SESSION_DIR/launch.env")
+run_session() {
+    local tcp udp desc
+    local -a launch pasta
+    tcp=$(port_list "${HOST_PORTS_TCP[@]}")
+    udp=$(port_list "${HOST_PORTS_UDP[@]}")
 
-# setpriv --pdeathsig KILL on every shape: launch.sh outlives bwrap, so the
-# process between sbx and bwrap needs its own parent-death signal. Under
-# pasta, which forks its child, a SIGKILLed sbx still orphans launch.sh —
-# networkless once pasta is gone, and --gc judges the session by sbx's pid.
-if [[ "$SBX_NETNS" == "true" ]]; then
-    PASTA=(pasta -f --config-net --no-map-gw -T "$PASTA_FWD_TCP" -U "$PASTA_FWD_UDP"
+    # "/bin/bash <script>", not the script: Ubuntu's AppArmor profile for
+    # pasta allows exec only under /bin and /usr/bin, and Ux there still
+    # runs the script unconfined (Ubuntu 26.04, 2026-09-23).
+    launch=(/bin/bash "$SCRIPT_DIR/lib/launch.sh" "$SESSION_DIR/launch.env")
+
+    # setpriv --pdeathsig KILL on every shape: launch.sh outlives bwrap, so
+    # the process between sbx and bwrap needs its own parent-death signal.
+    # Under pasta, which forks its child, a SIGKILLed sbx still orphans
+    # launch.sh — networkless once pasta is gone, and --gc judges the
+    # session by sbx's pid.
+    if [[ "$SBX_NETNS" != "true" ]]; then
+        echo "Starting session $SESSION_ID..."
+        # A: this user as 0 in a new user namespace, with an empty network.
+        setpriv --pdeathsig KILL -- unshare --user --map-root-user --net -- "${launch[@]}"
+        return
+    fi
+
+    # -T / -U are the whole host-access allow-list: pasta binds exactly
+    # these ports and splices them to the host's loopback; "none" replaces
+    # its default of forwarding every bound host port, and separate lists
+    # stop a TCP grant from carrying its UDP twin. --no-map-gw: otherwise
+    # the gateway address reaches every host-local service.
+    pasta=(pasta -f --config-net --no-map-gw -T "$tcp" -U "$udp"
            --interface "$HOST_IFACE" --no-ndp --no-dhcpv6 --no-ra
            -a "$HOST_IP" -g "$HOST_GW" -n "$HOST_MASK")
     if [[ "$USERNS_FULL" == "true" ]]; then
         echo "Starting session $SESSION_ID with networking (full userns)..."
-        # unshare claims the user's /etc/subuid range through the setuid
-        # newuidmap, so pasta must not create a user namespace of its own,
-        # which would discard the multi-UID mapping: --netns-only.
+        # unshare claims the subordinate range through the setuid newuidmap;
+        # pasta must not make a user namespace of its own (--netns-only).
         setpriv --pdeathsig KILL -- unshare --map-auto --map-root-user -- \
-            "${PASTA[@]}" --netns-only -- "${LAUNCH[@]}"
-    else
-        if [[ "$NET_MODE" == "dns" ]]; then
-            echo "Starting session $SESSION_ID with networking..."
-        else
-            HOST_PORT_DESC=""
-            [[ "$PASTA_FWD_TCP" != "none" ]] && HOST_PORT_DESC="tcp $PASTA_FWD_TCP"
-            if [[ "$PASTA_FWD_UDP" != "none" ]]; then
-                [[ -n "$HOST_PORT_DESC" ]] && HOST_PORT_DESC+=", "
-                HOST_PORT_DESC+="udp $PASTA_FWD_UDP"
-            fi
-            echo "Starting session $SESSION_ID with host ports $HOST_PORT_DESC (no internet)..."
-        fi
-        setpriv --pdeathsig KILL -- "${PASTA[@]}" -- "${LAUNCH[@]}"
+            "${pasta[@]}" --netns-only -- "${launch[@]}"
+        return
     fi
-else
-    echo "Starting session $SESSION_ID..."
-    # The control namespace A for a session without networking: this user
-    # mapped to 0 in a new user namespace, and an empty network namespace.
-    setpriv --pdeathsig KILL -- unshare --user --map-root-user --net -- "${LAUNCH[@]}"
-fi
+    if [[ "$NET_ENABLED" == "true" ]]; then
+        echo "Starting session $SESSION_ID with networking..."
+    else
+        desc=""
+        if [[ "$tcp" != "none" ]]; then
+            desc="tcp $tcp"
+        fi
+        if [[ "$udp" != "none" ]]; then
+            desc+="${desc:+, }udp $udp"
+        fi
+        echo "Starting session $SESSION_ID with host ports $desc (no internet)..."
+    fi
+    setpriv --pdeathsig KILL -- "${pasta[@]}" -- "${launch[@]}"
+}
+
+main() {
+    parse_args "$@"
+
+    if [[ "$RESEED" == "true" && "$DRY_RUN" == "true" ]]; then
+        echo "Error: --dry-run applies only to a launch; it cannot be combined with --reseed." >&2
+        exit 2
+    fi
+    if [[ "$DRY_RUN" != "true" ]]; then
+        sbx_state_init
+    fi
+    if [[ ${#COMMAND[@]} -eq 0 ]]; then
+        COMMAND=(/bin/bash)
+    fi
+
+    preflight_core
+    resolve_plan
+    if [[ "$DRY_RUN" == "true" ]]; then
+        dry_run_report
+    fi
+    check_plan
+    read_plan_settings
+    preflight_session
+
+    claim_session
+    build_base_args
+    setup_virt
+    add_profile_mounts
+    if [[ "$RESEED" == "true" ]]; then
+        reseed
+    fi
+    seed_forked_mounts
+    seed_record_mounts
+    add_env_and_path
+    setup_network
+    write_session_records
+    setup_gui
+    add_masks
+
+    trap teardown EXIT
+    write_session_files
+    run_session
+}
+
+main "$@"
