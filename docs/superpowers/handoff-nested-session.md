@@ -1,9 +1,15 @@
 # Continue: the nested session environment (paste this into a new session)
 
-State as of 2026-09-23, branch `podman-full-hardening`, not merged into `main`.
-A copy exists on the GitHub remote (an Ubuntu test VM's clone sees
-`origin/podman-full-hardening`); `git log main..HEAD` is the authority on what
-is on it.
+State as of 2026-09-23. Two branches, neither merged into `main`:
+
+- **`podman-full-hardening`** — the nested session environment. Checked out in
+  the main working copy while the user tests it in place; a copy exists on the
+  GitHub remote. 394 tests.
+- **`ubuntu-apparmor`** — branched from it, in `.claude/worktrees/`. Adds the
+  preflight diagnosis for the policies that block a session (see Task 8 below).
+  407 tests.
+
+`git log main..<branch>` is the authority on what each carries.
 
 ## Read these first
 
@@ -38,41 +44,50 @@ Tasks 1-7 are complete, each reviewed with its own fix rounds, plus a
 whole-branch review and one fix wave. Suite: **394/394**, `shellcheck -S error
 sbx sbx-profile lib/*.sh` silent.
 
-## Task 8 is done: Ubuntu was diagnosed, and it is not this branch's problem
+## Task 8 is done: Ubuntu works, with two AppArmor allowances
 
-Measured 2026-09-23 on an Ubuntu 26.04.1 VM (kernel 7.0), reachable over SSH.
-**The nesting mechanism works there**: `tests/userns.bats` 8/8, nested
-namespace creation inside pasta's namespace permitted, and bare `unshare` fine
-once it has its own AppArmor profile. **`sbx` as a whole does not work on
-Ubuntu, and `main` fails identically** — so this is a pre-existing porting gap,
-not a regression.
+Measured on an Ubuntu 26.04.1 VM (kernel 7.0), 2026-09-23. Ubuntu needs exactly
+two policy allowances; with them in place, **in enforce mode, not complain**:
+`nested.bats` 26/26, `hardening.bats` 24/24, `sessions.bats` 43/43,
+`join.bats` 12/12, and `sbx --doctor` exits 0 with every line ticked.
 
-1. **pasta cannot exec the launch script** (its profile allows exec only under
-   `/bin`/`/usr/bin`, `Ux`, and gives `$HOME` write without exec). **Fixed on
-   this branch:** pasta is handed `/bin/bash <launch script>`, which lands
-   inside the profile's allowance and still runs unconfined. Two lines plus
-   four snapshot goldens.
-2. **`unpriv_bwrap` carries `audit deny capability`**, so `setpriv
-   --bounding-set=-all` fails in every capability-dropping session and
-   `caps: keep` cannot hold capabilities. A local include cannot override a
-   `deny`; the profile must be replaced, which weakens it host-wide. Not fixed
-   — it needs a decision about what to ask Ubuntu users to accept.
-3. **With that profile replaced, sessions still die in the tmux layer**
-   ("server exited unexpectedly"; `main` says "no sessions"). Undiagnosed, and
-   unrelated to namespaces.
+What Ubuntu's policy does, and what answers it:
 
-New on this branch, for Ubuntu specifically: a session without networking
-creates its control namespace with bare `unshare`, which Ubuntu confines into
-`unprivileged_userns` (capabilities denied) unless `unshare` has a profile of
-its own, e.g.
+1. **pasta could not exec the generated launch script.** Its profile grants
+   exec only under `/bin` and `/usr/bin` (`/{usr/,}bin/** Ux`) and gives `$HOME`
+   write without exec. **Fixed in code on the nested-session branch:** pasta is
+   handed `/bin/bash <launch script>`, which lands inside that allowance, and
+   `Ux` still runs the script unconfined.
+2. **`unpriv_bwrap` carries `audit deny capability`**, so the `setpriv`
+   bounding-set drop that every session performs fails, and `caps: keep` cannot
+   hold capabilities at all. A `local/` include cannot relax it — AppArmor's
+   deny beats a later allow — so Ubuntu's bwrap profile has to be retired in
+   favour of a permissive one. That re-allows capabilities inside every bwrap
+   sandbox on the machine, which is the cost `--doctor` states out loud.
+3. **A binary that creates its own user namespace lands in
+   `unprivileged_userns`**, which denies the capabilities that namespace needs.
+   That hits `unshare`, which builds the control namespace for a session with
+   no networking and for every `userns: full` session, so `unshare` needs a
+   profile of its own.
 
-    profile sbx-unshare /usr/bin/unshare flags=(unconfined) { userns, }
+The `ubuntu-apparmor` branch adds the diagnosis rather than working around any
+of it: two probes that run exactly what a launch runs (the bounding-set drop
+inside a sandbox; `unshare` creating a user + network namespace together), a
+preflight that refuses before building a session, `--doctor` reporting both with
+the remedy and its cost, and the dry run showing them as `sandbox caps` and
+`unshare ns`. Verified on stock policy: the launch exits 1 naming the policy and
+leaves no session state behind.
 
-`sbx --doctor` does not mention that yet; it should, alongside the bwrap advice
-it already prints.
+**Decision on record (the user's, 2026-09-23): never skip a hardening step.**
+sbx does not adapt by dropping the bounding-set drop where the platform forbids
+it — a session either gets the guarantee or does not start. A test asserts the
+remedy text never offers to skip, ignore, bypass or disable it.
 
-If you pick Ubuntu support up as its own effort, the tmux failure (3) is the
-first thing to diagnose, since it blocks everything regardless of AppArmor.
+Not diagnosed, because it turned out not to exist: an apparent "tmux layer"
+failure in the first Ubuntu run was `TERM=dumb` in a non-interactive SSH
+session — the tmux *client* could not attach, so a session that had in fact run
+its payload looked dead from outside. Use a real `TERM` when driving sbx over
+SSH.
 
 ## Follow-ups, none blocking
 
