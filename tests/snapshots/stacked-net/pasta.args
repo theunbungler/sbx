@@ -17,4 +17,5 @@ snap0
 -n
 24
 --
+/bin/bash
 @ROOT@/h/.local/state/sbx/sessions/proj/launch.sh

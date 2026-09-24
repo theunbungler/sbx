@@ -2222,6 +2222,15 @@ if [[ "$PASTA_FWD_UDP" != "none" ]]; then
     HOST_PORT_DESC+="udp $PASTA_FWD_UDP"
 fi
 
+# pasta is handed "/bin/bash <launch script>" rather than the script itself.
+# Ubuntu ships an AppArmor profile for pasta that grants exec only under /bin
+# and /usr/bin ("/{usr/,}bin/** Ux") and gives $HOME write access without
+# exec, so pasta exec-ing the generated launch script is refused outright
+# ("Failed to start command or shell: Permission denied"; measured on Ubuntu
+# 26.04, 2026-09-23). Naming the interpreter keeps the exec inside what the
+# profile allows, and Ux means the script still runs unconfined, exactly as it
+# does where no such profile exists. Harmless on every other distribution.
+#
 # setpriv --pdeathsig KILL is applied uniformly across every dispatch below.
 # For the no-net shape it genuinely closes a gap: launch.sh now always
 # outlives bwrap (to release B and the relays), so a bash process sits
@@ -2250,7 +2259,7 @@ if [[ "$SBX_NETNS" == "true" ]]; then
         # multi-UID mapping): --netns-only.
         setpriv --pdeathsig KILL -- \
             unshare --map-auto --map-root-user -- \
-            pasta -f --config-net --netns-only --no-map-gw "${PASTA_PORT_ARGS[@]}" --interface "$HOST_IFACE" --no-ndp --no-dhcpv6 --no-ra -a "$HOST_IP" -g "$HOST_GW" -n "$HOST_MASK" -- "$LAUNCH_SCRIPT"
+            pasta -f --config-net --netns-only --no-map-gw "${PASTA_PORT_ARGS[@]}" --interface "$HOST_IFACE" --no-ndp --no-dhcpv6 --no-ra -a "$HOST_IP" -g "$HOST_GW" -n "$HOST_MASK" -- /bin/bash "$LAUNCH_SCRIPT"
     else
         if [[ ${#NET_PROFILES[@]} -gt 0 ]]; then
             echo "Starting session $SESSION_ID with networking..."
@@ -2258,7 +2267,7 @@ if [[ "$SBX_NETNS" == "true" ]]; then
             echo "Starting session $SESSION_ID with host ports $HOST_PORT_DESC (no internet)..."
         fi
         setpriv --pdeathsig KILL -- \
-            pasta -f --config-net --no-map-gw "${PASTA_PORT_ARGS[@]}" --interface "$HOST_IFACE" --no-ndp --no-dhcpv6 --no-ra -a "$HOST_IP" -g "$HOST_GW" -n "$HOST_MASK" -- "$LAUNCH_SCRIPT"
+            pasta -f --config-net --no-map-gw "${PASTA_PORT_ARGS[@]}" --interface "$HOST_IFACE" --no-ndp --no-dhcpv6 --no-ra -a "$HOST_IP" -g "$HOST_GW" -n "$HOST_MASK" -- /bin/bash "$LAUNCH_SCRIPT"
     fi
 else
     echo "Starting session $SESSION_ID..."

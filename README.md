@@ -98,6 +98,14 @@ For networked sessions it also checks that the running kernel can load the
 holds its firewall. After a kernel upgrade that check fails until you
 reboot.
 
+**Ubuntu is not currently supported end to end.** Measured on 26.04: its
+AppArmor profile for bwrap strips every capability inside the sandbox, which
+breaks the capability drop every session performs, and `caps: keep` sessions
+outright; relaxing it means replacing that profile for every bwrap user on the
+machine. Sessions without networking additionally need `unshare` allowed to
+create namespaces. Arch and its derivatives are what sbx is developed and
+tested on.
+
 A launch runs the same checks for just the groups it needs, and stops
 before building a session.
 

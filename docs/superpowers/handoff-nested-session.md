@@ -1,7 +1,9 @@
 # Continue: the nested session environment (paste this into a new session)
 
-State as of 2026-09-23, branch `podman-full-hardening` (19 commits ahead of
-`main`, nothing merged, nothing pushed).
+State as of 2026-09-23, branch `podman-full-hardening`, not merged into `main`.
+A copy exists on the GitHub remote (an Ubuntu test VM's clone sees
+`origin/podman-full-hardening`); `git log main..HEAD` is the authority on what
+is on it.
 
 ## Read these first
 
@@ -36,38 +38,41 @@ Tasks 1-7 are complete, each reviewed with its own fix rounds, plus a
 whole-branch review and one fix wave. Suite: **394/394**, `shellcheck -S error
 sbx sbx-profile lib/*.sh` silent.
 
-## The one thing left: Task 8, on Ubuntu 24.04
+## Task 8 is done: Ubuntu was diagnosed, and it is not this branch's problem
 
-**This is the merge gate.** Every session now creates a nested user namespace,
-and a session without networking starts A with `unshare --user --map-root-user
---net` — an unconfined binary doing exactly what Ubuntu's
-`apparmor_restrict_unprivileged_userns` refuses. Before this change no session
-took that path; now every one does.
+Measured 2026-09-23 on an Ubuntu 26.04.1 VM (kernel 7.0), reachable over SSH.
+**The nesting mechanism works there**: `tests/userns.bats` 8/8, nested
+namespace creation inside pasta's namespace permitted, and bare `unshare` fine
+once it has its own AppArmor profile. **`sbx` as a whole does not work on
+Ubuntu, and `main` fails identically** — so this is a pre-existing porting gap,
+not a regression.
 
-On a real Ubuntu 24.04 install (a VM — WSL2 usually does not enforce AppArmor,
-so a green run there does not clear the gate):
+1. **pasta cannot exec the launch script** (its profile allows exec only under
+   `/bin`/`/usr/bin`, `Ux`, and gives `$HOME` write without exec). **Fixed on
+   this branch:** pasta is handed `/bin/bash <launch script>`, which lands
+   inside the profile's allowance and still runs unconfined. Two lines plus
+   four snapshot goldens.
+2. **`unpriv_bwrap` carries `audit deny capability`**, so `setpriv
+   --bounding-set=-all` fails in every capability-dropping session and
+   `caps: keep` cannot hold capabilities. A local include cannot override a
+   `deny`; the profile must be replaced, which weakens it host-wide. Not fixed
+   — it needs a decision about what to ask Ubuntu users to accept.
+3. **With that profile replaced, sessions still die in the tmux layer**
+   ("server exited unexpectedly"; `main` says "no sessions"). Undiagnosed, and
+   unrelated to namespaces.
 
-```bash
-sysctl kernel.apparmor_restrict_unprivileged_userns     # expect 1 on stock 24.04
-unshare --user --map-root-user --net true && echo OK    # the new exposure
-bwrap --unshare-user --ro-bind / / true && echo OK      # what sbx already needed
-sudo aa-status | head
-./sbx --doctor                                          # prints the apt line for what is missing
-bats tests/userns.bats tests/nestnet.bats               # the mechanism, fast
-bats tests/nested.bats tests/hardening.bats             # real sessions, minutes
-bats tests/                                             # everything
-```
+New on this branch, for Ubuntu specifically: a session without networking
+creates its control namespace with bare `unshare`, which Ubuntu confines into
+`unprivileged_userns` (capabilities denied) unless `unshare` has a profile of
+its own, e.g.
 
-If a check fails, capture the message and `sudo dmesg | grep -i apparmor | tail
--20`: the denial names the profile and operation a fix must target. Toggling
-`kernel.apparmor_restrict_unprivileged_userns=0` separates "AppArmor blocked it"
-from "something else broke" — a diagnostic, not a recommendation. The fix, if
-needed, belongs in the AppArmor profile text `sbx --doctor` already prints.
+    profile sbx-unshare /usr/bin/unshare flags=(unconfined) { userns, }
 
-Expect two harmless differences there: Ubuntu ships podman 4.9, not 6.1.1, so
-the default-network DNS quirk Task 6 fixes may not exist (the fix is harmless
-either way, but a failure is worth capturing); and the container tests skip
-without a local alpine image.
+`sbx --doctor` does not mention that yet; it should, alongside the bwrap advice
+it already prints.
+
+If you pick Ubuntu support up as its own effort, the tmux failure (3) is the
+first thing to diagnose, since it blocks everything regardless of AppArmor.
 
 ## Follow-ups, none blocking
 

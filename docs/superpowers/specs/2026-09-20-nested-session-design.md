@@ -90,10 +90,35 @@ Four spikes (kernel 6.12.104 and 6.12.108 Manjaro, bwrap 0.12.0, podman
    - `setpriv --pdeathsig KILL` survives `unshare --user`: B's holder dies
      when the script that started it is SIGKILLed.
 
-**Still open:** Ubuntu 24.04's AppArmor userns restriction. Sessions without
-networking now create A with `unshare`, which Ubuntu's default policy may
-refuse for an unconfined binary, and B is created from inside A. This blocks
-merging, not starting, and is checked on a real machine.
+**Ubuntu, measured 2026-09-23** (26.04.1, kernel 7.0, on a VM with SSH access):
+the nesting mechanism works — `tests/userns.bats` passes 8/8, creating the
+nested namespace inside pasta's namespace is permitted, and a bare `unshare`
+works once it has an AppArmor profile of its own. What does NOT work is `sbx`
+itself, and it did not work before this branch either (`main` fails the same
+way). Three separate, pre-existing problems:
+
+1. **pasta cannot exec the generated launch script.** Ubuntu's profile for
+   pasta grants exec only under `/bin` and `/usr/bin` (`/{usr/,}bin/** Ux`)
+   and gives `$HOME` write access without exec, so the exec is refused
+   ("Failed to start command or shell: Permission denied"). Fixed on this
+   branch by handing pasta `/bin/bash <launch script>`: the exec then lands
+   inside what the profile allows, and `Ux` runs the script unconfined.
+2. **Ubuntu strips every capability inside a bwrap user namespace.** Its
+   `bwrap-userns-restrict` profile transitions bwrap's children into
+   `unpriv_bwrap`, which carries `audit deny capability`. That breaks
+   `setpriv --bounding-set=-all` in every capability-dropping session (exit
+   127) and makes `caps: keep` impossible. A local include cannot relax it —
+   AppArmor's `deny` beats a later `allow` — so the profile has to be
+   replaced, which weakens that protection for every bwrap user on the host.
+3. **With that profile replaced, sessions still fail in the tmux layer**
+   ("server exited unexpectedly" here, "no sessions" on `main`), which is
+   unrelated to namespaces and undiagnosed.
+
+So Ubuntu support is its own piece of work, and this design is not what
+blocks it. A session without networking additionally needs `unshare` to be
+allowed to create namespaces (an AppArmor profile naming it, as
+`sbx --doctor` already suggests for bwrap) — that part IS new here, since no
+session used bare `unshare` before.
 
 ## Design
 
