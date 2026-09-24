@@ -17,22 +17,9 @@ setup() {
     [ "$output" = "-home-user-projA" ]
 }
 
-@test "seed copies a directory's contents from the host" {
-    echo hello > "$SRC/a.txt"
-    sbx_copy_seed "$SRC" "$TMP"
-    [ "$(cat "$TMP/a.txt")" = "hello" ]
-}
-
-@test "seed copies a single file into the working directory" {
-    echo hi > "$WORK/one.txt"
-    sbx_copy_seed "$WORK/one.txt" "$TMP"
-    [ "$(cat "$TMP/one.txt")" = "hi" ]
-}
-
-@test "seed is a no-op when the source does not exist" {
-    sbx_copy_seed "$WORK/missing" "$TMP"
-    [ -d "$TMP" ]
-    [ -z "$(ls -A "$TMP")" ]
+@test "seed_progress creates nothing when the source does not exist" {
+    sbx_copy_seed_progress "$WORK/missing" "$TMP" test 2>/dev/null
+    [ ! -e "$TMP" ]
 }
 
 @test "manifest_build records a hash per file" {
@@ -170,7 +157,7 @@ setup() {
     [ -f "$SRC/$output" ]
 }
 
-@test "seed_progress copies the tree like seed does" {
+@test "seed_progress copies a directory's contents" {
     mkdir -p "$SRC/sub"
     echo one > "$SRC/a.txt"
     echo two > "$SRC/sub/b.txt"

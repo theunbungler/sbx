@@ -1376,7 +1376,7 @@ RECORD_WORK_DIR="$STATE_DIR/work/$SESSION_ID"
 # Removed, not merely created. teardown() clears this at the end of a normal
 # session, but a session killed by SIGKILL, OOM or power loss never runs it,
 # and the next launch from the same directory reclaims the same name and so
-# lands on the same path. sbx_copy_seed's `cp -a "$src/." "$tmp/"` MERGES
+# lands on the same path. sbx_copy_seed_progress's `cp -a "$src/." "$tmp/"` MERGES
 # into a non-empty destination rather than replacing it, and the manifest is
 # built afterwards over the merged tree — so a ghost file from the dead
 # session is folded into the BASELINE, reads as unchanged host state, never
@@ -1420,13 +1420,16 @@ BWRAP_ARGS+=(--setenv PATH "$SESSION_DIR/bin:$SANDBOX_PATH")
 
 # Network Setup
 if [[ "$SBX_NETNS" == "true" ]]; then
-    # Detect host network settings for manual injection if pasta auto-config fails
+    # The host's default-route interface and address, handed to pasta
+    # explicitly (--interface, -a, -g, -n) so the namespace mirrors it.
     HOST_IFACE=$(ip route show default | awk '{print $5}' | head -n 1)
+    if [[ -z "$HOST_IFACE" ]]; then
+        echo "Error: networking needs a default route on the host, and there is none." >&2
+        exit 1
+    fi
     HOST_IP=$(ip addr show "$HOST_IFACE" | grep "inet " | awk '{print $2}' | cut -d/ -f1 | head -n 1)
     HOST_GW=$(ip route show default | awk '{print $3}' | head -n 1)
     HOST_MASK=$(ip addr show "$HOST_IFACE" | grep "inet " | awk '{print $2}' | cut -d/ -f2 | head -n 1)
-    
-    export HOST_IFACE HOST_IP HOST_GW HOST_MASK
 
     DNS_DIR="$SESSION_DIR/dns"
     mkdir -p "$DNS_DIR"
@@ -1614,16 +1617,13 @@ if [[ "$SBX_NETNS" == "true" ]]; then
 fi
 
 # Session State Persistence
-cat > "$SESSION_DIR/session.json" <<EOF
-{
-    "id": "$SESSION_ID",
-    "cwd": "$PWD",
-    "pid": $$,
-    "fs_profiles": $(printf '%s\n' "${FS_PROFILES[@]}" | jq -R . | jq -s .),
-    "net_profiles": $(printf '%s\n' "${NET_PROFILES[@]}" | jq -R . | jq -s 'map(select(. != ""))'),
-    "cli_profile": $([[ -n "$CLI_PROFILE" ]] && jq -R . <<< "$CLI_PROFILE" || echo "null")
-}
-EOF
+jq -n --indent 4 --arg id "$SESSION_ID" --arg cwd "$PWD" --argjson pid "$$" \
+    --argjson fs "$(sbx_resolve_strings "${FS_PROFILES[@]}")" \
+    --argjson net "$(sbx_resolve_strings "${NET_PROFILES[@]}")" \
+    --arg cli "$CLI_PROFILE" \
+    '{id: $id, cwd: $cwd, pid: $pid, fs_profiles: $fs, net_profiles: $net,
+      cli_profile: (if $cli == "" then null else $cli end)}' \
+    > "$SESSION_DIR/session.json"
 
 # The join sidecar. Same information session.json would have carried, but
 # kept OUTSIDE $SESSION_DIR on purpose: that directory is bound rw into the
@@ -1648,14 +1648,11 @@ EOF
 #             dir is session.json, which lives inside the sandbox and is
 #             therefore forgeable. workdir above is not a substitute — --wd
 #             makes it a different directory entirely.
-cat > "$STATE_DIR/join/$SESSION_ID.json" <<EOF
-{
-    "path": $(jq -R . <<< "$SESSION_DIR/bin:$SANDBOX_PATH"),
-    "workdir": $(jq -R . <<< "${WORKDIR:-$PWD}"),
-    "caps_keep": $([[ "$CAPS_KEEP" == "true" ]] && echo true || echo false),
-    "forked_stores": $(printf '%s\n' "${FORKED_STORES[@]}" | jq -R . | jq -s 'map(select(. != ""))')
-}
-EOF
+jq -n --indent 4 --arg path "$SESSION_DIR/bin:$SANDBOX_PATH" --arg workdir "${WORKDIR:-$PWD}" \
+    --argjson caps_keep "$CAPS_KEEP" \
+    --argjson forked_stores "$(sbx_resolve_strings "${FORKED_STORES[@]}")" \
+    '{path: $path, workdir: $workdir, caps_keep: $caps_keep, forked_stores: $forked_stores}' \
+    > "$STATE_DIR/join/$SESSION_ID.json"
 
 # GUI Setup (xpra virtual display)
 if [[ "$GUI_FLAG" == "true" ]]; then

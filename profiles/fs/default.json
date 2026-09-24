@@ -1,5 +1,5 @@
 {
-  "description": "Project-specific sources",
+  "description": "Records changes to ./src; read-only /usr/include",
   "mounts": [
     {
       "source": "./src",

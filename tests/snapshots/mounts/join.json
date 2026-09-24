@@ -3,7 +3,7 @@
     "workdir": "/snap/ro",
     "caps_keep": false,
     "forked_stores": [
-  "@ROOT@/h/.local/state/sbx/forked/snapmounts/@ROOT_SLUG@-proj/_snap_state",
-  "@ROOT@/h/.local/state/sbx/forked/snapmounts/@ROOT_SLUG@-proj/_snap_state.json"
-]
+        "@ROOT@/h/.local/state/sbx/forked/snapmounts/@ROOT_SLUG@-proj/_snap_state",
+        "@ROOT@/h/.local/state/sbx/forked/snapmounts/@ROOT_SLUG@-proj/_snap_state.json"
+    ]
 }

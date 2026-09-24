@@ -6,9 +6,7 @@
         "generativelanguage.googleapis.com",
         "*.googleapis.com",
         "accounts.google.com",
-        "*.npmjs.org",
-        "localhost",
-        "127.0.0.1"
+        "*.npmjs.org"
     ],
     "ports": ["*"]
 }

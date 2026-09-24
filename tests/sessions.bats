@@ -31,6 +31,24 @@ run_sbx() {
     wait $bg
 }
 
+@test "a launch directory with a quote and a backslash still lists its session" {
+    local odd="$ROOT/q\"uo\\te"
+    mkdir -p "$odd"
+    cp -r "$PROJ/.sbx" "$odd/"
+    ( cd "$odd" && script -qec \
+        "$SBX --fs t -- /bin/sh -c 'echo up > /out/up.txt; sleep 5'" \
+        /dev/null >/dev/null 2>&1 ) &
+    local bg=$!
+    for _ in $(seq 1 40); do [[ -f "$HOSTDIR/up.txt" ]] && break; sleep 0.25; done
+    local sj
+    sj=$(find "$HOME/.local/state/sbx/sessions" -name session.json | head -n1)
+    [ "$(jq -r .cwd "$sj")" = "$odd" ]
+    run bash -c 'cd "$1" && "$2" --list-sessions' _ "$odd" "$SBX"
+    wait $bg
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"PID:"* ]]
+}
+
 @test "a session directory is removed on exit" {
     run_sbx "--fs t" "true"
     [ -z "$(find "$HOME/.local/state/sbx/sessions" -mindepth 1 2>/dev/null)" ]

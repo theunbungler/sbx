@@ -19,25 +19,6 @@ sbx_copy_path_slug() {
     echo "$1" | tr '/' '-'
 }
 
-# Populate a forked or record mount's working directory from the host source.
-#
-# --reflink=auto makes this metadata-only on btrfs/xfs when src and tmp
-# share a filesystem, and silently falls back to a full copy otherwise. On
-# the design host that is a 37x difference on 300MB (4ms vs 144ms). Callers
-# that want a progress display for the slow fallback path should use
-# sbx_copy_seed_progress below instead of calling this directly.
-sbx_copy_seed() {
-    local src="$1" tmp="$2"
-
-    mkdir -p "$tmp"
-
-    if [[ -d "$src" ]]; then
-        cp -a --reflink=auto "$src/." "$tmp/"
-    elif [[ -f "$src" ]]; then
-        cp -a --reflink=auto "$src" "$tmp/"
-    fi
-}
-
 # Manifest of a tree's file contents, used as the diff baseline for a
 # `record` mount.
 #
@@ -138,7 +119,11 @@ sbx_manifest_deleted() {
         <(cut -d' ' -f3- "$2" | LC_ALL=C sort)
 }
 
-# sbx_copy_seed, with a progress line for copies slow enough to look hung.
+# Populate a forked or record mount's working directory from the host
+# source, with a progress line for copies slow enough to look hung.
+#
+# --reflink=auto makes the copy metadata-only on btrfs/xfs when source and
+# destination share a filesystem, and falls back to a full copy otherwise.
 #
 # Gated on BOTH a time threshold and stderr being a TTY, because the fast
 # path needs no instrumentation at all: a 300MB same-filesystem btrfs seed

@@ -230,7 +230,7 @@ EOF
 # A session killed by SIGKILL, OOM or power loss never runs teardown, so its
 # $STATE_DIR/work/<name>/ tree survives. The next launch from the same
 # directory reclaims the same name and points RECORD_WORK_DIR at that same
-# path — and sbx_copy_seed's `cp -a "$src/." "$tmp/"` MERGES into a
+# path — and sbx_copy_seed_progress's `cp -a "$src/." "$tmp/"` MERGES into a
 # non-empty destination rather than replacing it. The ghost files then get
 # hashed into the launch-time baseline, so they read as unchanged: the
 # sandbox sees files the host does not have, and --changes never mentions

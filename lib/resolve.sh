@@ -103,7 +103,7 @@ sbx_resolve() {
         done < <(sbx_profile_check "$type" "$p" "$origin")
 
         # A version-controlled project profile arrived with the repository;
-        # using it is the user's explicit decision (see confirm_project_profile
+        # using it is the user's explicit decision (see prompt_project_profile
         # in sbx). An untracked one is the user's own scratch config.
         if [[ "$origin" == "project" && "${SBX_TRUST_PROJECT_PROFILES:-}" != "1" ]] &&
            git -C "$launch_dir" ls-files --error-unmatch "$p" >/dev/null 2>&1; then

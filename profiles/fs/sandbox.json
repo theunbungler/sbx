@@ -1,5 +1,5 @@
 {
-  "description": "Project-specific sources",
+  "description": "The launch directory, read-write, at /workspace",
   "mounts": [
     {
       "source": "$PWD",
