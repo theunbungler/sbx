@@ -61,6 +61,11 @@ EOF
 if [[ "$*" == "--unshare-user --ro-bind / / true" ]]; then
     exit 0
 fi
+# So must the capability probe, which is the one bwrap invocation whose last
+# argument is /bin/true (a real launch ends with session.sh).
+if [[ "${*: -1}" == "/bin/true" ]]; then
+    exit 0
+fi
 mkdir -p "$SBX_CAPTURE"
 printf '%s\n' "$@" > "$SBX_CAPTURE/bwrap.args"
 # bwrap's last argument is session.sh, inside the session directory.
@@ -75,6 +80,10 @@ exec "$(dirname "$0")/sbx-capture" "$(dirname "${@: -1}")"
 EOF
     cat > "$STUB/unshare" <<'EOF'
 #!/bin/bash
+# The preflight probe for "can unshare make a user + network namespace".
+if [[ "$*" == "--user --map-root-user --net /bin/true" ]]; then
+    exit 0
+fi
 args=("$@")
 while [[ $# -gt 0 && "$1" != "--" ]]; do
     shift

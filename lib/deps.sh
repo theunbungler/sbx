@@ -239,6 +239,94 @@ sbx_deps_userns_check() {
     return 1
 }
 
+# Shared remedy for a host whose policy forbids capabilities inside a bwrap
+# user namespace, or namespace creation by unshare. On Ubuntu both come from
+# AppArmor: bwrap's profile puts its children under "unpriv_bwrap", which
+# carries `audit deny capability`, and an unconfined binary that creates a user
+# namespace lands in "unprivileged_userns", which denies the capabilities that
+# namespace then needs. A local/ include cannot relax either — AppArmor's deny
+# always beats a later allow — so the profile has to be replaced. Measured on
+# Ubuntu 26.04 (2026-09-23): with both allowances every sbx suite passes there.
+sbx_deps_apparmor_remedy() {
+    local bw
+    bw=$(sbx_deps_bwrap_path)
+    if [[ "$(sbx_deps_sysctl kernel/apparmor_restrict_unprivileged_userns)" != "1" ]]; then
+        printf '%s\n' \
+            "Fix: whatever forbids it on this host (AppArmor, SELinux, seccomp, or an outer" \
+            "  container runtime) has to allow capabilities inside an unprivileged user" \
+            "  namespace. sbx does not skip the drop: a session either gets that guarantee" \
+            "  or does not start."
+        return 0
+    fi
+    printf '%s\n' \
+        "Cause: Ubuntu's AppArmor policy (kernel.apparmor_restrict_unprivileged_userns = 1)." \
+        "  Its bwrap profile puts everything inside the sandbox under \"unpriv_bwrap\", which" \
+        "  denies every capability, and confines binaries that create their own user" \
+        "  namespace under \"unprivileged_userns\", which does the same. A local/ include" \
+        "  cannot override those denials."
+    if ! sbx_deps_bwrap_trusted "$bw"; then
+        printf '%s\n' \
+            "Warning: bwrap resolves to \"$bw\", which is not a root-owned system binary." \
+            "  sbx will not suggest an AppArmor exemption for it."
+        return 0
+    fi
+    printf '%s\n' \
+        "Note: this re-allows capabilities inside EVERY bwrap sandbox on this machine," \
+        "  which is what Ubuntu's restriction exists to prevent. Your call to make." \
+        "Fix: as root, retire Ubuntu's bwrap profile:" \
+        "" \
+        "    sudo ln -sf /etc/apparmor.d/bwrap-userns-restrict /etc/apparmor.d/disable/" \
+        "    sudo apparmor_parser -R /etc/apparmor.d/bwrap-userns-restrict" \
+        "" \
+        "  write /etc/apparmor.d/sbx-bwrap:" \
+        "" \
+        "    abi <abi/4.0>," \
+        "    include <tunables/global>" \
+        "    profile sbx-bwrap $bw flags=(unconfined) {" \
+        "      userns," \
+        "    }" \
+        "" \
+        "  write /etc/apparmor.d/sbx-unshare, the same but naming /usr/bin/unshare," \
+        "  then load both:" \
+        "" \
+        "    sudo apparmor_parser -r /etc/apparmor.d/sbx-bwrap /etc/apparmor.d/sbx-unshare"
+}
+
+# Every session empties its capability bounding set with setpriv, which needs
+# CAP_SETPCAP inside the sandbox; bwrap keeps exactly that one capability for
+# it. Where the host forbids capabilities there, setpriv fails with "apply
+# bounding set: Operation not permitted" and the session aborts with status
+# 127, naming setpriv rather than the policy. Probe it as a launch does.
+sbx_deps_caps_check() {
+    local err
+    # /bin/true, not "true": both binaries run without a shell, and a probe
+    # must not depend on what is on PATH inside the sandbox it builds.
+    if err=$(bwrap --ro-bind / / --unshare-user --cap-drop ALL --cap-add CAP_SETPCAP -- \
+             setpriv --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- /bin/true 2>&1 >/dev/null); then
+        return 0
+    fi
+    echo "Error: the capability bounding set cannot be emptied inside a sandbox, which every session does."
+    echo "  It reported: $err"
+    sbx_deps_apparmor_remedy
+    return 1
+}
+
+# A session without networking, and every "userns": "full" session, creates its
+# control namespace with unshare rather than pasta. A host that confines an
+# unconfined binary for creating a user namespace then refuses the network
+# namespace that goes with it ("unshare failed: Operation not permitted").
+sbx_deps_nsunshare_check() {
+    local err
+    if err=$(unshare --user --map-root-user --net /bin/true 2>&1 >/dev/null); then
+        return 0
+    fi
+    echo "Error: unshare cannot create a user and network namespace together, which a session"
+    echo "  without networking — and every \"userns\": \"full\" session — needs."
+    echo "  It reported: $err"
+    sbx_deps_apparmor_remedy
+    return 1
+}
+
 # userns: full maps the user's subordinate range through newuidmap, which
 # refuses outright without an entry. Entries may name the user or the UID.
 sbx_deps_subids_ok() {
@@ -303,6 +391,16 @@ sbx_deps_require() {
     fi
     if [[ " $* " == *" core "* ]]; then
         sbx_deps_userns_check >&2 || return 1
+        # Both of these used to surface as a failure mid-launch, blaming the
+        # tool that hit the wall (setpriv, or unshare) rather than the policy
+        # that put it there. Refuse up front instead, with the remedy.
+        sbx_deps_caps_check >&2 || return 1
+    fi
+    # unshare builds the control namespace for a session with no networking,
+    # and for every userns: full session. A plain networked session gets its
+    # namespace from pasta, which needs no such allowance.
+    if [[ " $* " == *" nsunshare "* ]]; then
+        sbx_deps_nsunshare_check >&2 || return 1
     fi
     if [[ " $* " == *" net "* ]] && ! sbx_deps_veth_ok; then
         local -a veth_lines
@@ -332,6 +430,7 @@ sbx_deps_doctor() {
     [[ "${1:-}" == "--json" ]] && json=true
 
     local family group rc=0 userns=null userns_msg="" subids=false veth=false user line
+    local caps=null caps_msg="" nsunshare=null nsunshare_msg=""
     local -a missing tools all_missing=() hint=()
     local -A group_missing=()
 
@@ -350,6 +449,24 @@ sbx_deps_doctor() {
             userns=true
         else
             userns=false
+            rc=1
+        fi
+        # Only meaningful once a namespace can be created at all: the probe
+        # runs inside one.
+        if [[ "$userns" == "true" ]]; then
+            if caps_msg=$(sbx_deps_caps_check); then
+                caps=true
+            else
+                caps=false
+                rc=1
+            fi
+        fi
+    fi
+    if command -v unshare >/dev/null 2>&1; then
+        if nsunshare_msg=$(sbx_deps_nsunshare_check); then
+            nsunshare=true
+        else
+            nsunshare=false
             rc=1
         fi
     fi
@@ -372,7 +489,8 @@ sbx_deps_doctor() {
             printf '"%s":%s' "$group" "$(sbx_deps_json_list ${group_missing[$group]})"
             first=0
         done
-        printf '},"userns":%s,"subids":%s,"veth":%s,"install":%s}\n' "$userns" "$subids" "$veth" "$(sbx_deps_json_list "${hint[@]}")"
+        printf '},"userns":%s,"caps":%s,"nsunshare":%s,"subids":%s,"veth":%s,"install":%s}\n' \
+            "$userns" "$caps" "$nsunshare" "$subids" "$veth" "$(sbx_deps_json_list "${hint[@]}")"
         return $rc
     fi
 
@@ -395,6 +513,25 @@ sbx_deps_doctor() {
                         while IFS= read -r line; do
                             echo "           $line"
                         done <<< "$userns_msg"
+                        ;;
+                esac
+                case "$caps" in
+                    true)  echo "         ✓ capabilities usable inside a sandbox (the bounding-set drop)" ;;
+                    false)
+                        echo "         ✗ capabilities usable inside a sandbox (the bounding-set drop)"
+                        while IFS= read -r line; do
+                            echo "           $line"
+                        done <<< "$caps_msg"
+                        ;;
+                esac
+                case "$nsunshare" in
+                    true)  echo "         ✓ unshare can create a user + network namespace" ;;
+                    false)
+                        echo "         ✗ unshare can create a user + network namespace"
+                        echo "           (sessions without networking, and every \"userns\": \"full\" session)"
+                        while IFS= read -r line; do
+                            echo "           $line"
+                        done <<< "$nsunshare_msg"
                         ;;
                 esac
                 ;;
@@ -428,19 +565,26 @@ sbx_deps_doctor() {
 }
 
 # Report-only form of sbx_deps_require, for --dry-run: which of the given
-# groups' tools are missing, whether the user-namespace probe passes (only
-# when core is requested and bwrap exists), whether subordinate IDs exist
-# (only with --subids), and whether the running kernel has the veth module
-# (only when net is requested). Prints one JSON object and returns 0 either
-# way — .ok carries the verdict, so the caller can show everything before
-# deciding its exit status.
-sbx_deps_status() {   # [--subids] <group>...
+# groups' tools are missing, whether the user-namespace probe passes and
+# capabilities are usable inside a sandbox (only when core is requested and
+# bwrap exists), whether unshare can create a user + network namespace (only
+# with --nsunshare, i.e. for the session shapes that need it), whether
+# subordinate IDs exist (only with --subids), and whether the running kernel
+# has the veth module (only when net is requested). Prints one JSON object and
+# returns 0 either way — .ok carries the verdict, so the caller can show
+# everything before deciding its exit status.
+sbx_deps_status() {   # [--subids] <group>... [nsunshare]
     local want_subids=false group ok=true userns=null subids=null veth=null groups_json=""
+    local caps=null nsunshare=null
+    local want_nsunshare=false
     local -a missing all_missing=() hint=()
-    if [[ "${1:-}" == "--subids" ]]; then
-        want_subids=true
-        shift
-    fi
+    while true; do
+        case "${1:-}" in
+            --subids)    want_subids=true; shift ;;
+            --nsunshare) want_nsunshare=true; shift ;;
+            *)           break ;;
+        esac
+    done
     for group in "$@"; do
         mapfile -t missing < <(sbx_deps_missing "$group")
         if [[ -n "$groups_json" ]]; then
@@ -460,6 +604,24 @@ sbx_deps_status() {   # [--subids] <group>...
             userns=false
             ok=false
         fi
+        # The capability probe runs inside a namespace, so it only means
+        # anything once one can be created.
+        if [[ "$userns" == "true" ]]; then
+            if sbx_deps_caps_check >/dev/null 2>&1; then
+                caps=true
+            else
+                caps=false
+                ok=false
+            fi
+        fi
+    fi
+    if [[ "$want_nsunshare" == "true" ]]; then
+        if sbx_deps_nsunshare_check >/dev/null 2>&1; then
+            nsunshare=true
+        else
+            nsunshare=false
+            ok=false
+        fi
     fi
     if [[ "$want_subids" == "true" ]]; then
         if sbx_deps_subids_ok; then
@@ -477,6 +639,7 @@ sbx_deps_status() {   # [--subids] <group>...
             ok=false
         fi
     fi
-    printf '{"groups":{%s},"userns":%s,"subids":%s,"veth":%s,"install":%s,"ok":%s}\n' \
-        "$groups_json" "$userns" "$subids" "$veth" "$(sbx_deps_json_list "${hint[@]}")" "$ok"
+    printf '{"groups":{%s},"userns":%s,"caps":%s,"nsunshare":%s,"subids":%s,"veth":%s,"install":%s,"ok":%s}\n' \
+        "$groups_json" "$userns" "$caps" "$nsunshare" "$subids" "$veth" \
+        "$(sbx_deps_json_list "${hint[@]}")" "$ok"
 }

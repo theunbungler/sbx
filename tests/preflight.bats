@@ -106,6 +106,44 @@ no_session_built() {
     no_session_built
 }
 
+@test "a sandbox that cannot drop its bounding set stops the launch, blaming the policy" {
+    # Ubuntu's shape: bwrap may create a user namespace, but nothing inside it
+    # may hold a capability. Before this check the launch got as far as setpriv
+    # and failed with "apply bounding set: Operation not permitted", naming the
+    # wrong culprit and leaving a half-built session behind.
+    rm "$ROOT/bin/bwrap"
+    cat > "$ROOT/bin/bwrap" <<'EOF'
+#!/bin/sh
+for a in "$@"; do
+    if [ "$a" = "--cap-add" ]; then
+        echo "setpriv: apply bounding set: Operation not permitted" >&2
+        exit 1
+    fi
+done
+exit 0
+EOF
+    chmod +x "$ROOT/bin/bwrap"
+    mkdir -p "$ROOT/sys/kernel"
+    echo 1 > "$ROOT/sys/kernel/apparmor_restrict_unprivileged_userns"
+    run env PATH="$ROOT/bin" SBX_OS_RELEASE="$ROOT/ubuntu" SBX_PROC_SYS="$ROOT/sys" \
+        bash -c 'cd "$1" && shift && "$@" < /dev/null 2>&1' _ "$ROOT/p" "$SBX" -- /bin/true
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"bounding set cannot be emptied"* ]]
+    [[ "$output" == *"unpriv_bwrap"* ]]
+    no_session_built
+}
+
+@test "a session without networking stops when unshare may not create namespaces" {
+    rm "$ROOT/bin/unshare"
+    printf '#!/bin/sh\necho "unshare: unshare failed: Operation not permitted" >&2\nexit 1\n' > "$ROOT/bin/unshare"
+    chmod +x "$ROOT/bin/unshare"
+    run env PATH="$ROOT/bin" SBX_OS_RELEASE="$ROOT/ubuntu" SBX_PROC_SYS="$ROOT/sys" \
+        bash -c 'cd "$1" && shift && "$@" < /dev/null 2>&1' _ "$ROOT/p" "$SBX" -- /bin/true
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"user and network namespace"* ]]
+    no_session_built
+}
+
 @test "userns: full without a subordinate range stops with the usermod line" {
     mkdir -p "$HOME/.config/sbx/profiles/fs"
     echo '{"description":"t","userns":"full"}' > "$HOME/.config/sbx/profiles/fs/full.json"

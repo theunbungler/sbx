@@ -98,13 +98,16 @@ For networked sessions it also checks that the running kernel can load the
 holds its firewall. After a kernel upgrade that check fails until you
 reboot.
 
-**Ubuntu is not currently supported end to end.** Measured on 26.04: its
-AppArmor profile for bwrap strips every capability inside the sandbox, which
-breaks the capability drop every session performs, and `caps: keep` sessions
-outright; relaxing it means replacing that profile for every bwrap user on the
-machine. Sessions without networking additionally need `unshare` allowed to
-create namespaces. Arch and its derivatives are what sbx is developed and
-tested on.
+**Ubuntu needs two AppArmor allowances.** Its policy lets bwrap create a user
+namespace but denies every capability inside it, and confines any other binary
+that creates one. sbx needs capabilities there for one step — emptying the
+capability bounding set, which is what stops anything in the session from
+regaining privilege — and it will not skip that step: a session either gets the
+guarantee or does not start. `--doctor` probes both and prints the profiles to
+install, including what they cost: re-allowing capabilities inside bwrap
+sandboxes applies to every bwrap sandbox on the machine, which is what Ubuntu's
+restriction exists to prevent. With both in place, every suite passes on Ubuntu
+26.04. Arch and its derivatives are what sbx is developed and tested on.
 
 A launch runs the same checks for just the groups it needs, and stops
 before building a session.

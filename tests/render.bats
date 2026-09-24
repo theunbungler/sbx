@@ -135,6 +135,13 @@ line() {   # <prefix> -> the first output line starting with it
     [ "$(line Needs)" = "Needs      core ✓ · userns ✓" ]
 }
 
+@test "needs shows the sandbox-capability and unshare probes only when they ran" {
+    render '.needs = {groups:{core:[]}, userns:true, caps:false, nsunshare:false, subids:null, veth:null, install:[], ok:false}'
+    [ "$(line Needs)" = "Needs      core ✓ · userns ✓ · sandbox caps ✗ · unshare ns ✗" ]
+    render '.needs = {groups:{core:[]}, userns:true, caps:true, nsunshare:null, subids:null, veth:null, install:[], ok:true}'
+    [ "$(line Needs)" = "Needs      core ✓ · userns ✓ · sandbox caps ✓" ]
+}
+
 @test "errors are listed, the plan sections are omitted, and the launch would stop" {
     render '.errors = ["/p.json: .mount: unknown field for a fs profile"] | .proceed = false'
     [ "$(line Errors)" = "Errors     /p.json: .mount: unknown field for a fs profile" ]

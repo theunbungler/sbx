@@ -711,6 +711,12 @@ if [[ "$DRY_RUN" == "true" ]]; then
     if [[ "$(plan_get '.security.userns_full')" == "true" ]]; then
         DRY_DEPS_ARGS+=(--subids)
     fi
+    # unshare builds the control namespace for a session with no networking,
+    # and for userns: full (where it claims the subuid range before pasta
+    # starts). A plain networked session gets that namespace from pasta.
+    if [[ "$(plan_get '.netns')" != "true" || "$(plan_get '.security.userns_full')" == "true" ]]; then
+        DRY_DEPS_ARGS+=(--nsunshare)
+    fi
     mapfile -t DRY_GROUPS < <(plan_get '.deps[]')
     DRY_NEEDS=$(sbx_deps_status "${DRY_DEPS_ARGS[@]}" "${DRY_GROUPS[@]}")
     DRY_WRITES=$(sbx_state_writes "$PLAN" "$STATE_DIR" "$PWD" "${XAUTHORITY:-$HOME/.Xauthority}")
@@ -804,7 +810,14 @@ NEST_TCP=$(IFS=,; echo "${HOST_PORTS_TCP[*]}")
 NEST_UDP=$(IFS=,; echo "${HOST_PORTS_UDP[*]}")
 
 # --- Dependency preflight: optional groups ---
+# "nsunshare" is not a tool group: it asks sbx_deps_require to prove that
+# unshare may create a user + network namespace, which the shapes below build
+# their control namespace with. A plain networked session gets that namespace
+# from pasta and needs no such proof.
 mapfile -t DEP_GROUPS < <(plan_get '.deps[] | select(. != "core")')
+if [[ "$SBX_NETNS" != "true" || "$USERNS_FULL" == "true" ]]; then
+    DEP_GROUPS+=(nsunshare)
+fi
 if [[ ${#DEP_GROUPS[@]} -gt 0 ]]; then
     sbx_deps_require "${DEP_GROUPS[@]}" || exit 1
 fi

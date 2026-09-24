@@ -112,6 +112,144 @@ fake_sysctl() {   # <relative path under /proc/sys> <value>
     [ -z "$output" ]
 }
 
+fake_unshare() {   # <exit-status> [<stderr>]
+    mkdir -p "$FIX/bin"
+    printf '#!/bin/sh\necho "%s" >&2\nexit %s\n' "${2:-}" "$1" > "$FIX/bin/unshare"
+    chmod +x "$FIX/bin/unshare"
+}
+
+# A bwrap that can create a user namespace but whose sandbox has no
+# capabilities — i.e. Ubuntu's shape. The userns probe passes; the capability
+# probe (recognisable by --cap-add) fails.
+fake_bwrap_no_caps() {   # [<stderr>]
+    mkdir -p "$FIX/bin"
+    cat > "$FIX/bin/bwrap" <<EOF
+#!/bin/sh
+for a in "\$@"; do
+    if [ "\$a" = "--cap-add" ]; then
+        echo "${1:-setpriv: apply bounding set: Operation not permitted}" >&2
+        exit 1
+    fi
+done
+exit 0
+EOF
+    chmod +x "$FIX/bin/bwrap"
+}
+
+@test "caps check passes when the bounding-set drop works inside a sandbox" {
+    fake_bwrap 0
+    PATH="$FIX/bin:$PATH" run sbx_deps_caps_check
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+@test "caps check blames the policy, not setpriv, and names the remedy" {
+    fake_bwrap 1 "setpriv: apply bounding set: Operation not permitted"
+    fake_sysctl kernel/apparmor_restrict_unprivileged_userns 1
+    PATH="$FIX/bin:$PATH" SBX_PROC_SYS="$FIX/sys" SBX_BWRAP_PATH=/usr/bin/bwrap run sbx_deps_caps_check
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"bounding set cannot be emptied"* ]]
+    [[ "$output" == *"unpriv_bwrap"* ]]
+    [[ "$output" == *"profile sbx-bwrap /usr/bin/bwrap"* ]]
+    [[ "$output" == *"EVERY bwrap sandbox"* ]]
+    # It must still quote what the tool said, so the failure is recognisable.
+    [[ "$output" == *"apply bounding set"* ]]
+}
+
+@test "caps check on a host without Ubuntu's knob says what must change, not how" {
+    fake_bwrap 1 "setpriv: apply bounding set: Operation not permitted"
+    mkdir -p "$FIX/sys"
+    PATH="$FIX/bin:$PATH" SBX_PROC_SYS="$FIX/sys" run sbx_deps_caps_check
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"AppArmor, SELinux, seccomp"* ]]
+    if [[ "$output" == *"apparmor_parser"* ]]; then
+        echo "suggested an Ubuntu-specific fix on a host with no such knob" >&2
+        return 1
+    fi
+}
+
+@test "caps check never suggests skipping the drop" {
+    fake_bwrap 1 "setpriv: apply bounding set: Operation not permitted"
+    fake_sysctl kernel/apparmor_restrict_unprivileged_userns 1
+    PATH="$FIX/bin:$PATH" SBX_PROC_SYS="$FIX/sys" SBX_BWRAP_PATH=/usr/bin/bwrap run sbx_deps_caps_check
+    for word in skip ignore bypass disable; do
+        if [[ "$output" == *"$word the drop"* || "$output" == *"$word this check"* ]]; then
+            echo "offered to weaken the hardening: $word" >&2
+            return 1
+        fi
+    done
+}
+
+@test "nsunshare check passes when unshare can make both namespaces" {
+    fake_unshare 0
+    PATH="$FIX/bin:$PATH" run sbx_deps_nsunshare_check
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+@test "nsunshare check names the shapes that need it and the remedy" {
+    fake_unshare 1 "unshare: unshare failed: Operation not permitted"
+    fake_sysctl kernel/apparmor_restrict_unprivileged_userns 1
+    PATH="$FIX/bin:$PATH" SBX_PROC_SYS="$FIX/sys" SBX_BWRAP_PATH=/usr/bin/bwrap run sbx_deps_nsunshare_check
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"without networking"* ]]
+    [[ "$output" == *"userns"* ]]
+    [[ "$output" == *"sbx-unshare"* ]]
+    [[ "$output" == *"unshare failed"* ]]
+}
+
+@test "require core stops on a failing caps probe" {
+    doctor_bin bwrap
+    fake_bwrap_no_caps
+    veth_loaded
+    PATH="$FIX/bin:$PATH" run sbx_deps_require core
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"bounding set cannot be emptied"* ]]
+}
+
+@test "require checks unshare only when the nsunshare pseudo-group is asked for" {
+    doctor_bin bwrap unshare
+    fake_bwrap 0
+    fake_unshare 1 "unshare: unshare failed: Operation not permitted"
+    veth_loaded
+    PATH="$FIX/bin:$PATH" run sbx_deps_require core
+    [ "$status" -eq 0 ]
+    PATH="$FIX/bin:$PATH" run sbx_deps_require core nsunshare
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"user and network namespace"* ]]
+}
+
+@test "status reports caps and nsunshare, and nsunshare only when asked" {
+    doctor_bin bwrap unshare
+    fake_bwrap 0
+    fake_unshare 1 "nope"
+    veth_loaded
+    PATH="$FIX/bin:$PATH" run sbx_deps_status core
+    [ "$(jq -r .caps <<< "$output")" = "true" ]
+    [ "$(jq -r .nsunshare <<< "$output")" = "null" ]
+    [ "$(jq -r .ok <<< "$output")" = "true" ]
+    PATH="$FIX/bin:$PATH" run sbx_deps_status --nsunshare core
+    [ "$(jq -r .nsunshare <<< "$output")" = "false" ]
+    [ "$(jq -r .ok <<< "$output")" = "false" ]
+    # The pseudo-group must not leak into the groups map as a tool group.
+    [ "$(jq -r '.groups | has("nsunshare")' <<< "$output")" = "false" ]
+}
+
+@test "doctor reports both new probes under core" {
+    doctor_bin bwrap unshare
+    fake_bwrap_no_caps
+    fake_unshare 1 "unshare: unshare failed: Operation not permitted"
+    fake_sysctl kernel/apparmor_restrict_unprivileged_userns 1
+    veth_loaded
+    PATH="$FIX/bin:$PATH" SBX_PROC_SYS="$FIX/sys" SBX_BWRAP_PATH=/usr/bin/bwrap run sbx_deps_doctor
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"✗ capabilities usable inside a sandbox"* ]]
+    [[ "$output" == *"✗ unshare can create a user + network namespace"* ]]
+    PATH="$FIX/bin:$PATH" SBX_PROC_SYS="$FIX/sys" SBX_BWRAP_PATH=/usr/bin/bwrap run sbx_deps_doctor --json
+    [ "$(jq -r .caps <<< "$output")" = "false" ]
+    [ "$(jq -r .nsunshare <<< "$output")" = "false" ]
+}
+
 @test "userns check blames AppArmor when Ubuntu's restriction is on" {
     fake_bwrap 1 "bwrap: setting up uid map: Permission denied"
     fake_sysctl kernel/apparmor_restrict_unprivileged_userns 1

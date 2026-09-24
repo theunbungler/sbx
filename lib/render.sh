@@ -104,6 +104,8 @@ def mark($ok): if $ok then "✓" else "✗" end;
         ( [ ($d.needs.groups | to_entries[]
               | if (.value | length) == 0 then "\(.key) ✓" else "\(.key) ✗ missing \(.value | join(" "))" end),
             (if $d.needs.userns == null then empty else "userns \(mark($d.needs.userns))" end),
+            (if $d.needs.caps == null then empty else "sandbox caps \(mark($d.needs.caps))" end),
+            (if $d.needs.nsunshare == null then empty else "unshare ns \(mark($d.needs.nsunshare))" end),
             (if $d.needs.subids == null then empty else "subuid/subgid \(mark($d.needs.subids))" end),
             (if $d.needs.veth == null then empty else "veth \(mark($d.needs.veth))" end)
           ] | join(" · ") ),
