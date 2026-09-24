@@ -553,23 +553,12 @@ if [[ "$DRY_RUN" == "true" ]]; then
     # A missing bwrap, tmux or other core tool is not a reason to stop
     # before the report: it belongs in the report's Needs, as a reason
     # .proceed is false, same as a missing net/gui/podman tool.
-    DRY_RUN_CORE_REQUIRED=(jq realpath envsubst)
     DRY_RUN_CORE_MISSING=()
-    for dry_tool in "${DRY_RUN_CORE_REQUIRED[@]}"; do
+    for dry_tool in jq realpath envsubst; do
         command -v "$dry_tool" >/dev/null 2>&1 || DRY_RUN_CORE_MISSING+=("$dry_tool")
     done
     if [[ ${#DRY_RUN_CORE_MISSING[@]} -gt 0 ]]; then
-        {
-            if [[ ${#DRY_RUN_CORE_MISSING[@]} -eq 1 ]]; then
-                echo "Error: sbx requires ${DRY_RUN_CORE_MISSING[0]}, which is not on PATH."
-            else
-                echo "Error: sbx requires ${DRY_RUN_CORE_MISSING[*]}, which are not on PATH."
-            fi
-            echo "  Install with:"
-            while IFS= read -r dry_hint_line; do
-                echo "    $dry_hint_line"
-            done < <(sbx_deps_install_hint "$(sbx_deps_family)" "${DRY_RUN_CORE_MISSING[@]}")
-        } >&2
+        sbx_deps_report_missing "${DRY_RUN_CORE_MISSING[@]}" >&2
         exit 1
     fi
 else

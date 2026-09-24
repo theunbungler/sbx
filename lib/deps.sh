@@ -130,7 +130,9 @@ sbx_deps_install_hint() {
 # knob is Ubuntu's).
 sbx_deps_sysctl() {
     local v=""
-    read -r v < "${SBX_PROC_SYS:-/proc/sys}/$1" 2>/dev/null || true
+    # Braced: a redirection's own failure is reported before a 2>/dev/null
+    # on the same command takes effect.
+    { read -r v < "${SBX_PROC_SYS:-/proc/sys}/$1"; } 2>/dev/null || true
     echo "$v"
 }
 
@@ -371,39 +373,117 @@ sbx_deps_veth_explain() {
     echo "  After a kernel upgrade, reboot so the running kernel matches its modules."
 }
 
-sbx_deps_require() {
+
+# Runs the host checks once and leaves the results in globals, for the
+# three reports below to render:
+#   SBX_DEPS_GROUPS    the tool groups asked for, in order
+#   SBX_DEPS_MISSING   every missing tool across them
+#   SBX_DEPS_HINT      install command lines for SBX_DEPS_MISSING
+#   SBX_DEPS_R         missing_<group>, and for each probe (userns, caps,
+#                      nsunshare, subids, veth) true, false or null when it
+#                      did not run, with <probe>_msg holding the diagnosis
+# Tool groups are positional; "nsunshare" may also be passed positionally,
+# as sbx_deps_require's callers do. userns runs with core when bwrap exists,
+# caps only once userns passes (its probe runs inside a namespace), veth with
+# net, nsunshare and subids only when asked for.
+sbx_deps_probe() {   # [--nsunshare] [--subids] <group>...
+    local want_nsunshare=false want_subids=false group msg
     local -a missing
-    local line
-    mapfile -t missing < <(sbx_deps_missing "$@")
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        {
-            if [[ ${#missing[@]} -eq 1 ]]; then
-                echo "Error: sbx requires ${missing[0]}, which is not on PATH."
+    SBX_DEPS_GROUPS=()
+    SBX_DEPS_MISSING=()
+    SBX_DEPS_HINT=()
+    declare -gA SBX_DEPS_R=([userns]=null [caps]=null [nsunshare]=null [subids]=null [veth]=null)
+    while true; do
+        case "${1:-}" in
+            --subids)    want_subids=true; shift ;;
+            --nsunshare) want_nsunshare=true; shift ;;
+            *)           break ;;
+        esac
+    done
+    for group in "$@"; do
+        if [[ "$group" == "nsunshare" ]]; then
+            want_nsunshare=true
+            continue
+        fi
+        mapfile -t missing < <(sbx_deps_missing "$group")
+        SBX_DEPS_GROUPS+=("$group")
+        SBX_DEPS_R[missing_$group]="${missing[*]}"
+        SBX_DEPS_MISSING+=("${missing[@]}")
+    done
+    if [[ ${#SBX_DEPS_MISSING[@]} -gt 0 ]]; then
+        mapfile -t SBX_DEPS_HINT < <(sbx_deps_install_hint "$(sbx_deps_family)" "${SBX_DEPS_MISSING[@]}")
+    fi
+
+    if [[ " ${SBX_DEPS_GROUPS[*]} " == *" core "* ]] && command -v bwrap >/dev/null 2>&1; then
+        if msg=$(sbx_deps_userns_check); then
+            SBX_DEPS_R[userns]=true
+            if msg=$(sbx_deps_caps_check); then
+                SBX_DEPS_R[caps]=true
             else
-                echo "Error: sbx requires ${missing[*]}, which are not on PATH."
+                SBX_DEPS_R[caps]=false
+                SBX_DEPS_R[caps_msg]="$msg"
             fi
-            echo "  Install with:"
-            while IFS= read -r line; do
-                echo "    $line"
-            done < <(sbx_deps_install_hint "$(sbx_deps_family)" "${missing[@]}")
-        } >&2
+        else
+            SBX_DEPS_R[userns]=false
+            SBX_DEPS_R[userns_msg]="$msg"
+        fi
+    fi
+    if [[ "$want_nsunshare" == "true" ]] && command -v unshare >/dev/null 2>&1; then
+        if msg=$(sbx_deps_nsunshare_check); then
+            SBX_DEPS_R[nsunshare]=true
+        else
+            SBX_DEPS_R[nsunshare]=false
+            SBX_DEPS_R[nsunshare_msg]="$msg"
+        fi
+    fi
+    if [[ "$want_subids" == "true" ]]; then
+        if sbx_deps_subids_ok; then
+            SBX_DEPS_R[subids]=true
+        else
+            SBX_DEPS_R[subids]=false
+        fi
+    fi
+    if [[ " ${SBX_DEPS_GROUPS[*]} " == *" net "* ]]; then
+        if sbx_deps_veth_ok; then
+            SBX_DEPS_R[veth]=true
+        else
+            SBX_DEPS_R[veth]=false
+        fi
+    fi
+    return 0
+}
+
+# The error a launch prints for tools that are not on PATH.
+sbx_deps_report_missing() {   # <tool>...
+    local line
+    if [[ $# -eq 1 ]]; then
+        echo "Error: sbx requires $1, which is not on PATH."
+    else
+        echo "Error: sbx requires $*, which are not on PATH."
+    fi
+    echo "  Install with:"
+    while IFS= read -r line; do
+        echo "    $line"
+    done < <(sbx_deps_install_hint "$(sbx_deps_family)" "$@")
+}
+
+# A launch's preflight: silent on success; on failure prints the first
+# problem, with its remedy, and returns 1.
+sbx_deps_require() {   # <group>... [nsunshare]
+    local probe
+    local -a veth_lines
+    sbx_deps_probe "$@"
+    if [[ ${#SBX_DEPS_MISSING[@]} -gt 0 ]]; then
+        sbx_deps_report_missing "${SBX_DEPS_MISSING[@]}" >&2
         return 1
     fi
-    if [[ " $* " == *" core "* ]]; then
-        sbx_deps_userns_check >&2 || return 1
-        # Both of these used to surface as a failure mid-launch, blaming the
-        # tool that hit the wall (setpriv, or unshare) rather than the policy
-        # that put it there. Refuse up front instead, with the remedy.
-        sbx_deps_caps_check >&2 || return 1
-    fi
-    # unshare builds the control namespace for a session with no networking,
-    # and for every userns: full session. A plain networked session gets its
-    # namespace from pasta, which needs no such allowance.
-    if [[ " $* " == *" nsunshare "* ]]; then
-        sbx_deps_nsunshare_check >&2 || return 1
-    fi
-    if [[ " $* " == *" net "* ]] && ! sbx_deps_veth_ok; then
-        local -a veth_lines
+    for probe in userns caps nsunshare; do
+        if [[ "${SBX_DEPS_R[$probe]}" == "false" ]]; then
+            printf '%s\n' "${SBX_DEPS_R[${probe}_msg]}" >&2
+            return 1
+        fi
+    done
+    if [[ "${SBX_DEPS_R[veth]}" == "false" ]]; then
         mapfile -t veth_lines < <(sbx_deps_veth_explain)
         {
             echo "Error: the ${veth_lines[0]}"
@@ -425,128 +505,95 @@ sbx_deps_json_list() {
     printf ']'
 }
 
+# The groups object of the JSON reports, from the last sbx_deps_probe.
+sbx_deps_json_groups() {
+    local group first=1
+    printf '{'
+    for group in "${SBX_DEPS_GROUPS[@]}"; do
+        [[ $first -eq 1 ]] || printf ','
+        # shellcheck disable=SC2086  # the stored list is space-separated
+        printf '"%s":%s' "$group" "$(sbx_deps_json_list ${SBX_DEPS_R[missing_$group]})"
+        first=0
+    done
+    printf '}'
+}
+
+# Prints a probe's diagnosis indented under its line in the doctor report.
+sbx_deps_doctor_detail() {   # <probe>
+    local line
+    while IFS= read -r line; do
+        echo "           $line"
+    done <<< "${SBX_DEPS_R[${1}_msg]}"
+}
+
 sbx_deps_doctor() {
-    local json=false
+    local json=false group user rc=0 line
+    local -a tools veth_lines
     [[ "${1:-}" == "--json" ]] && json=true
 
-    local family group rc=0 userns=null userns_msg="" subids=false veth=false user line
-    local caps=null caps_msg="" nsunshare=null nsunshare_msg=""
-    local -a missing tools all_missing=() hint=()
-    local -A group_missing=()
-
-    family=$(sbx_deps_family)
-    user=$(id -un)
-    for group in core net gui podman; do
-        mapfile -t missing < <(sbx_deps_missing "$group")
-        group_missing[$group]="${missing[*]}"
-        all_missing+=("${missing[@]}")
-    done
-    if [[ -n "${group_missing[core]}" ]]; then
+    sbx_deps_probe --nsunshare --subids core net gui podman
+    # Only what every session needs decides the exit status; an optional
+    # group's gap is reported, not fatal.
+    if [[ -n "${SBX_DEPS_R[missing_core]}" || "${SBX_DEPS_R[userns]}" == "false" ||
+          "${SBX_DEPS_R[caps]}" == "false" || "${SBX_DEPS_R[nsunshare]}" == "false" ]]; then
         rc=1
-    fi
-    if command -v bwrap >/dev/null 2>&1; then
-        if userns_msg=$(sbx_deps_userns_check); then
-            userns=true
-        else
-            userns=false
-            rc=1
-        fi
-        # Only meaningful once a namespace can be created at all: the probe
-        # runs inside one.
-        if [[ "$userns" == "true" ]]; then
-            if caps_msg=$(sbx_deps_caps_check); then
-                caps=true
-            else
-                caps=false
-                rc=1
-            fi
-        fi
-    fi
-    if command -v unshare >/dev/null 2>&1; then
-        if nsunshare_msg=$(sbx_deps_nsunshare_check); then
-            nsunshare=true
-        else
-            nsunshare=false
-            rc=1
-        fi
-    fi
-    if sbx_deps_subids_ok; then
-        subids=true
-    fi
-    if sbx_deps_veth_ok; then
-        veth=true
-    fi
-    if [[ ${#all_missing[@]} -gt 0 ]]; then
-        mapfile -t hint < <(sbx_deps_install_hint "$family" "${all_missing[@]}")
     fi
 
     if $json; then
-        printf '{"family":"%s","ok":%s,"groups":{' "$family" "$([[ $rc -eq 0 ]] && echo true || echo false)"
-        local first=1
-        for group in core net gui podman; do
-            [[ $first -eq 1 ]] || printf ','
-            # shellcheck disable=SC2086  # the stored list is space-separated
-            printf '"%s":%s' "$group" "$(sbx_deps_json_list ${group_missing[$group]})"
-            first=0
-        done
-        printf '},"userns":%s,"caps":%s,"nsunshare":%s,"subids":%s,"veth":%s,"install":%s}\n' \
-            "$userns" "$caps" "$nsunshare" "$subids" "$veth" "$(sbx_deps_json_list "${hint[@]}")"
+        printf '{"family":"%s","ok":%s,"groups":%s,"userns":%s,"caps":%s,"nsunshare":%s,"subids":%s,"veth":%s,"install":%s}\n' \
+            "$(sbx_deps_family)" "$([[ $rc -eq 0 ]] && echo true || echo false)" "$(sbx_deps_json_groups)" \
+            "${SBX_DEPS_R[userns]}" "${SBX_DEPS_R[caps]}" "${SBX_DEPS_R[nsunshare]}" \
+            "${SBX_DEPS_R[subids]}" "${SBX_DEPS_R[veth]}" "$(sbx_deps_json_list "${SBX_DEPS_HINT[@]}")"
         return $rc
     fi
 
-    echo "sbx doctor — distro family: $family"
+    user=$(id -un)
+    echo "sbx doctor — distro family: $(sbx_deps_family)"
     echo
-    for group in core net gui podman; do
-        if [[ -z "${group_missing[$group]}" ]]; then
+    for group in "${SBX_DEPS_GROUPS[@]}"; do
+        if [[ -z "${SBX_DEPS_R[missing_$group]}" ]]; then
             mapfile -t tools < <(sbx_deps_tools "$group")
             printf '%-8s ✓ %s\n' "$group" "${tools[*]}"
         else
-            printf '%-8s ✗ missing: %s\n' "$group" "${group_missing[$group]}"
+            printf '%-8s ✗ missing: %s\n' "$group" "${SBX_DEPS_R[missing_$group]}"
         fi
         case "$group" in
             core)
-                case "$userns" in
+                case "${SBX_DEPS_R[userns]}" in
                     true)  echo "         ✓ unprivileged user namespaces" ;;
                     null)  echo "         ? unprivileged user namespaces (needs bwrap)" ;;
                     false)
                         echo "         ✗ unprivileged user namespaces"
-                        while IFS= read -r line; do
-                            echo "           $line"
-                        done <<< "$userns_msg"
+                        sbx_deps_doctor_detail userns
                         ;;
                 esac
-                case "$caps" in
+                case "${SBX_DEPS_R[caps]}" in
                     true)  echo "         ✓ capabilities usable inside a sandbox (the bounding-set drop)" ;;
                     false)
                         echo "         ✗ capabilities usable inside a sandbox (the bounding-set drop)"
-                        while IFS= read -r line; do
-                            echo "           $line"
-                        done <<< "$caps_msg"
+                        sbx_deps_doctor_detail caps
                         ;;
                 esac
-                case "$nsunshare" in
+                case "${SBX_DEPS_R[nsunshare]}" in
                     true)  echo "         ✓ unshare can create a user + network namespace" ;;
                     false)
                         echo "         ✗ unshare can create a user + network namespace"
                         echo "           (sessions without networking, and every \"userns\": \"full\" session)"
-                        while IFS= read -r line; do
-                            echo "           $line"
-                        done <<< "$nsunshare_msg"
+                        sbx_deps_doctor_detail nsunshare
                         ;;
                 esac
                 ;;
             net)
-                if [[ "$veth" == "true" ]]; then
+                if [[ "${SBX_DEPS_R[veth]}" == "true" ]]; then
                     echo "         ✓ veth kernel module"
                 else
-                    local -a veth_lines
                     mapfile -t veth_lines < <(sbx_deps_veth_explain)
                     echo "         ✗ ${veth_lines[0]}"
                     echo "           ${veth_lines[1]#  }"
                 fi
                 ;;
             podman)
-                if [[ "$subids" == "false" ]]; then
+                if [[ "${SBX_DEPS_R[subids]}" == "false" ]]; then
                     echo "         ✗ no subordinate UID/GID range for $user (needed by \"userns\": \"full\")"
                     echo "           sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $user"
                     echo "           (choose a range not already used by another user in /etc/subuid)"
@@ -554,92 +601,31 @@ sbx_deps_doctor() {
                 ;;
         esac
     done
-    if [[ ${#hint[@]} -gt 0 ]]; then
+    if [[ ${#SBX_DEPS_HINT[@]} -gt 0 ]]; then
         echo
         echo "Install missing packages:"
-        for line in "${hint[@]}"; do
+        for line in "${SBX_DEPS_HINT[@]}"; do
             echo "  $line"
         done
     fi
     return $rc
 }
 
-# Report-only form of sbx_deps_require, for --dry-run: which of the given
-# groups' tools are missing, whether the user-namespace probe passes and
-# capabilities are usable inside a sandbox (only when core is requested and
-# bwrap exists), whether unshare can create a user + network namespace (only
-# with --nsunshare, i.e. for the session shapes that need it), whether
-# subordinate IDs exist (only with --subids), and whether the running kernel
-# has the veth module (only when net is requested). Prints one JSON object and
-# returns 0 either way — .ok carries the verdict, so the caller can show
-# everything before deciding its exit status.
-sbx_deps_status() {   # [--subids] <group>... [nsunshare]
-    local want_subids=false group ok=true userns=null subids=null veth=null groups_json=""
-    local caps=null nsunshare=null
-    local want_nsunshare=false
-    local -a missing all_missing=() hint=()
-    while true; do
-        case "${1:-}" in
-            --subids)    want_subids=true; shift ;;
-            --nsunshare) want_nsunshare=true; shift ;;
-            *)           break ;;
-        esac
-    done
-    for group in "$@"; do
-        mapfile -t missing < <(sbx_deps_missing "$group")
-        if [[ -n "$groups_json" ]]; then
-            groups_json+=","
-        fi
-        groups_json+="\"$group\":$(sbx_deps_json_list "${missing[@]}")"
-        all_missing+=("${missing[@]}")
-    done
-    if [[ ${#all_missing[@]} -gt 0 ]]; then
+# Report-only form of sbx_deps_require, for --dry-run: one JSON object with
+# every result, returning 0 either way — .ok carries the verdict, so the
+# caller can show everything before deciding its exit status.
+sbx_deps_status() {   # [--subids] [--nsunshare] <group>...
+    local ok=true probe
+    sbx_deps_probe "$@"
+    if [[ ${#SBX_DEPS_MISSING[@]} -gt 0 ]]; then
         ok=false
-        mapfile -t hint < <(sbx_deps_install_hint "$(sbx_deps_family)" "${all_missing[@]}")
     fi
-    if [[ " $* " == *" core "* ]] && command -v bwrap >/dev/null 2>&1; then
-        if sbx_deps_userns_check >/dev/null 2>&1; then
-            userns=true
-        else
-            userns=false
+    for probe in userns caps nsunshare subids veth; do
+        if [[ "${SBX_DEPS_R[$probe]}" == "false" ]]; then
             ok=false
         fi
-        # The capability probe runs inside a namespace, so it only means
-        # anything once one can be created.
-        if [[ "$userns" == "true" ]]; then
-            if sbx_deps_caps_check >/dev/null 2>&1; then
-                caps=true
-            else
-                caps=false
-                ok=false
-            fi
-        fi
-    fi
-    if [[ "$want_nsunshare" == "true" ]]; then
-        if sbx_deps_nsunshare_check >/dev/null 2>&1; then
-            nsunshare=true
-        else
-            nsunshare=false
-            ok=false
-        fi
-    fi
-    if [[ "$want_subids" == "true" ]]; then
-        if sbx_deps_subids_ok; then
-            subids=true
-        else
-            subids=false
-            ok=false
-        fi
-    fi
-    if [[ " $* " == *" net "* ]]; then
-        if sbx_deps_veth_ok; then
-            veth=true
-        else
-            veth=false
-            ok=false
-        fi
-    fi
-    printf '{"groups":{%s},"userns":%s,"caps":%s,"nsunshare":%s,"subids":%s,"veth":%s,"install":%s,"ok":%s}\n' \
-        "$groups_json" "$userns" "$caps" "$nsunshare" "$subids" "$veth" \
-        "$(sbx_deps_json_list "${hint[@]}")" "$ok"
+    done
+    printf '{"groups":%s,"userns":%s,"caps":%s,"nsunshare":%s,"subids":%s,"veth":%s,"install":%s,"ok":%s}\n' \
+        "$(sbx_deps_json_groups)" "${SBX_DEPS_R[userns]}" "${SBX_DEPS_R[caps]}" "${SBX_DEPS_R[nsunshare]}" \
+        "${SBX_DEPS_R[subids]}" "${SBX_DEPS_R[veth]}" "$(sbx_deps_json_list "${SBX_DEPS_HINT[@]}")" "$ok"
 }
