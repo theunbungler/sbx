@@ -859,23 +859,21 @@ forked_store() {   # <profile> <dest>
 }
 
 # Deletes this directory's forked stores after confirmation, and exits.
+# Runs from the plan alone, before any session is claimed.
 reseed() {
-    local fm f_prof f_src f_dest f_store f_size spid sname lstore rt blocker="" reply i
-    local -a targets=()
+    local f_prof f_src f_dest f_store f_size spid sname lstore rt blocker="" reply i
+    local -a sources=() dests=() targets=()
 
-    # Give the claimed name back first: --reseed never launches, and our own
-    # pid record would otherwise be a live session with no sidecar below.
-    rm -rf "${SESSION_DIR:?}"
-    rm -f "$STATE_DIR/join/$SESSION_ID.pid"
-
-    if [[ ${#FORKED_MOUNTS[@]} -eq 0 ]]; then
+    while IFS= read -r -d '' f_prof && IFS= read -r -d '' f_src && IFS= read -r -d '' f_dest; do
+        sources+=("$f_src")
+        dests+=("$f_dest")
+        targets+=("$(forked_store "$f_prof" "$f_dest")")
+    done < <(jq -j 'def nul: [0] | implode;
+        .mounts[] | select(.perm == "forked") | .profile, nul, .source, nul, .dest, nul' <<< "$PLAN")
+    if [[ ${#targets[@]} -eq 0 ]]; then
         echo "No forked mounts in the selected profiles; nothing to reseed." >&2
         exit 1
     fi
-    for fm in "${FORKED_MOUNTS[@]}"; do
-        IFS=$'\t' read -r f_prof f_src f_dest <<< "$fm"
-        targets+=("$(forked_store "$f_prof" "$f_dest")")
-    done
 
     # A store is bound rw into every session using it; deleting it under a
     # live one destroys the state it is using. Which stores a session holds
@@ -909,8 +907,9 @@ reseed() {
     fi
 
     echo "This will delete the sandbox-owned copies of:"
-    for i in "${!FORKED_MOUNTS[@]}"; do
-        IFS=$'\t' read -r f_prof f_src f_dest <<< "${FORKED_MOUNTS[$i]}"
+    for i in "${!targets[@]}"; do
+        f_src="${sources[$i]}"
+        f_dest="${dests[$i]}"
         f_store="${targets[$i]}"
         if [[ -d "$f_store" ]]; then
             f_size=$(du -sh "$f_store" 2>/dev/null | cut -f1)
@@ -1356,6 +1355,9 @@ main() {
         dry_run_report
     fi
     check_plan
+    if [[ "$RESEED" == "true" ]]; then
+        reseed
+    fi
     read_plan_settings
     preflight_session
 
@@ -1363,9 +1365,6 @@ main() {
     build_base_args
     setup_virt
     add_profile_mounts
-    if [[ "$RESEED" == "true" ]]; then
-        reseed
-    fi
     seed_forked_mounts
     seed_record_mounts
     add_env_and_path

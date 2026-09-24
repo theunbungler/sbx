@@ -680,41 +680,17 @@ EOF
 # The claim loop reclaimed only join/<name>.pid while --gc reclaims .pid,
 # .json and .lock. A crashed session therefore left a stale join/<name>.json
 # that outlived its name: the successor is live from the moment its pid is
-# written but does not overwrite that sidecar until ~850 lines later, and in
-# that window --reseed reads the PREDECESSOR's forked_stores list. If that
-# stale list does not name the store --reseed is targeting, the "live pid
-# but unknown mounts -> refuse" guard is bypassed and --reseed deletes a
-# store the starting session has already seeded and is about to --bind.
-#
-# --reseed goes through the same claim loop and then releases the name
-# without ever writing a sidecar of its own, which makes the reclaim
-# observable on its own.
-@test "a name reclaim removes the predecessor's json and lock, not just its pid" {
-    make_fk_profile
-    mkdir -p "$HOME/.local/state/sbx/sessions/myproj" "$HOME/.local/state/sbx/join"
-    echo 999999 > "$HOME/.local/state/sbx/join/myproj.pid"
-    echo '{"forked_stores":["/nowhere/ghost-store"]}' \
-        > "$HOME/.local/state/sbx/join/myproj.json"
-    : > "$HOME/.local/state/sbx/join/myproj.lock"
-    run bash -c "cd '$PROJ' && $SBX --cli fk --reseed --yes"
-    [ "$status" -eq 0 ]
-    if [ -f "$HOME/.local/state/sbx/join/myproj.json" ]; then
-        echo "a reclaimed name kept the predecessor's forked_stores sidecar" >&2
-        return 1
-    fi
-    if [ -f "$HOME/.local/state/sbx/join/myproj.lock" ]; then
-        echo "a reclaimed name kept the predecessor's join lock" >&2
-        return 1
-    fi
-}
-
-# The same reclaim on the launch path: a live session must never be
-# describable by its predecessor's sidecar.
+# written but does not write its own sidecar until much later, and in that
+# window --reseed reads the PREDECESSOR's forked_stores list. If that stale
+# list does not name the store --reseed is targeting, the "live pid but
+# unknown mounts -> refuse" guard is bypassed and --reseed deletes a store
+# the starting session has already seeded and is about to --bind.
 @test "a launch that reclaims a name does not inherit the predecessor's sidecar" {
     mkdir -p "$HOME/.local/state/sbx/sessions/myproj" "$HOME/.local/state/sbx/join"
     echo 999999 > "$HOME/.local/state/sbx/join/myproj.pid"
     echo '{"forked_stores":["/nowhere/ghost-store"],"stale":true}' \
         > "$HOME/.local/state/sbx/join/myproj.json"
+    : > "$HOME/.local/state/sbx/join/myproj.lock"
     ( cd "$PROJ" && script -qec \
         "$SBX --fs t -- /bin/sh -c 'echo up > /out/up.txt; sleep 5'" \
         /dev/null >/dev/null 2>&1 ) &
@@ -722,11 +698,14 @@ EOF
     # Poll from the instant the name is reclaimed: the pid record is
     # rewritten under claim.lock immediately after the reclaim, long before
     # the successor writes its own sidecar.
-    local seen=""
+    local seen="" lock_seen=""
     for _ in $(seq 1 400); do
         if [[ -f "$HOME/.local/state/sbx/join/myproj.pid" ]] &&
            [[ "$(cat "$HOME/.local/state/sbx/join/myproj.pid")" != 999999 ]]; then
             seen=$(cat "$HOME/.local/state/sbx/join/myproj.json" 2>/dev/null || true)
+            if [[ -e "$HOME/.local/state/sbx/join/myproj.lock" ]]; then
+                lock_seen=yes
+            fi
             break
         fi
         sleep 0.02
@@ -735,6 +714,10 @@ EOF
     [ -f "$HOSTDIR/up.txt" ]
     if [[ "$seen" == *stale* ]]; then
         echo "a newly claimed session was described by its predecessor's sidecar: $seen" >&2
+        return 1
+    fi
+    if [[ -n "$lock_seen" ]]; then
+        echo "a newly claimed session kept its predecessor's join lock" >&2
         return 1
     fi
 }
