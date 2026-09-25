@@ -14,7 +14,7 @@ State as of 2026-09-23. Two branches, neither merged into `main`:
 ## Read these first
 
 - Design (the authority): `docs/superpowers/specs/2026-09-20-nested-session-design.md`
-- Plan, eight tasks: `docs/superpowers/plans/2026-09-21-nested-session.md`
+- Plan, eight tasks: `docs/superpowers/archive/plans/2026-09-21-nested-session.md`
 
 ## What this branch does
 

@@ -53,7 +53,7 @@ So `--join` is `new-session`, and the server — inside the namespaces, under
 `setpriv` — forks the shell. The control channel, the per-join PTY, the join
 registry, and the "wait for the last shell" teardown all come from tmux instead
 of from bespoke code, which keeps the project's stock-tools-only rule
-(`docs/superpowers/plans/2026-08-01-sbx-hardening.md:13`).
+(`docs/superpowers/archive/plans/2026-08-01-sbx-hardening.md:13`).
 
 ### Rejected alternatives
 
@@ -315,7 +315,7 @@ join path no longer depends on it.
 
 **Path length.** tmux sockets inherit the ~108-char `sun_path` limit that
 already constrains e2e tests to a short `$HOME`
-(`docs/superpowers/plans/2026-07-23-persistent-cli-profiles.md:30`). The first
+(`docs/superpowers/archive/plans/2026-07-23-persistent-cli-profiles.md:30`). The first
 probe run failed exactly this way. Comments and test scaffolding that explain
 the limit in terms of abduco must be reworded, not deleted.
 

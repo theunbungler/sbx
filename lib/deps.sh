@@ -368,9 +368,16 @@ sbx_deps_veth_ok() {
     return 1
 }
 
-sbx_deps_veth_explain() {
+# Two lines, separately, because each caller prefixes them its own way: the
+# preflight writes "Error: the <problem>", the doctor a ✗ and an indent. One
+# function returning both left both callers slicing an array and stripping
+# the indent back off.
+sbx_deps_veth_problem() {
     echo "veth kernel module is not available to the running kernel ($(sbx_deps_kernel_release))."
-    echo "  After a kernel upgrade, reboot so the running kernel matches its modules."
+}
+
+sbx_deps_veth_remedy() {
+    echo "After a kernel upgrade, reboot so the running kernel matches its modules."
 }
 
 
@@ -471,7 +478,6 @@ sbx_deps_report_missing() {   # <tool>...
 # problem, with its remedy, and returns 1.
 sbx_deps_require() {   # <group>... [nsunshare]
     local probe
-    local -a veth_lines
     sbx_deps_probe "$@"
     if [[ ${#SBX_DEPS_MISSING[@]} -gt 0 ]]; then
         sbx_deps_report_missing "${SBX_DEPS_MISSING[@]}" >&2
@@ -484,10 +490,9 @@ sbx_deps_require() {   # <group>... [nsunshare]
         fi
     done
     if [[ "${SBX_DEPS_R[veth]}" == "false" ]]; then
-        mapfile -t veth_lines < <(sbx_deps_veth_explain)
         {
-            echo "Error: the ${veth_lines[0]}"
-            printf '%s\n' "${veth_lines[@]:1}"
+            echo "Error: the $(sbx_deps_veth_problem)"
+            echo "  $(sbx_deps_veth_remedy)"
         } >&2
         return 1
     fi
@@ -528,7 +533,7 @@ sbx_deps_doctor_detail() {   # <probe>
 
 sbx_deps_doctor() {
     local json=false group user rc=0 line
-    local -a tools veth_lines
+    local -a tools
     [[ "${1:-}" == "--json" ]] && json=true
 
     sbx_deps_probe --nsunshare --subids core net gui podman
@@ -587,9 +592,8 @@ sbx_deps_doctor() {
                 if [[ "${SBX_DEPS_R[veth]}" == "true" ]]; then
                     echo "         ✓ veth kernel module"
                 else
-                    mapfile -t veth_lines < <(sbx_deps_veth_explain)
-                    echo "         ✗ ${veth_lines[0]}"
-                    echo "           ${veth_lines[1]#  }"
+                    echo "         ✗ $(sbx_deps_veth_problem)"
+                    echo "           $(sbx_deps_veth_remedy)"
                 fi
                 ;;
             podman)

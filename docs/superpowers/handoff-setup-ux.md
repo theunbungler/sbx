@@ -7,10 +7,10 @@ state as of 2026-09-19.
 ## Read these first
 
 - Spec (all five phases): `docs/superpowers/specs/2026-09-16-setup-ux-design.md`
-- Phase 1 plan (done): `docs/superpowers/plans/2026-09-16-setup-ux-phase1-deps.md`
-- Phase 2 plan (done): `docs/superpowers/plans/2026-09-17-setup-ux-phase2-resolve.md`
-- Phase 3 plan (done): `docs/superpowers/plans/2026-09-18-setup-ux-phase3-dry-run.md`
-- Phase 4 plan (done): `docs/superpowers/plans/2026-09-19-setup-ux-phase4-sbx-profile.md`
+- Phase 1 plan (done): `docs/superpowers/archive/plans/2026-09-16-setup-ux-phase1-deps.md`
+- Phase 2 plan (done): `docs/superpowers/archive/plans/2026-09-17-setup-ux-phase2-resolve.md`
+- Phase 3 plan (done): `docs/superpowers/archive/plans/2026-09-18-setup-ux-phase3-dry-run.md`
+- Phase 4 plan (done): `docs/superpowers/archive/plans/2026-09-19-setup-ux-phase4-sbx-profile.md`
 
 ## Where the work stands
 

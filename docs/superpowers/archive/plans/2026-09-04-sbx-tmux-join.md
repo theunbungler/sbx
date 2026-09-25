@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- **Stock tools only.** No compiled artifacts, no bespoke daemons (`docs/superpowers/plans/2026-08-01-sbx-hardening.md:13`). `tmux` replaces `abduco`/`dtach`; nothing else is added.
+- **Stock tools only.** No compiled artifacts, no bespoke daemons (`docs/superpowers/archive/plans/2026-08-01-sbx-hardening.md:13`). `tmux` replaces `abduco`/`dtach`; nothing else is added.
 - **`sbx` stays a single shipped script.** `session.sh` and `tmux.conf` are *generated* into `$SESSION_DIR` at launch, exactly like `launch.sh` and `wrapper.sh` already are.
 - **Unix socket paths are capped at ~108 chars (`sun_path`).** Test `$HOME` must stay short — `mktemp -d /tmp/sbxh.XXXXXX`, never `$BATS_TEST_TMPDIR`.
 - **`sbx` runs under `set -e`** (`sbx:5`). Generated scripts do not inherit it; commands whose failure is expected must end in `|| true`.
