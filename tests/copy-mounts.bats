@@ -7,14 +7,82 @@ setup() {
     mkdir -p "$SRC"
 }
 
-@test "mount_id flattens a destination path" {
+@test "mount_id flattens a destination path and digests it" {
     run sbx_copy_mount_id "/home/user/.claude"
-    [ "$output" = "_home_user_.claude" ]
+    [[ "$output" == "_home_user_.claude."???????? ]]
+    # Same path, same key, every time and on every machine.
+    local first="$output"
+    run sbx_copy_mount_id "/home/user/.claude"
+    [ "$output" = "$first" ]
 }
 
-@test "path_slug dashes an absolute path Claude-Code style" {
+@test "path_slug dashes an absolute path Claude-Code style and digests it" {
     run sbx_copy_path_slug "/home/user/projA"
-    [ "$output" = "-home-user-projA" ]
+    [[ "$output" == "-home-user-projA."???????? ]]
+}
+
+@test "a deep path still fits a filename, and stays distinct" {
+    local deep="/$(printf 'averyverylongcomponentname/%.0s' {1..40})leaf"
+    run sbx_copy_mount_id "$deep"
+    [ "${#output}" -le 255 ]
+    local first="$output"
+    run sbx_copy_mount_id "$deep/other"
+    [ "$output" != "$first" ]
+    [ "${#output}" -le 255 ]
+}
+
+# Two mounts that share a store directory mix their contents, and a record
+# archive then attributes one mount's changes to the other. Two launch
+# directories that share a forked store see and overwrite each other's
+# sandbox-owned data. Both keys must therefore be injective.
+@test "mount_id distinguishes a separator from a literal underscore" {
+    run sbx_copy_mount_id "/data/cache"
+    local slashed="$output"
+    run sbx_copy_mount_id "/data_cache"
+    [ "$output" != "$slashed" ]
+    # The readable part is deliberately the same; the digest separates them.
+    [[ "$slashed" == _data_cache.* ]]
+    [[ "$output" == _data_cache.* ]]
+}
+
+@test "path_slug distinguishes a separator from a literal dash" {
+    run sbx_copy_path_slug "/home/u/my/proj"
+    local slashed="$output"
+    run sbx_copy_path_slug "/home/u/my-proj"
+    [ "$output" != "$slashed" ]
+}
+
+@test "paths naming the same file key the same store" {
+    # // and a trailing / are the same path, so they must not fork the store.
+    run sbx_copy_mount_id "/a/b"
+    local plain="$output"
+    run sbx_copy_mount_id "/a//b"
+    [ "$output" = "$plain" ]
+    run sbx_copy_mount_id "/a/b/"
+    [ "$output" = "$plain" ]
+    run sbx_copy_path_slug "/a//b/"
+    local slug="$output"
+    run sbx_copy_path_slug "/a/b"
+    [ "$output" = "$slug" ]
+    # Root survives normalisation rather than becoming the empty string.
+    run sbx_copy_mount_id "/"
+    [[ "$output" == "_."???????? ]]
+}
+
+@test "both keys stay injective across a set of awkward paths" {
+    local -a paths=(
+        /a/b /a_b /a__b /a/_b /a_/b
+        /x-y /x/y /x--y /x/-y /x-/y
+        "/p/__pycache__" "/p__/pycache__" "/p/q" "/p_q"
+    )
+    local p ids=() slugs=()
+    for p in "${paths[@]}"; do
+        ids+=("$(sbx_copy_mount_id "$p")")
+        slugs+=("$(sbx_copy_path_slug "$p")")
+    done
+    # No duplicates: as many distinct keys as inputs.
+    [ "$(printf '%s\n' "${ids[@]}" | sort -u | wc -l)" -eq "${#paths[@]}" ]
+    [ "$(printf '%s\n' "${slugs[@]}" | sort -u | wc -l)" -eq "${#paths[@]}" ]
 }
 
 @test "seed_progress creates nothing when the source does not exist" {

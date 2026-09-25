@@ -29,7 +29,12 @@ setup() {
 
 @test "forked store path is keyed by profile, launch directory and destination" {
     run sbx_state_forked_store /s /home/u/proj pi /home/u/.pi
-    [ "$output" = "/s/forked/pi/-home-u-proj/_home_u_.pi" ]
+    # Built from the key functions rather than spelled out, so the digests
+    # they append live in one place (tests/copy-mounts.bats pins the format).
+    [ "$output" = "/s/forked/pi/$(sbx_copy_path_slug /home/u/proj)/$(sbx_copy_mount_id /home/u/.pi)" ]
+    # Each component actually varies with its input.
+    run sbx_state_forked_store /s /home/u/proj2 pi /home/u/.pi
+    [ "$output" != "/s/forked/pi/$(sbx_copy_path_slug /home/u/proj)/$(sbx_copy_mount_id /home/u/.pi)" ]
 }
 
 @test "socket probe is the widest tmux.sock path the claim loop can produce" {
@@ -82,7 +87,7 @@ setup_writes() {
     run sbx_state_writes "$(plan "[$(mount record "$SRC/tree" /a true),$(mount record "$SRC/tree" /b true)]")" "$STATE" "$LAUNCH"
     [ "$(jq -r 'map(.kind) | join(",")' <<< "$output")" = "temporary,temporary,archived,temporary,temporary" ]
     base=$(sbx_state_session_base "$LAUNCH")
-    [ "$(jq -r '.[0].path' <<< "$output")" = "$STATE/work/$base/_a" ]
+    [ "$(jq -r '.[0].path' <<< "$output")" = "$STATE/work/$base/$(sbx_copy_mount_id /a)" ]
     [ "$(jq -r '.[2].path' <<< "$output")" = "$STATE/changes/$(sbx_copy_path_slug "$LAUNCH")/<stamp>-$base/" ]
 }
 

@@ -173,8 +173,17 @@ normalize() {   # <capture dir>
     # root also survives inside forked-store and change-archive paths in that
     # mangled form; strip it too.
     root_slug=$(printf '%s' "$ROOT" | tr '/' '-')
+    # That slug now ends in a digest of the launch directory, which contains
+    # the random temp root and so differs on every run. Replace the whole
+    # slug, digest included, with the real function's own answer — the
+    # mount-id digests are of fixed destinations and stay pinned.
+    local launch_slug
+    # shellcheck source=lib/copy-mounts.sh
+    source "$REPO/lib/copy-mounts.sh"
+    launch_slug=$(sbx_copy_path_slug "$PROJ")
     for f in "$dir"/*; do
         sed -i -E \
+            -e "s#$launch_slug#@LAUNCH_SLUG@#g" \
             -e "s#$ROOT#@ROOT@#g" \
             -e "s#$root_slug#@ROOT_SLUG@#g" \
             -e "s#$REPO#@REPO@#g" \

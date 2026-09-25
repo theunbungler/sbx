@@ -4,19 +4,71 @@
 # Sourced by sbx and directly by tests/. Defines functions only — no side
 # effects at source time, no dependency on sbx globals.
 
+# Collapse repeated slashes and drop a trailing one, so that paths naming
+# the same file key the same store. Escaping alone would not: //  becomes
+# the same two characters an escaped literal underscore does, so /a//b and
+# /a_b would collide — and /a//b is /a/b, which must key with it, not
+# against it. Lexical only: no symlink resolution, since a key must not
+# depend on what exists on the host right now.
+sbx_copy_path_normalise() {
+    local p="$1"
+    while [[ "$p" == *//* ]]; do
+        p="${p//\/\//\/}"
+    done
+    if [[ "${#p}" -gt 1 ]]; then
+        p="${p%/}"
+    fi
+    printf '%s\n' "$p"
+}
+
+# The readable part of a key, kept short enough that the whole key fits a
+# 255-byte filename even for a deep path. Truncation cannot make two keys
+# equal on its own: the digest below is what distinguishes them.
+sbx_copy_key_flat() {   # <normalised path> <separator>
+    local flat="${1//\//$2}"
+    printf '%s\n' "${flat:0:200}"
+}
+
+# Eight hex of the normalised path's digest — what makes a key injective.
+sbx_copy_key_digest() {   # <normalised path>
+    local out
+    out=$(printf '%s' "$1" | sha256sum)
+    printf '%s\n' "${out:0:8}"
+}
+
 # Translate a sandbox destination path into the flat identifier used for
 # forked and record store directories.
-#   /home/user/.claude -> _home_user_.claude
+#   /home/user/.claude -> _home_user_.claude.d5a1f0c2
+#   /data/cache        -> _data_cache.1b9e77aa
+#   /data_cache        -> _data_cache.4c0f2e31
+#
+# The digest, not the flattening, is what keeps keys apart. Flattening alone
+# collided — /data/cache and /data_cache both gave _data_cache — and two
+# mounts sharing a store directory mix their contents and misattribute a
+# record archive. Escaping the separator instead cannot fix it with a
+# single-character escape: /a/_b and /a_/b both give _a___b, because nothing
+# distinguishes a component that ended with the escape character from one
+# that began with it. A two-character escape works but reads badly, so the
+# readable flattening stays and the digest carries uniqueness.
 sbx_copy_mount_id() {
-    echo "$1" | tr '/' '_'
+    local p
+    p=$(sbx_copy_path_normalise "$1")
+    printf '%s.%s\n' "$(sbx_copy_key_flat "$p" _)" "$(sbx_copy_key_digest "$p")"
 }
 
 # Translate an absolute path into a dashed slug, Claude-Code style, used
 # to key a persistent store by the external directory sbx was launched
 # from.
-#   /home/user/projA -> -home-user-projA
+#   /home/user/projA   -> -home-user-projA.7f31c0de
+#   /home/user/my-proj -> -home-user-my-proj.2a8be914
+#
+# Digested like sbx_copy_mount_id, and for the same reason: ~/my/proj and
+# ~/my-proj are different projects, and sharing one forked store would let
+# each see and overwrite the other's sandbox-owned data.
 sbx_copy_path_slug() {
-    echo "$1" | tr '/' '-'
+    local p
+    p=$(sbx_copy_path_normalise "$1")
+    printf '%s.%s\n' "$(sbx_copy_key_flat "$p" -)" "$(sbx_copy_key_digest "$p")"
 }
 
 # Manifest of a tree's file contents, used as the diff baseline for a

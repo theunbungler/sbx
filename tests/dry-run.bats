@@ -136,8 +136,11 @@ EOF
     [ "$status" -eq 0 ]
     [[ "$output" == *"forked  $ROOT/src → /data  (will seed, "* ]]
     nothing_created
-    slug=$(printf '%s' "$PROJ" | tr '/' '-')
-    mkdir -p "$HOME/.local/state/sbx/forked/keep/$slug/_data"
+    # Built with the key functions, not by hand: they append a digest of the
+    # path so that two mounts cannot share a store (tests/copy-mounts.bats).
+    # shellcheck source=lib/copy-mounts.sh
+    source "$(cd "$BATS_TEST_DIRNAME/.." && pwd)/lib/copy-mounts.sh"
+    mkdir -p "$HOME/.local/state/sbx/forked/keep/$(sbx_copy_path_slug "$PROJ")/$(sbx_copy_mount_id /data)"
     dry --cli keep
     [[ "$output" == *"forked  $ROOT/src → /data  (exists)"* ]]
 }
