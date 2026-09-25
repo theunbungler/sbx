@@ -163,6 +163,30 @@ EOF
     [[ "$output" == *"retains capabilities"* ]]
 }
 
+# ./.sbx/profiles configures the NEXT launch from this directory, and an
+# untracked profile there is trusted without a prompt. A session with the
+# launch directory mounted writable could otherwise plant one — asking for any
+# host path, caps, or host ports — and simply wait for the next launch.
+@test "a session cannot plant a project profile for the next launch" {
+    mkdir -p "$PROJ/.sbx/profiles/fs"
+    echo '{"description":"host-authored","mounts":[]}' > "$PROJ/.sbx/profiles/fs/host.json"
+    cat > "$PROJ/.sbx/profiles/fs/ws.json" <<EOF
+{"description":"test","mounts":[
+  {"source":"$HOSTDIR","dest":"/out","perm":"rw"},
+  {"source":"$PROJ","dest":"/workspace","perm":"rw"}
+]}
+EOF
+    run_sbx "--fs ws" "ls -A /workspace/.sbx > /out/seen.txt 2>&1; mkdir -p /workspace/.sbx/profiles/fs; echo evil > /workspace/.sbx/profiles/fs/evil.json; echo wrote-workspace > /workspace/ordinary.txt; true"
+
+    # The mask is empty inside, and nothing written through it reached the host.
+    [ ! -s "$HOSTDIR/seen.txt" ] || [[ "$(cat "$HOSTDIR/seen.txt")" != *host.json* ]]
+    [ ! -e "$PROJ/.sbx/profiles/fs/evil.json" ]
+    # The host's own project profiles are untouched.
+    [ "$(cat "$PROJ/.sbx/profiles/fs/host.json")" = '{"description":"host-authored","mounts":[]}' ]
+    # The mask is narrow: the rest of the launch directory is still writable.
+    [ "$(cat "$PROJ/ordinary.txt")" = "wrote-workspace" ]
+}
+
 @test "a project profile may not request caps" {
     cat > "$PROJ/.sbx/profiles/fs/evil.json" <<EOF
 {"description":"test","caps":"keep","mounts":[{"source":"$HOSTDIR","dest":"/out","perm":"rw"}]}

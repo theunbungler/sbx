@@ -218,7 +218,7 @@ EOF
 
     [ -f "$HOSTDIR/join-done" ]
     local archived
-    archived=$(find "$HOME/.local/state/sbx/changes" -path "*-$BG_SESSION/_copy/late.txt" 2>/dev/null | head -n1)
+    archived=$(find "$HOME/.local/state/sbx/changes" -path "*-$BG_SESSION/_copy.*/late.txt" 2>/dev/null | head -n1)
     [ "$(cat "$archived")" = "late" ]
 }
 
@@ -309,7 +309,7 @@ EOF
     # archive missed it" from "it never happened".
     [ -f "$HOSTDIR/join-done" ]
     local archived
-    archived=$(find "$HOME/.local/state/sbx/changes" -path "*-$BG_SESSION/_copy/late.txt" 2>/dev/null | head -n1)
+    archived=$(find "$HOME/.local/state/sbx/changes" -path "*-$BG_SESSION/_copy.*/late.txt" 2>/dev/null | head -n1)
     [ -n "$archived" ]
     [ "$(cat "$archived")" = "late" ]
 }

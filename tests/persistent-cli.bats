@@ -19,9 +19,17 @@ setup() {
     export SBX_TRUST_PROJECT_PROFILES=1
 
     # The store is keyed by profile name AND the external launch
-    # directory (see lib/copy-mounts.sh:sbx_copy_path_slug), so every
-    # store path assertion below needs this slug of $PROJ.
-    PROJ_SLUG=$(echo "$PROJ" | tr '/' '-')
+    # directory, and each key ends in a digest of its path so that two
+    # mounts cannot share a store, so ask the real functions rather than
+    # spelling the keys out here.
+    # shellcheck source=lib/copy-mounts.sh
+    source "$(cd "$BATS_TEST_DIRNAME/.." && pwd)/lib/copy-mounts.sh"
+    PROJ_SLUG=$(sbx_copy_path_slug "$PROJ")
+    FK_MOUNT_ID=$(sbx_copy_mount_id /tmp/fkmount)
+    FK_FILE_ID=$(sbx_copy_mount_id /tmp/fkfile)
+    FK_ABSENT_ID=$(sbx_copy_mount_id /tmp/fkabsent)
+    REC_MOUNT_ID=$(sbx_copy_mount_id /tmp/recmount)
+    REC_FILE_ID=$(sbx_copy_mount_id /tmp/recfile)
     echo hostfile > "$HOSTDIR/host.txt"
 
     FORKED_ROOT="$HOME/.local/state/sbx/forked"
@@ -107,78 +115,78 @@ EOF
 
 @test "a forked mount is seeded from the host on first launch" {
     run_sbx "--cli fk" "cp /tmp/fkmount/host.txt /tmp/fkmount/seen.txt"
-    [ "$(cat "$FORKED_ROOT/fk/$PROJ_SLUG/_tmp_fkmount/seen.txt")" = "hostfile" ]
+    [ "$(cat "$FORKED_ROOT/fk/$PROJ_SLUG/$FK_MOUNT_ID/seen.txt")" = "hostfile" ]
 }
 
 @test "a forked mount carries a new file into the next launch" {
     run_sbx "--cli fk" "echo made > /tmp/fkmount/new.txt"
     run_sbx "--cli fk" "cp /tmp/fkmount/new.txt /tmp/fkmount/echoed.txt"
-    [ "$(cat "$FORKED_ROOT/fk/$PROJ_SLUG/_tmp_fkmount/echoed.txt")" = "made" ]
+    [ "$(cat "$FORKED_ROOT/fk/$PROJ_SLUG/$FK_MOUNT_ID/echoed.txt")" = "made" ]
 }
 
 @test "a forked mount stops seeing host edits after the first launch" {
     run_sbx "--cli fk" "true"
     echo edited > "$HOSTDIR/host.txt"
     run_sbx "--cli fk" "cp /tmp/fkmount/host.txt /tmp/fkmount/seen.txt"
-    [ "$(cat "$FORKED_ROOT/fk/$PROJ_SLUG/_tmp_fkmount/seen.txt")" = "hostfile" ]
+    [ "$(cat "$FORKED_ROOT/fk/$PROJ_SLUG/$FK_MOUNT_ID/seen.txt")" = "hostfile" ]
 }
 
 @test "a file deleted in a forked mount stays deleted" {
     run_sbx "--cli fk" "rm /tmp/fkmount/host.txt"
-    [ -d "$FORKED_ROOT/fk/$PROJ_SLUG/_tmp_fkmount" ]
+    [ -d "$FORKED_ROOT/fk/$PROJ_SLUG/$FK_MOUNT_ID" ]
     run_sbx "--cli fk" "test -f /tmp/fkmount/host.txt && echo back > /tmp/fkmount/back.txt"
-    [ ! -f "$FORKED_ROOT/fk/$PROJ_SLUG/_tmp_fkmount/back.txt" ]
+    [ ! -f "$FORKED_ROOT/fk/$PROJ_SLUG/$FK_MOUNT_ID/back.txt" ]
 }
 
 @test "a forked mount never modifies the host source" {
     run_sbx "--cli fk" "echo sandbox > /tmp/fkmount/host.txt; echo x > /tmp/fkmount/new.txt"
-    [ "$(cat "$FORKED_ROOT/fk/$PROJ_SLUG/_tmp_fkmount/host.txt")" = "sandbox" ]
+    [ "$(cat "$FORKED_ROOT/fk/$PROJ_SLUG/$FK_MOUNT_ID/host.txt")" = "sandbox" ]
     [ "$(cat "$HOSTDIR/host.txt")" = "hostfile" ]
     [ ! -f "$HOSTDIR/new.txt" ]
 }
 
 @test "forked stores are keyed by launch directory" {
     OTHER="$ROOT/o"; mkdir -p "$OTHER"
-    OTHER_SLUG=$(echo "$OTHER" | tr '/' '-')
+    OTHER_SLUG=$(sbx_copy_path_slug "$OTHER")
     cp -a "$PROJ/.sbx" "$OTHER/.sbx"
     run_sbx "--cli fk" "echo here > /tmp/fkmount/where.txt"
     run_sbx_in "$OTHER" "--cli fk" "echo there > /tmp/fkmount/where.txt"
-    [ "$(cat "$FORKED_ROOT/fk/$PROJ_SLUG/_tmp_fkmount/where.txt")" = "here" ]
-    [ "$(cat "$FORKED_ROOT/fk/$OTHER_SLUG/_tmp_fkmount/where.txt")" = "there" ]
+    [ "$(cat "$FORKED_ROOT/fk/$PROJ_SLUG/$FK_MOUNT_ID/where.txt")" = "here" ]
+    [ "$(cat "$FORKED_ROOT/fk/$OTHER_SLUG/$FK_MOUNT_ID/where.txt")" = "there" ]
 }
 
 @test "a record mount archives a file the sandbox created" {
     run_sbx "--fs rec" "echo made > /tmp/recmount/new.txt"
-    [ "$(cat "$(latest_archive)/_tmp_recmount/new.txt")" = "made" ]
+    [ "$(cat "$(latest_archive)/$REC_MOUNT_ID/new.txt")" = "made" ]
 }
 
 @test "a record mount archives a file the sandbox modified" {
     run_sbx "--fs rec" "echo changed > /tmp/recmount/host.txt"
-    [ "$(cat "$(latest_archive)/_tmp_recmount/host.txt")" = "changed" ]
+    [ "$(cat "$(latest_archive)/$REC_MOUNT_ID/host.txt")" = "changed" ]
 }
 
 @test "a record mount does not archive an untouched file" {
     run_sbx "--fs rec" "echo made > /tmp/recmount/new.txt"
-    [ "$(cat "$(latest_archive)/_tmp_recmount/new.txt")" = "made" ]
-    [ ! -f "$(latest_archive)/_tmp_recmount/host.txt" ]
+    [ "$(cat "$(latest_archive)/$REC_MOUNT_ID/new.txt")" = "made" ]
+    [ ! -f "$(latest_archive)/$REC_MOUNT_ID/host.txt" ]
 }
 
 @test "a record mount lists a deleted file and does not archive it" {
     run_sbx "--fs rec" "rm /tmp/recmount/host.txt"
-    [ "$(cat "$(latest_archive)/_tmp_recmount.deleted")" = "host.txt" ]
-    [ ! -f "$(latest_archive)/_tmp_recmount/host.txt" ]
+    [ "$(cat "$(latest_archive)/$REC_MOUNT_ID.deleted")" = "host.txt" ]
+    [ ! -f "$(latest_archive)/$REC_MOUNT_ID/host.txt" ]
 }
 
 @test "a record mount resets to host state on the next launch" {
     run_sbx "--fs rec" "echo made > /tmp/recmount/new.txt"
     run_sbx "--fs rec" "test -f /tmp/recmount/new.txt && echo leaked > /tmp/recmount/leak.txt || echo absent > /tmp/recmount/gone.txt"
-    [ "$(cat "$(latest_archive)/_tmp_recmount/gone.txt")" = "absent" ]
-    [ ! -f "$(latest_archive)/_tmp_recmount/leak.txt" ]
+    [ "$(cat "$(latest_archive)/$REC_MOUNT_ID/gone.txt")" = "absent" ]
+    [ ! -f "$(latest_archive)/$REC_MOUNT_ID/leak.txt" ]
 }
 
 @test "a record mount never modifies the host source" {
     run_sbx "--fs rec" "echo sandbox > /tmp/recmount/host.txt; rm -f /tmp/recmount/host.txt; echo x > /tmp/recmount/new.txt"
-    [ "$(cat "$(latest_archive)/_tmp_recmount/new.txt")" = "x" ]
+    [ "$(cat "$(latest_archive)/$REC_MOUNT_ID/new.txt")" = "x" ]
     [ "$(cat "$HOSTDIR/host.txt")" = "hostfile" ]
     [ ! -f "$HOSTDIR/new.txt" ]
 }
@@ -203,17 +211,17 @@ EOF
     fi
     echo "edited-by-host" > "$HOSTDIR/host.txt"
     wait $bg
-    [ ! -f "$(latest_archive)/_tmp_recmount/host.txt" ]
+    [ ! -f "$(latest_archive)/$REC_MOUNT_ID/host.txt" ]
 }
 
 @test "the work directory is removed at teardown" {
     run_sbx "--fs rec" "echo made > /tmp/recmount/new.txt"
-    [ "$(cat "$(latest_archive)/_tmp_recmount/new.txt")" = "made" ]
+    [ "$(cat "$(latest_archive)/$REC_MOUNT_ID/new.txt")" = "made" ]
     [ -z "$(find "$HOME/.local/state/sbx/work" -mindepth 1 2>/dev/null)" ]
 }
 
 @test "a file-source forked mount is seeded and persists a modification across two launches" {
-    local store="$FORKED_ROOT/fkfile/$PROJ_SLUG/_tmp_fkfile/hostfile.txt"
+    local store="$FORKED_ROOT/fkfile/$PROJ_SLUG/$FK_FILE_ID/hostfile.txt"
     run_sbx "--cli fkfile" "true"
     [ "$(cat "$store")" = "filedata" ]
     run_sbx "--cli fkfile" "echo modified > /tmp/fkfile"
@@ -224,7 +232,7 @@ EOF
 
 @test "a file-source record mount archives a modification" {
     run_sbx "--fs recfile" "echo changed > /tmp/recfile"
-    [ "$(cat "$(latest_archive)/_tmp_recfile/hostfile.txt")" = "changed" ]
+    [ "$(cat "$(latest_archive)/$REC_FILE_ID/hostfile.txt")" = "changed" ]
 }
 
 # A session killed by SIGKILL, OOM or power loss never runs teardown, so its
@@ -236,12 +244,12 @@ EOF
 # sandbox sees files the host does not have, and --changes never mentions
 # them. The work tree must be removed before seeding.
 @test "a stale work tree does not leak into the next session of the same name" {
-    local work="$HOME/.local/state/sbx/work/p/_tmp_recmount"
+    local work="$HOME/.local/state/sbx/work/p/$REC_MOUNT_ID"
     mkdir -p "$work"
     echo ghost > "$work/ghost.txt"
     run_sbx "--fs rec" "test -f /tmp/recmount/ghost.txt && echo saw > /tmp/recmount/saw.txt || echo clean > /tmp/recmount/clean.txt"
-    [ -f "$(latest_archive)/_tmp_recmount/clean.txt" ]
-    if [ -f "$(latest_archive)/_tmp_recmount/saw.txt" ]; then
+    [ -f "$(latest_archive)/$REC_MOUNT_ID/clean.txt" ]
+    if [ -f "$(latest_archive)/$REC_MOUNT_ID/saw.txt" ]; then
         echo "the sandbox saw a ghost file from a crashed session's work tree" >&2
         return 1
     fi
@@ -252,13 +260,13 @@ EOF
 # host state that was always there. Removing it inside the sandbox is then
 # archived as the sandbox deleting a host file that never existed.
 @test "a stale work tree's files are not folded into the next session's baseline" {
-    local work="$HOME/.local/state/sbx/work/p/_tmp_recmount"
+    local work="$HOME/.local/state/sbx/work/p/$REC_MOUNT_ID"
     mkdir -p "$work"
     echo ghost > "$work/ghost.txt"
     run_sbx "--fs rec" "rm -f /tmp/recmount/ghost.txt; echo made > /tmp/recmount/new.txt"
-    [ "$(cat "$(latest_archive)/_tmp_recmount/new.txt")" = "made" ]
+    [ "$(cat "$(latest_archive)/$REC_MOUNT_ID/new.txt")" = "made" ]
     local deleted
-    deleted=$(cat "$(latest_archive)/_tmp_recmount.deleted" 2>/dev/null || true)
+    deleted=$(cat "$(latest_archive)/$REC_MOUNT_ID.deleted" 2>/dev/null || true)
     if [[ "$deleted" == *ghost.txt* ]]; then
         echo "a ghost file was folded into the baseline and archived as a deletion: $deleted" >&2
         return 1
@@ -276,8 +284,8 @@ EOF
 {"description":"test","mounts":[{"source":"$HOSTDIR/absent.txt","dest":"/tmp/fkabsent","perm":"forked"}]}
 EOF
     run_sbx "--cli fkabs" "true"
-    if [ -e "$FORKED_ROOT/fkabs/$PROJ_SLUG/_tmp_fkabsent" ]; then
-        echo "an absent source left a store behind: $(ls -la "$FORKED_ROOT/fkabs/$PROJ_SLUG/_tmp_fkabsent")" >&2
+    if [ -e "$FORKED_ROOT/fkabs/$PROJ_SLUG/$FK_ABSENT_ID" ]; then
+        echo "an absent source left a store behind: $(ls -la "$FORKED_ROOT/fkabs/$PROJ_SLUG/$FK_ABSENT_ID")" >&2
         return 1
     fi
 }
@@ -289,7 +297,7 @@ EOF
     run_sbx "--cli fkabs" "true"
     echo appeared > "$HOSTDIR/absent.txt"
     run_sbx "--cli fkabs" "test -f /tmp/fkabsent && echo yes >> /tmp/fkabsent"
-    local store="$FORKED_ROOT/fkabs/$PROJ_SLUG/_tmp_fkabsent/absent.txt"
+    local store="$FORKED_ROOT/fkabs/$PROJ_SLUG/$FK_ABSENT_ID/absent.txt"
     [ -f "$store" ]
     [ "$(cat "$store")" = "$(printf 'appeared\nyes')" ]
 }

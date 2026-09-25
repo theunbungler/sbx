@@ -68,17 +68,21 @@ In every session, this means:
   over SSH to `github.com`.
 - **Untracked project profiles.** A profile under `./.sbx/profiles` that git
   does not track is treated as your own scratch config and used without a
-  prompt. If a session mounts the launch directory read-write (as
-  `fs/sandbox` does), code inside it can write such a profile, and the next
-  launch from that directory will use it without asking. `--dry-run` shows
-  each profile's origin, so a `(project)` profile you did not write is
-  visible before you launch.
+  prompt. A session cannot plant one: `.sbx` is masked with an empty `tmpfs`
+  wherever a writable mount would expose it, so code inside never sees the
+  directory that configures the next launch, and writes to it are discarded.
+  (bwrap creates the mountpoint, so an empty `.sbx` may appear in a project
+  that had none; git ignores empty directories.) What remains is a profile
+  you wrote yourself and forgot — `--dry-run` shows each profile's origin, so
+  a `(project)` profile you did not expect is visible before you launch.
 - **The launch directory's git configuration.** sbx runs `git` in the launch
   directory to check whether a project profile is tracked, so that
   repository's `.git/config` applies — including settings such as
   `core.fsmonitor` that run a command on the host. Launch only from
-  directories whose `.git/config` you trust; like an untracked profile, a
-  session with the launch directory mounted read-write can change it.
+  directories whose `.git/config` you trust: a session with the launch
+  directory mounted read-write can change it, and `.git` is not masked the
+  way `.sbx` is — a sandbox that cannot use git in its own workspace would be
+  worse than the exposure.
 
 ## Checking your setup
 

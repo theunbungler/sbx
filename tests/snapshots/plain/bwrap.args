@@ -83,6 +83,8 @@ unix:///run/user/@UID@/podman/podman.sock
 --bind-try
 @ROOT@/proj
 /workspace
+--tmpfs
+/workspace/.sbx
 --setenv
 PATH
 @ROOT@/h/.local/state/sbx/sessions/proj/bin:/usr/local/bin:/usr/bin:/bin

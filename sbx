@@ -814,7 +814,7 @@ SHIMEOF
 # writes on the host.
 add_profile_mounts() {
     local profile_name source dest perm parent part curr
-    local -a parts
+    local -a parts writable=()
     FORKED_MOUNTS=()   # "profile<TAB>source<TAB>dest"
     RECORD_MOUNTS=()   # "source<TAB>dest"
     while IFS= read -r -d '' profile_name && IFS= read -r -d '' source &&
@@ -841,8 +841,10 @@ add_profile_mounts() {
         # binds stay strict.
         case "$perm" in
             ro)     BWRAP_ARGS+=(--ro-bind-try "$source" "$dest") ;;
-            rw)     BWRAP_ARGS+=(--bind-try "$source" "$dest") ;;
-            dev)    BWRAP_ARGS+=(--dev-bind-try "$source" "$dest") ;;
+            rw)     BWRAP_ARGS+=(--bind-try "$source" "$dest")
+                    writable+=("$source"$'\t'"$dest") ;;
+            dev)    BWRAP_ARGS+=(--dev-bind-try "$source" "$dest")
+                    writable+=("$source"$'\t'"$dest") ;;
             forked) FORKED_MOUNTS+=("$profile_name"$'\t'"$source"$'\t'"$dest") ;;
             record) RECORD_MOUNTS+=("$source"$'\t'"$dest") ;;
             *)
@@ -852,6 +854,36 @@ add_profile_mounts() {
                 ;;
         esac
     done < <(jq -j 'def nul: [0] | implode; .mounts[] | .profile, nul, .source, nul, .dest, nul, .perm, nul' <<< "$PLAN")
+    mask_project_sbx "${writable[@]}"
+}
+
+# The launch directory's .sbx is never visible inside a session.
+#
+# ./.sbx/profiles configures the NEXT launch, and an untracked profile there
+# is trusted without a prompt (README, Threat model). So a session that can
+# write it can hand itself any mount set — any host path, caps, host ports —
+# on the next launch from that directory, and simply wait. An empty tmpfs
+# goes over every writable mount that exposes it, whether that is the
+# launch directory itself or an ancestor like $HOME.
+#
+# ro mounts are left alone: reading a project's own profiles is not the
+# vector, writing them is. bwrap creates the mountpoint, so an empty .sbx
+# may appear in a project that had none — git ignores empty directories, and
+# writes inside the mask land on the tmpfs, never on the host.
+mask_project_sbx() {   # <source<TAB>dest>...
+    local pair src dest rel project_sbx
+    project_sbx=$(sbx_copy_path_normalise "$PWD/.sbx")
+    for pair in "$@"; do
+        IFS=$'\t' read -r src dest <<< "$pair"
+        src=$(sbx_copy_path_normalise "$src")
+        dest=$(sbx_copy_path_normalise "$dest")
+        if [[ "$project_sbx" == "$src" ]]; then
+            BWRAP_ARGS+=(--tmpfs "$dest")
+        elif [[ "$project_sbx" == "$src"/* ]]; then
+            rel="${project_sbx#"$src"/}"
+            BWRAP_ARGS+=(--tmpfs "$dest/$rel")
+        fi
+    done
 }
 
 forked_store() {   # <profile> <dest>
