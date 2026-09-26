@@ -110,6 +110,14 @@ sbx_resolve() {
             esac
         done < <(sbx_profile_check "$type" "$p" "$origin")
 
+        # A same-named cli profile is the one the user may have meant.
+        local twin
+        if [[ "$type" == fs ]]; then
+            while IFS= read -r twin; do
+                warnings+=("fs/$name: loaded $p; $twin is a cli profile and was not used")
+            done < <(sbx_profile_cli_twins "$name" "$config_dir" "$global_dir")
+        fi
+
         # A version-controlled project profile arrived with the repository;
         # using it is the user's explicit decision (see prompt_project_profile
         # in sbx). An untracked one is the user's own scratch config.

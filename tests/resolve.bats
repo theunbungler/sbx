@@ -270,3 +270,11 @@ r() { jq -r "$1" <<< "$PLAN"; }
     [[ "$(r '.warnings[]')" == *"cli profiles are now fs profiles, so none in $CFG/profiles/cli are loaded; move them to $CFG/profiles/fs"* ]]
     [ "$(q .errors)" = '[]' ]
 }
+
+@test "a cli profile of the same name as a loaded fs profile is named as not used" {
+    mkdir -p "$CFG/profiles/cli"
+    echo '{"env":{"MINE":"1"}}' > "$CFG/profiles/cli/claude.json"
+    echo '{}' > "$GLOBAL/fs/claude.json"
+    resolve --fs "$GLOBAL/fs/claude.json"
+    [[ "$(r '.warnings[]')" == *"fs/claude: loaded $GLOBAL/fs/claude.json; $CFG/profiles/cli/claude.json is a cli profile and was not used"* ]]
+}

@@ -46,14 +46,11 @@ sbx_profile_resolve() {   # <type> <name> <config_dir> <global_dir>
     done
 
     if [[ "$type" == fs ]]; then
-        for p in "./.sbx/profiles/cli/$name.json" \
-                 "$config_dir/profiles/cli/$name.json" \
-                 "$global_dir/cli/$name.json"; do
-            if [[ -f "$p" ]]; then
-                echo "Error: Profile '$name' not found. $p is a cli profile, and cli profiles are now fs profiles: move it to ${p%/cli/*}/fs/$name.json" >&2
-                return 1
-            fi
-        done
+        p=$(sbx_profile_cli_twins "$name" "$config_dir" "$global_dir" | head -n1)
+        if [[ -n "$p" ]]; then
+            echo "Error: Profile '$name' not found. $p is a cli profile, and cli profiles are now fs profiles: move it to ${p%/cli/*}/fs/$name.json" >&2
+            return 1
+        fi
     fi
     echo "Error: Profile '$name' of type '$type' not found." >&2
     return 1
@@ -72,6 +69,19 @@ sbx_profile_legacy_cli_dirs() {   # <config_dir> <global_dir>
                 break
             fi
         done
+    done
+    return 0
+}
+
+# The cli profiles named <name>, in lookup precedence order. A user's
+# customised cli/claude.json is not loaded once a global fs/claude.json
+# exists, and that must be said by name, not only as a directory warning.
+sbx_profile_cli_twins() {   # <name> <config_dir> <global_dir>
+    local p
+    for p in "./.sbx/profiles/cli/$1.json" "$2/profiles/cli/$1.json" "$3/cli/$1.json"; do
+        if [[ -f "$p" ]]; then
+            printf '%s\n' "$p"
+        fi
     done
     return 0
 }
