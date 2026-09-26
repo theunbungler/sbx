@@ -61,7 +61,7 @@ behaviour exactly for `--cli` (applied last, its entries first).
 
 The combined list is handed to the unchanged `sbx_resolve_path`, so it still
 goes in front of any `env.PATH` and the default still closes it. The
-`cli_path` special case and the `--cli` argument of `sbx_resolve_plan` are
+`cli_path` special case and the `--cli` argument of `sbx_resolve` are
 removed.
 
 ### 4. Lookup and the leftover warning
@@ -72,8 +72,9 @@ removed.
 - A new helper, `sbx_profile_legacy_cli_dirs <config_dir> <global_dir>`,
   prints each of `./.sbx/profiles/cli`, `$config_dir/profiles/cli` and
   `$global_dir/cli` that holds at least one `.json` file.
-- `sbx_resolve_plan` adds one plan warning per such directory:
-  `cli profiles are now fs profiles and are not loaded; move them to the fs/ directory beside it: <dir>`.
+- `sbx_resolve` adds one plan warning per such directory, built by
+  `sbx_profile_legacy_cli_warning <dir>`:
+  `cli profiles are now fs profiles, so none in <dir> are loaded; move them to <parent>/fs`.
   It therefore appears on every launch and in `--dry-run` (text and JSON),
   after any trust prompt, as all warnings do.
 - `sbx_profile_list` lists FS and NET only, and prints the same warning for
