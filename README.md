@@ -1,6 +1,6 @@
 # sbx (sandbox-gemini)
 
-`sbx` is a command-line tool designed to manage isolated sandboxed environments. It lets users to spin up, manage, and join sessions with highly configurable environments using modular profiles for CLI, Filesystem, and Networking.
+`sbx` is a command-line tool designed to manage isolated sandboxed environments. It lets users to spin up, manage, and join sessions with highly configurable environments using modular profiles for filesystem/environment and networking.
 
 ## Motivation
 
@@ -11,8 +11,7 @@ The motivating intent behind sbx is to be a sandboxed environment for an AI codi
 ## Features
 
 - **Modular Profiles**: Tailor your sandbox with specific configurations:
-  - **CLI Profiles**: Set environment variables, paths, and mounts (e.g., `dev`, `gemini`, `pi`).
-  - **Filesystem (FS) Profiles**: Define mounts and filesystem-level configurations (e.g., `chrome`, `sandbox`).
+  - **Filesystem (FS) Profiles**: Mounts, environment variables, PATH entries and capabilities (e.g., `claude`, `sandbox`, `podman`).
   - **Network (NET) Profiles**: Control network access and connectivity (e.g., `web`, `test_net`).
 - **Composable FS and NET profiles**: Each is designed to enable a minimal environment for something.  Bring as many as you like into the sandbox. 
 - **Flexible Session Management**: List active sessions, and open additional shells inside a running one.
@@ -41,7 +40,7 @@ In every session, this means:
 - **The host environment does not leak in.** The environment is cleared;
   variables arrive only via the base set or a profile's `passthrough`.
 - **sbx's own state and config are masked**, so a sandbox cannot reach
-  sibling sessions, persistent cli stores, or the profiles that configure the
+  sibling sessions, persistent forked stores, or the profiles that configure the
   next launch.
 - **Project-supplied profiles that git tracks require confirmation.** A
   profile under `./.sbx/profiles` that the repository tracks is shown and
@@ -130,7 +129,7 @@ To see all available commands and options, run:
 |---------|-------------|
 | `--doctor [--json]` | Check that required tools are installed and that unprivileged user namespaces work. Prints the install command for your distro. Exits non-zero only if something every session needs is missing. |
 | `--dry-run [--json]` | Show everything this launch would do — profiles, mounts, environment, network grants, every host location it would write, missing dependencies, confirmations, warnings and errors — without creating, prompting or launching anything. Exits 1 if the real launch would stop. |
-| `--list-profiles` | Show all available CLI, FS, and NET profiles. |
+| `--list-profiles` | Show all available FS and NET profiles. |
 | `--list-sessions` | List all currently active sandbox sessions. |
 | `--join <session>` | Open a new shell inside a running sandbox session, with its own terminal. Append `-- <cmd>` to run a command instead. |
 | `--attach <session>` | Reattach to a running session's original terminal (the one `sbx` started it on). |
@@ -147,13 +146,13 @@ To see all available commands and options, run:
 You can combine multiple profiles to build your desired environment:
 
 ```bash
-# Start a session with a specific CLI, FS, and Network profile
-./sbx --cli dev --fs chrome --net web
+# Start a session with filesystem/environment and network profiles
+./sbx --fs dev --fs chrome --net web
 ```
 
 ## Constructing Profiles
 
-Profiles are JSON files organized into three categories — **CLI**, **Filesystem (FS)**, and **Network (NET)** — and stored under `profiles/<type>/<name>.json`. Each type has its own schema.
+Profiles are JSON files in two categories — **Filesystem (FS)** and **Network (NET)** — stored under `profiles/<type>/<name>.json`. Each type has its own schema.
 
 ### Profile Locations
 
@@ -163,21 +162,23 @@ Profiles are loaded by **name only**, from these three locations (in order):
 2. `$HOME/.config/sbx/profiles/` (User-specific configuration)
 3. Global profiles in the profiles directory with sbx
 
-The launch directory itself is never searched — a file sitting next to where you run `sbx` is not a profile just because it has the right name, and `--fs`/`--net`/`--cli` do not accept a file path, only `<name>` or `<type>/<name>`.
+The launch directory itself is never searched — a file sitting next to where you run `sbx` is not a profile just because it has the right name, and `--fs`/`--net` do not accept a file path, only `<name>` or `<type>/<name>`.
 
 `sbx-profile ls` shows which one wins when the same name exists in several places.
 
 
-### CLI Profiles (`profiles/cli/<name>.json`)
+### Filesystem (FS) Profiles (`profiles/fs/<name>.json`)
 
-CLI profiles configure the shell environment inside the sandbox. They control environment variables, PATH entries, and additional filesystem mounts.
+FS profiles define the sandbox's filesystem layout and environment — which directories are mounted, environment variables, and PATH entries. Stack as many as you like. Pass `--wd <path>` on the command line to set the initial working directory.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `description` | string | No | Human-readable label for the profile |
-| `env` | object | No | Key-value pairs of environment variables to set |
-| `path` | array of strings | No | Directories to prepend to the sandbox `PATH` |
-| `mounts` | array of objects | No | Filesystem mounts (same structure as FS mounts below) |
+| `mounts` | array of objects | No | Filesystem mount specifications (see below) |
+| `env` | object | No | Environment variables to set. A later profile's value wins. |
+| `path` | array of strings | No | Directories to put first on the sandbox `PATH`. A later profile's entries go in front of an earlier one's, and all go before any `env.PATH`. |
+| `userns` | string | No | `"full"` runs the entire session inside an outer user namespace carrying your full subordinate-UID range (multi-UID podman). Requires `--net`; the session identity becomes namespace-root. See [Multi-UID containers](#multi-uid-containers-podman-full). |
+| `docker_api` | boolean | No | `true` starts a podman docker-API socket for the session (see [Docker compatibility](#docker-compatibility)). |
 | `passthrough` | array | No | Host environment variables to forward into the sandbox by name. The environment is otherwise cleared. |
 | `caps` | string | No | `"keep"` retains capabilities inside the sandbox. Required for nested user namespaces (podman); capabilities stay inside the payload's namespace; `ro` mounts and the firewall still hold. Ignored — and rejected — in project-supplied profiles. |
 
@@ -213,20 +214,6 @@ CLI profiles configure the shell environment inside the sandbox. They control en
 }
 ```
 
-### Filesystem (FS) Profiles (`profiles/fs/<name>.json`)
-
-FS profiles define the sandbox's filesystem layout — which directories are mounted and FS-level environment variables. Pass `--wd <path>` on the command line to set the initial working directory.
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `description` | string | No | Human-readable label for the profile |
-| `mounts` | array of objects | No | Filesystem mount specifications (see below) |
-| `env` | object | No | Key-value pairs of environment variables to set |
-| `userns` | string | No | `"full"` runs the entire session inside an outer user namespace carrying your full subordinate-UID range (multi-UID podman). Requires `--net`; the session identity becomes namespace-root. See [Multi-UID containers](#multi-uid-containers-podman-full). |
-| `docker_api` | boolean | No | `true` starts a podman docker-API socket for the session (see [Docker compatibility](#docker-compatibility)). Honored in CLI profiles too. |
-| `passthrough` | array | No | Host environment variables to forward into the sandbox by name. The environment is otherwise cleared. |
-| `caps` | string | No | `"keep"` retains capabilities inside the sandbox. Required for nested user namespaces (podman); capabilities stay inside the payload's namespace; `ro` mounts and the firewall still hold. Ignored — and rejected — in project-supplied profiles. |
-
 #### Mount Object
 
 Each entry in the `mounts` array has these fields:
@@ -241,7 +228,7 @@ Each entry in the `mounts` array has these fields:
 
 - **`ro`** — Read-only bind mount. The sandbox sees the host directory but cannot modify it.
 - **`rw`** — Read-write bind mount. Changes made inside the sandbox are reflected on the host.
-- **`forked`** — Sandbox-owned. The first time a given profile/mount is launched from a given directory, the source is copied into a persistent store at `~/.local/state/sbx/forked/<profile-name>/<cwd-slug>/<mount_id>/`, which is then bound straight into the sandbox. After that first seed, the host source is never consulted again — the store *is* the tree, edits and deletions inside the sandbox persist there across launches, and later changes to the host original have no effect on it. This is what lets `sbx --cli claude` keep the sessions, history, and auth it accumulated last time. `<cwd-slug>` is the launch directory (`$PWD`) with slashes dashed, so each project gets its own store.
+- **`forked`** — Sandbox-owned. The first time a given profile/mount is launched from a given directory, the source is copied into a persistent store at `~/.local/state/sbx/forked/<profile-name>/<cwd-slug>/<mount_id>/`, which is then bound straight into the sandbox. After that first seed, the host source is never consulted again — the store *is* the tree, edits and deletions inside the sandbox persist there across launches, and later changes to the host original have no effect on it. This is what lets `sbx --fs claude` keep the sessions, history, and auth it accumulated last time. `<cwd-slug>` is the launch directory (`$PWD`) with slashes dashed, so each project gets its own store.
 - **`record`** — Host-owned. A private working copy is seeded fresh from the host source on *every* launch, and bound into the sandbox; the sandbox never touches the host original. At teardown, files the session created or modified (relative to that launch's seed) are archived to `~/.local/state/sbx/changes/<cwd-slug>/<stamp>-<session-id>/<mount_id>/`, and deletions are listed in a sibling `<mount_id>.deleted` file — see [Forked and Record Mounts](#forked-and-record-mounts) below and `--changes`.
 - **`dev`** — Device bind mount (`--dev-bind`). Like `rw`, but allows device-node access (a plain `ro`/`rw` bind mounts `nodev`, so opening a device file would fail). Used for things like `/dev/kvm` and `/dev/net/tun`.
 
@@ -313,11 +300,13 @@ Egress is enforced at the **IP layer by `nftables`**, not just at DNS resolution
 
 ### Applying Profiles
 
-Profiles are applied via the `--cli`, `--fs`, and `--net` flags. Multiple `--fs` flags can be stacked:
+Profiles are applied with `--fs` and `--net`, each repeatable, in the order given. `--cli <name>` is kept for compatibility: it applies an fs profile after every `--fs` one, so its env and PATH entries win.
+
+Profiles used to live in a separate `cli/` directory. Nothing is loaded from `cli/` any more; if one still holds profiles, every launch, `--dry-run`, `--list-profiles` and `sbx-profile check` warn about it. Move the files to the `fs/` directory beside it. `forked` stores are keyed by profile name, so a moved profile keeps its store.
 
 ```bash
 # Combine profiles from different categories
-./sbx --cli dev --fs sandbox --net web
+./sbx --fs dev --fs sandbox --net web
 
 # Stack multiple filesystem profiles
 ./sbx --fs sandbox --fs chrome
@@ -388,7 +377,7 @@ exist on this host (the mount is skipped), and a `*.` wildcard in `allow`.
 `--dry-run` takes the same flags as a launch and prints what that launch
 would do, without doing any of it:
 
-    ./sbx --dry-run --cli claude --fs sandbox --net anthropic
+    ./sbx --dry-run --fs sandbox --fs claude --net anthropic
 
 It shows the security settings, every mount (with forked stores marked
 *will seed* or *exists*), the environment with which profile won each
@@ -409,9 +398,9 @@ pulled from the host environment are not printed.
 
 `forked` and `record` mounts both isolate the sandbox from the host — the original host directory is never modified by either — but they disagree about who owns the data afterward.
 
-**`forked` — sandbox-owned.** The first launch of a given profile/mount from a given directory copies the host source into a persistent store at `~/.local/state/sbx/forked/<profile-name>/<cwd-slug>/<mount_id>/` and binds that store straight into the sandbox. Every later launch of the same profile from the same directory reuses that store directly — the host source is never re-read, so host-side edits made after the first seed simply don't show up, and deletions made inside the sandbox stay deleted. This is what lets `sbx --cli claude` keep the sessions, history, and auth tokens it accumulated last time. `<cwd-slug>` is the launch directory (`$PWD`) with slashes dashed, so each project keeps its own store; `<mount_id>` is the sandbox destination path, also slashes-to-underscores.
+**`forked` — sandbox-owned.** The first launch of a given profile/mount from a given directory copies the host source into a persistent store at `~/.local/state/sbx/forked/<profile-name>/<cwd-slug>/<mount_id>/` and binds that store straight into the sandbox. Every later launch of the same profile from the same directory reuses that store directly — the host source is never re-read, so host-side edits made after the first seed simply don't show up, and deletions made inside the sandbox stay deleted. This is what lets `sbx --fs claude` keep the sessions, history, and auth tokens it accumulated last time. `<cwd-slug>` is the launch directory (`$PWD`) with slashes dashed, so each project keeps its own store; `<mount_id>` is the sandbox destination path, also slashes-to-underscores.
 
-To start a profile over from a clean host copy, run `./sbx --cli <name> --reseed` from the same directory. It lists the stores it is about to delete, with their sizes, and asks before removing them; the next launch seeds them from the host again. Other directories' stores for the same profile are unaffected.
+To start a profile over from a clean host copy, run `./sbx --fs <name> --reseed` from the same directory. It lists the stores it is about to delete, with their sizes, and asks before removing them; the next launch seeds them from the host again. Other directories' stores for the same profile are unaffected.
 
 Use `--reseed` rather than deleting the store directory by hand: a store is bind-mounted read-write into its session for as long as that session runs, so removing one under a live sandbox destroys the auth tokens and history it is using at that moment. `--reseed` checks for that and refuses.
 
@@ -438,7 +427,7 @@ Both permissions use `rsync --compare-dest` for the diff when available, falling
         _tmp_recmount.deleted
   forked/
     claude/
-      -home-user-projA/             # store for `--cli claude` launched from ~/projA
+      -home-user-projA/             # store for `--fs claude` launched from ~/projA
         _home_user_.claude/
         _home_user_.claude.json
       -home-user-projB/             # independent store for the same profile in ~/projB
@@ -480,13 +469,13 @@ Three `fs` profiles add device access and persistent storage:
 
 ```bash
 # Root-only containers, composes with anything (real-user identity)
-./sbx --fs sandbox --fs podman --net web --cli claude
+./sbx --fs sandbox --fs podman --fs claude --net web
 
 # Full image fidelity (postgres/USER images), ns-root session
 ./sbx --fs sandbox --fs podman-full --net web
 
 # KVM-accelerated VMs, with disk images persisting across sessions
-./sbx --fs sandbox --fs qemu --cli claude
+./sbx --fs sandbox --fs qemu --fs claude
 ```
 
 ### Multi-UID containers (podman-full)
