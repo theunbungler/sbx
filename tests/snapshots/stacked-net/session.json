@@ -7,6 +7,5 @@
         "@REPO@/profiles/net/web.json",
         "@ROOT@/h/.config/sbx/profiles/net/snapdb.json",
         "@ROOT@/h/.config/sbx/profiles/net/snapwild.json"
-    ],
-    "cli_profile": null
+    ]
 }

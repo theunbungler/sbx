@@ -97,7 +97,7 @@ run_sbx() {
 @test "a dead session directory is not listed and its name is reclaimed" {
     mkdir -p "$HOME/.local/state/sbx/sessions/myproj"
     cat > "$HOME/.local/state/sbx/sessions/myproj/session.json" <<EOF
-{"id":"myproj","cwd":"$PROJ","pid":999999,"fs_profiles":[],"net_profiles":[],"cli_profile":null}
+{"id":"myproj","cwd":"$PROJ","pid":999999,"fs_profiles":[],"net_profiles":[]}
 EOF
     run bash -c "cd '$PROJ' && $SBX --list-sessions"
     [[ "$output" != *myproj* ]]
@@ -123,7 +123,7 @@ EOF
     mkdir -p "$HOME/.local/state/sbx/sessions/evil" "$HOME/.local/state/sbx/join"
     echo $$ > "$HOME/.local/state/sbx/join/evil.pid"
     jq -n --arg id "evil$(printf '\033')[31m" --arg cwd "$PROJ" --argjson pid "$$" \
-        '{id:$id,cwd:$cwd,pid:$pid,fs_profiles:[],net_profiles:[],cli_profile:null}' \
+        '{id:$id,cwd:$cwd,pid:$pid,fs_profiles:[],net_profiles:[]}' \
         > "$HOME/.local/state/sbx/sessions/evil/session.json"
     run bash -c "cd '$PROJ' && $SBX --list-sessions"
     [ "$status" -eq 0 ]
@@ -141,7 +141,7 @@ EOF
     mkdir -p "$HOME/.local/state/sbx/sessions/goodproj" "$HOME/.local/state/sbx/join"
     echo $$ > "$HOME/.local/state/sbx/join/goodproj.pid"
     jq -n --arg cwd "$PROJ" --argjson pid "$$" \
-        '{id:"goodproj", cwd:$cwd, pid:$pid, fs_profiles:[], net_profiles:[], cli_profile:null}' \
+        '{id:"goodproj", cwd:$cwd, pid:$pid, fs_profiles:[], net_profiles:[]}' \
         > "$HOME/.local/state/sbx/sessions/goodproj/session.json"
     run bash -c "cd '$PROJ' && $SBX --list-sessions"
     [ "$status" -eq 0 ]
@@ -226,7 +226,7 @@ EOF
 @test "list-sessions ignores a session.json pid and uses the out-of-band record" {
     mkdir -p "$HOME/.local/state/sbx/sessions/liar" "$HOME/.local/state/sbx/join"
     jq -n --arg cwd "$PROJ" --argjson pid "$$" \
-        '{id:"liar",cwd:$cwd,pid:$pid,fs_profiles:[],net_profiles:[],cli_profile:null}' \
+        '{id:"liar",cwd:$cwd,pid:$pid,fs_profiles:[],net_profiles:[]}' \
         > "$HOME/.local/state/sbx/sessions/liar/session.json"
     echo 999999 > "$HOME/.local/state/sbx/join/liar.pid"
     run bash -c "cd '$PROJ' && $SBX --list-sessions"
@@ -389,8 +389,8 @@ EOF
 # --- --reseed ---
 
 @test "reseed drops a forked store so the next launch re-reads the host" {
-    mkdir -p "$PROJ/.sbx/profiles/cli"
-    cat > "$PROJ/.sbx/profiles/cli/fk.json" <<EOF
+    mkdir -p "$PROJ/.sbx/profiles/fs"
+    cat > "$PROJ/.sbx/profiles/fs/fk.json" <<EOF
 {"description":"test","mounts":[{"source":"$HOSTDIR","dest":"/tmp/fkmount","perm":"forked"}]}
 EOF
     echo hostfile > "$HOSTDIR/host.txt"
@@ -403,8 +403,8 @@ EOF
 }
 
 @test "reseed without --yes prompts and aborts by default" {
-    mkdir -p "$PROJ/.sbx/profiles/cli"
-    cat > "$PROJ/.sbx/profiles/cli/fk.json" <<EOF
+    mkdir -p "$PROJ/.sbx/profiles/fs"
+    cat > "$PROJ/.sbx/profiles/fs/fk.json" <<EOF
 {"description":"test","mounts":[{"source":"$HOSTDIR","dest":"/tmp/fkmount","perm":"forked"}]}
 EOF
     run bash -c "cd '$PROJ' && $SBX --cli fk --reseed </dev/null"
@@ -415,8 +415,8 @@ EOF
 # --- --gc and the claim lock ---
 
 make_fk_profile() {
-    mkdir -p "$PROJ/.sbx/profiles/cli"
-    cat > "$PROJ/.sbx/profiles/cli/fk.json" <<EOF
+    mkdir -p "$PROJ/.sbx/profiles/fs"
+    cat > "$PROJ/.sbx/profiles/fs/fk.json" <<EOF
 {"description":"test","mounts":[{"source":"$HOSTDIR","dest":"/tmp/fkmount","perm":"forked"}]}
 EOF
 }

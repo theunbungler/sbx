@@ -12,7 +12,7 @@ setup() {
     export HOME="$ROOT/h"
     PROJ="$ROOT/p"
     HOSTDIR="$ROOT/s"
-    mkdir -p "$HOME" "$PROJ/.sbx/profiles/cli" "$PROJ/.sbx/profiles/fs" "$HOSTDIR"
+    mkdir -p "$HOME" "$PROJ/.sbx/profiles/fs" "$HOSTDIR"
 
     # Every fixture below lives in ./.sbx/profiles; these are ours, so opt
     # out of the project-profile confirmation prompt for the whole suite.
@@ -33,7 +33,7 @@ setup() {
     echo hostfile > "$HOSTDIR/host.txt"
 
     FORKED_ROOT="$HOME/.local/state/sbx/forked"
-    cat > "$PROJ/.sbx/profiles/cli/fk.json" <<EOF
+    cat > "$PROJ/.sbx/profiles/fs/fk.json" <<EOF
 {"description":"test","mounts":[{"source":"$HOSTDIR","dest":"/tmp/fkmount","perm":"forked"}]}
 EOF
 
@@ -46,7 +46,7 @@ EOF
     # host file, the untested branch in the seeding loops.
     FORKED_FILE_SRC="$HOSTDIR/hostfile.txt"
     echo filedata > "$FORKED_FILE_SRC"
-    cat > "$PROJ/.sbx/profiles/cli/fkfile.json" <<EOF
+    cat > "$PROJ/.sbx/profiles/fs/fkfile.json" <<EOF
 {"description":"test","mounts":[{"source":"$FORKED_FILE_SRC","dest":"/tmp/fkfile","perm":"forked"}]}
 EOF
     cat > "$PROJ/.sbx/profiles/fs/recfile.json" <<EOF
@@ -280,7 +280,7 @@ EOF
 # after the host file appeared. The trigger is ordinary: `sbx --cli claude`
 # before Claude Code has ever written ~/.claude.json.
 @test "a forked mount whose file source is absent creates no store" {
-    cat > "$PROJ/.sbx/profiles/cli/fkabs.json" <<EOF
+    cat > "$PROJ/.sbx/profiles/fs/fkabs.json" <<EOF
 {"description":"test","mounts":[{"source":"$HOSTDIR/absent.txt","dest":"/tmp/fkabsent","perm":"forked"}]}
 EOF
     run_sbx "--cli fkabs" "true"
@@ -291,7 +291,7 @@ EOF
 }
 
 @test "a forked mount whose file source appears later is seeded as a file" {
-    cat > "$PROJ/.sbx/profiles/cli/fkabs.json" <<EOF
+    cat > "$PROJ/.sbx/profiles/fs/fkabs.json" <<EOF
 {"description":"test","mounts":[{"source":"$HOSTDIR/absent.txt","dest":"/tmp/fkabsent","perm":"forked"}]}
 EOF
     run_sbx "--cli fkabs" "true"

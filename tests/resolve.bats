@@ -9,7 +9,7 @@ setup() {
     W="$BATS_TEST_TMPDIR/w"
     PROJ="$W/proj"; CFG="$W/cfg"; GLOBAL="$W/global"; SRC="$W/src"
     mkdir -p "$PROJ/.sbx/profiles/fs" "$PROJ/.sbx/profiles/net" \
-             "$CFG/profiles/fs" "$CFG/profiles/cli" "$CFG/profiles/net" "$GLOBAL/fs" "$SRC/present"
+             "$CFG/profiles/fs" "$CFG/profiles/net" "$GLOBAL/fs" "$SRC/present"
     cd "$PROJ"
 }
 
@@ -45,11 +45,11 @@ r() { jq -r "$1" <<< "$PLAN"; }
     local fs cli
     export SNAPVAR="$SRC"
     fs=$(user fs m '{"mounts":[{"source":"$SNAPVAR/present","dest":"$HOME/p","perm":"ro"},{"source":"'"$SRC"'/gone","dest":"/g","perm":"ro"},{"source":"'"$SRC"'/newrw","dest":"/n","perm":"rw"}]}')
-    cli=$(user cli c '{"mounts":[{"source":"'"$SRC"'/present","dest":"/c","perm":"forked"}]}')
-    resolve --fs "$fs" --cli "$cli"
+    cli=$(user fs c '{"mounts":[{"source":"'"$SRC"'/present","dest":"/c","perm":"forked"}]}')
+    resolve --fs "$fs" --fs "$cli"
     [ "$(q '.mounts[0]')" = "{\"profile\":\"m\",\"from\":\"fs/m\",\"source\":\"$SRC/present\",\"dest\":\"$HOME/p\",\"perm\":\"ro\",\"present\":true}" ]
     [ "$(r '.mounts[1].present')" = "false" ]
-    [ "$(r '.mounts[3].from')" = "cli/c" ]
+    [ "$(r '.mounts[3].from')" = "fs/c" ]
     [[ "$(r '.warnings[]')" == *"fs/m: mount source not present on this host, skipped: ro $SRC/gone"* ]]
     if [[ "$(r '.warnings[]')" == *"newrw"* ]]; then return 1; fi
 }
@@ -68,12 +68,12 @@ r() { jq -r "$1" <<< "$PLAN"; }
     [ ! -e "$SRC/newrw" ]
 }
 
-@test "env is every assignment in profile order; PATH layers env, cli path and the default" {
+@test "env is every assignment in profile order; PATH layers env, path entries and the default" {
     local fs cli
     fs=$(user fs e '{"env":{"SHARED":"fs","PATH":"/fs/bin","N":7}}')
-    cli=$(user cli e '{"env":{"SHARED":"cli","HOMEY":"$HOME/x"},"path":["/cli/bin","$HOME/b"]}')
-    resolve --fs "$fs" --cli "$cli"
-    [ "$(q '[.env[] | [.name, .value, .from]]')" = "[[\"SHARED\",\"fs\",\"fs/e\"],[\"PATH\",\"/fs/bin\",\"fs/e\"],[\"N\",\"7\",\"fs/e\"],[\"SHARED\",\"cli\",\"cli/e\"],[\"HOMEY\",\"$HOME/x\",\"cli/e\"]]" ]
+    cli=$(user fs e2 '{"env":{"SHARED":"cli","HOMEY":"$HOME/x"},"path":["/cli/bin","$HOME/b"]}')
+    resolve --fs "$fs" --fs "$cli"
+    [ "$(q '[.env[] | [.name, .value, .from]]')" = "[[\"SHARED\",\"fs\",\"fs/e\"],[\"PATH\",\"/fs/bin\",\"fs/e\"],[\"N\",\"7\",\"fs/e\"],[\"SHARED\",\"cli\",\"fs/e2\"],[\"HOMEY\",\"$HOME/x\",\"fs/e2\"]]" ]
     [ "$(r .path)" = "/cli/bin:$HOME/b:/fs/bin:/usr/local/bin:/usr/bin:/bin" ]
 }
 
@@ -93,12 +93,12 @@ r() { jq -r "$1" <<< "$PLAN"; }
     [ "$(r '.env[0].value')" = "hunter2" ]
 }
 
-@test "path_raw carries the unexpanded PATH env value and cli path entries, composed like path" {
+@test "path_raw carries the unexpanded PATH env value and path entries, composed like path" {
     local fs cli
     export SBX_RESOLVE_PATHSECRET=hunter2path
     fs=$(user fs pe '{"env":{"PATH":"$SBX_RESOLVE_PATHSECRET:/usr/bin"}}')
-    cli=$(user cli pc '{"path":["$SBX_RESOLVE_PATHSECRET/bin"]}')
-    resolve --fs "$fs" --cli "$cli"
+    cli=$(user fs pc '{"path":["$SBX_RESOLVE_PATHSECRET/bin"]}')
+    resolve --fs "$fs" --fs "$cli"
     [ "$(r .path)" = "hunter2path/bin:hunter2path:/usr/bin:/usr/local/bin:/usr/bin:/bin" ]
     [ "$(r .path_raw)" = '$SBX_RESOLVE_PATHSECRET/bin:$SBX_RESOLVE_PATHSECRET:/usr/bin:/usr/local/bin:/usr/bin:/bin' ]
 }

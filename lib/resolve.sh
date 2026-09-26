@@ -40,7 +40,7 @@ sbx_resolve_path() {   # <entries, colon-joined> <env PATH>
 }
 
 sbx_resolve() {
-    local launch_dir="" config_dir="" global_dir="" wd="" gui=false cli=""
+    local launch_dir="" config_dir="" global_dir="" wd="" gui=false
     local -a fs=() net=() flag_ports=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -48,7 +48,6 @@ sbx_resolve() {
             --config-dir) config_dir="$2"; shift 2 ;;
             --global-dir) global_dir="$2"; shift 2 ;;
             --fs)         fs+=("$2"); shift 2 ;;
-            --cli)        cli="$2"; shift 2 ;;
             --net)        net+=("$2"); shift 2 ;;
             --host-port)  flag_ports+=("$2"); shift 2 ;;
             --wd)         wd="$2"; shift 2 ;;
@@ -60,13 +59,10 @@ sbx_resolve() {
         esac
     done
 
-    # Every profile in the order the launch applies them: fs, cli, net.
+    # Every profile in the order the launch applies them: fs, then net.
     local -a types=() paths=() origins=()
     local p i
     for p in "${fs[@]}"; do types+=(fs); paths+=("$p"); done
-    if [[ -n "$cli" ]]; then
-        types+=(cli); paths+=("$cli")
-    fi
     for p in "${net[@]}"; do types+=(net); paths+=("$p"); done
 
     local -a profiles=() errors=() warnings=() confirm=()
@@ -133,7 +129,7 @@ sbx_resolve() {
 
     if [[ ${#errors[@]} -eq 0 ]]; then
         # --- Profile feature-field scan (phase 2 virt) ---
-        # Optional fields honored in any applied fs/cli profile:
+        # Optional fields honored in any applied fs profile:
         #   "userns": "full"    -> run the whole session inside an outer user
         #                          namespace carrying the user's full subordinate-
         #                          UID range (multi-UID podman). Requires --net.

@@ -23,7 +23,7 @@ setup() {
     STUB="$ROOT/stub"
     CAP="$ROOT/cap"
     HOSTSRC="$ROOT/src"
-    mkdir -p "$HOME_DIR/.config/sbx/profiles/fs" "$HOME_DIR/.config/sbx/profiles/cli" \
+    mkdir -p "$HOME_DIR/.config/sbx/profiles/fs" \
              "$HOME_DIR/.config/sbx/profiles/net" "$PROJ" "$STUB" "$CAP" "$HOSTSRC"
     write_stubs
     write_fixture_profiles
@@ -138,7 +138,7 @@ write_fixture_profiles() {
  "env":{"SNAP_FS":"fs-value","SNAP_SHARED":"from-fs","PATH":"/opt/snap/bin:/usr/bin"},
  "passthrough":["SBX_SNAP_TOKEN"]}
 EOF
-    cat > "$P/cli/snapcli.json" <<'EOF'
+    cat > "$P/fs/snapcli.json" <<'EOF'
 {"description":"snapshot cli",
  "env":{"SNAP_SHARED":"from-cli","SNAP_HOME":"$HOME/x","SNAP_NUM":7},
  "path":["$HOME/.snap/bin","/opt/tool/bin"],

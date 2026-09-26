@@ -45,7 +45,7 @@ CLAIM_LOCK="$STATE_DIR/claim.lock"
 # Flags. Profiles are resolved to paths as they are parsed.
 FS_PROFILES=()
 NET_PROFILES=()
-CLI_PROFILE=""
+LAST_PROFILES=()   # --cli: fs profiles applied after every --fs (compatibility)
 WORKDIR=""
 HOST_PORT_SPECS=()   # as typed; lib/resolve.sh validates and buckets them
 COMMAND=()
@@ -114,7 +114,7 @@ Options:
   --attach <session>     Reattach to a session's original terminal
   --fs <profile>         Apply a filesystem profile (multiple allowed)
   --net <profile>        Apply a network profile (multiple allowed)
-  --cli <profile>        Apply a CLI/environment profile
+  --cli <profile>        Apply an fs profile after every --fs one (compatibility)
   --host-port <spec>     Reach a host service on 127.0.0.1:<port> from inside.
                          <spec> is <port>[/tcp|/udp]; bare means tcp.
                          (repeatable; implies a network namespace)
@@ -373,7 +373,7 @@ parse_args() {
                 shift 2
                 ;;
             --cli)
-                CLI_PROFILE="$(resolve_profile cli "$2")"
+                LAST_PROFILES+=("$(resolve_profile fs "$2")")
                 shift 2
                 ;;
             --host-port)
@@ -448,12 +448,9 @@ preflight_core() {
 resolve_plan() {
     local profile spec
     local -a args=(--launch-dir "$PWD" --config-dir "$CONFIG_DIR" --global-dir "$SCRIPT_DIR/profiles")
-    for profile in "${FS_PROFILES[@]}"; do
+    for profile in "${FS_PROFILES[@]}" "${LAST_PROFILES[@]}"; do
         args+=(--fs "$profile")
     done
-    if [[ -n "$CLI_PROFILE" ]]; then
-        args+=(--cli "$CLI_PROFILE")
-    fi
     for profile in "${NET_PROFILES[@]}"; do
         args+=(--net "$profile")
     done
@@ -1088,11 +1085,9 @@ setup_network() {
 #                 whose only other record is the forgeable session.json.
 write_session_records() {
     jq -n --indent 4 --arg id "$SESSION_ID" --arg cwd "$PWD" --argjson pid "$$" \
-        --argjson fs "$(sbx_resolve_strings "${FS_PROFILES[@]}")" \
+        --argjson fs "$(sbx_resolve_strings "${FS_PROFILES[@]}" "${LAST_PROFILES[@]}")" \
         --argjson net "$(sbx_resolve_strings "${NET_PROFILES[@]}")" \
-        --arg cli "$CLI_PROFILE" \
-        '{id: $id, cwd: $cwd, pid: $pid, fs_profiles: $fs, net_profiles: $net,
-          cli_profile: (if $cli == "" then null else $cli end)}' \
+        '{id: $id, cwd: $cwd, pid: $pid, fs_profiles: $fs, net_profiles: $net}' \
         > "$SESSION_DIR/session.json"
 
     jq -n --indent 4 --arg path "$SESSION_DIR/bin:$SANDBOX_PATH" --arg workdir "${WORKDIR:-$PWD}" \

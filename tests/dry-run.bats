@@ -20,7 +20,7 @@ setup() {
     ROOT="$(mktemp -d /tmp/sbxh.XXXXXX)"
     export HOME="$ROOT/h"
     PROJ="$ROOT/proj"
-    mkdir -p "$HOME/.config/sbx/profiles/fs" "$HOME/.config/sbx/profiles/cli" "$PROJ" "$ROOT/src"
+    mkdir -p "$HOME/.config/sbx/profiles/fs" "$PROJ" "$ROOT/src"
     echo data > "$ROOT/src/f"
     printf 'ID=manjaro\nID_LIKE=arch\n' > "$ROOT/arch"
     mkdir -p "$ROOT/sysmod/veth"
@@ -129,7 +129,7 @@ nothing_created() {
 }
 
 @test "a forked mount shows will seed, then exists" {
-    cat > "$HOME/.config/sbx/profiles/cli/keep.json" <<EOF
+    cat > "$HOME/.config/sbx/profiles/fs/keep.json" <<EOF
 {"mounts":[{"source":"$ROOT/src","dest":"/data","perm":"forked"}]}
 EOF
     dry --cli keep
@@ -143,6 +143,22 @@ EOF
     mkdir -p "$HOME/.local/state/sbx/forked/keep/$(sbx_copy_path_slug "$PROJ")/$(sbx_copy_mount_id /data)"
     dry --cli keep
     [[ "$output" == *"forked  $ROOT/src → /data  (exists)"* ]]
+    # The store is keyed by profile name, not by the flag that applied it.
+    dry --fs keep
+    [[ "$output" == *"forked  $ROOT/src → /data  (exists)"* ]]
+}
+
+@test "--cli applies fs profiles after every --fs, in the order given" {
+    echo '{"env":{"WHO":"a"},"path":["/a"]}' > "$HOME/.config/sbx/profiles/fs/pa.json"
+    echo '{"env":{"WHO":"b"},"path":["/b"]}' > "$HOME/.config/sbx/profiles/fs/pb.json"
+    echo '{"env":{"WHO":"c"},"path":["/c"]}' > "$HOME/.config/sbx/profiles/fs/pc.json"
+    run bash -c 'cd "$1" && shift && "$@" < /dev/null 2>/dev/null' _ "$PROJ" "$SBX" \
+        --dry-run --json --cli pa --fs pc --cli pb
+    [ "$status" -eq 0 ]
+    [ "$(jq -c '[.profiles[] | .type + "/" + .name]' <<< "$output")" = '["fs/pc","fs/pa","fs/pb"]' ]
+    [ "$(jq -r '[.env[] | select(.name == "WHO")] | last | .raw' <<< "$output")" = "b" ]
+    [[ "$(jq -r '.path_raw' <<< "$output")" == /b:/a:/c:* ]]
+    nothing_created
 }
 
 @test "passthrough values never appear" {

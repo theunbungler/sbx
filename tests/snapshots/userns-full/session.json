@@ -7,6 +7,5 @@
     ],
     "net_profiles": [
         "@REPO@/profiles/net/web.json"
-    ],
-    "cli_profile": null
+    ]
 }

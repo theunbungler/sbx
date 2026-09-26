@@ -9,7 +9,7 @@ setup() {
 doc() {   # [jq update]
     jq -cn '{
       profiles: [{type:"fs",name:"sandbox",path:"/g/fs/sandbox.json",origin:"global"},
-                 {type:"cli",name:"pi",path:"/home/u/.config/sbx/profiles/cli/pi.json",origin:"user"}],
+                 {type:"fs",name:"pi",path:"/home/u/.config/sbx/profiles/fs/pi.json",origin:"user"}],
       errors: [], warnings: [], confirm: [],
       deps: ["core"],
       security: {caps_keep:false, caps_profile:"", userns_full:false, userns_profile:"", docker_api:false},
@@ -41,7 +41,7 @@ line() {   # <prefix> -> the first output line starting with it
 
 @test "profiles and security" {
     render
-    [ "$(line Profiles)" = "Profiles   fs/sandbox (global)  cli/pi (user)" ]
+    [ "$(line Profiles)" = "Profiles   fs/sandbox (global)  fs/pi (user)" ]
     [ "$(line Security)" = "Security   capabilities dropped; mounts and the firewall are enforced from outside the payload namespace · no userns · no docker API" ]
     render '.security = {caps_keep:true, caps_profile:"/home/u/.config/sbx/profiles/fs/k.json", userns_full:true, userns_profile:"x", docker_api:true}'
     [ "$(line Security)" = "Security   capabilities KEPT in the payload namespace (~/.config/sbx/profiles/fs/k.json) · userns full · docker API" ]
@@ -49,12 +49,12 @@ line() {   # <prefix> -> the first output line starting with it
 
 @test "mounts show perm, paths, note and origin; absent sources are skipped" {
     render '.mounts = [
-        {profile:"pi",from:"cli/pi",source:"/home/u/.pi",dest:"/home/u/.pi",perm:"forked",present:true},
+        {profile:"pi",from:"fs/pi",source:"/home/u/.pi",dest:"/home/u/.pi",perm:"forked",present:true},
         {profile:"s",from:"fs/s",source:"/opt/missing",dest:"/opt/x",perm:"ro",present:false},
         {profile:"s",from:"fs/s",source:"/home/u/new",dest:"/n",perm:"rw",present:false}]
       | .writes = [{kind:"persistent",path:"/s/forked",detail:"forked store",dest:"/home/u/.pi",note:"will seed, 12M",source:"/home/u/.pi"},
                    {kind:"host",path:"/home/u/new",detail:"rw bind",dest:"/n",note:"created at launch",source:"/home/u/new"}]'
-    [ "$(line Mounts)" = "Mounts     forked  ~/.pi → ~/.pi  (will seed, 12M)  cli/pi" ]
+    [ "$(line Mounts)" = "Mounts     forked  ~/.pi → ~/.pi  (will seed, 12M)  fs/pi" ]
     printf '%s\n' "$output" | grep -qxF "           skip    /opt/missing → /opt/x  (source absent)  fs/s"
     printf '%s\n' "$output" | grep -qxF "           rw      ~/new → /n  (created at launch)  fs/s"
 }
@@ -70,8 +70,8 @@ line() {   # <prefix> -> the first output line starting with it
 }
 
 @test "env shows the winning value and what it overrides; PATH has its own line" {
-    render '.env = [{name:"A",value:"1",raw:"1",from:"fs/x"},{name:"PATH",value:"/p",raw:"/p",from:"fs/x"},{name:"A",value:"2",raw:"$A",from:"cli/c"}]'
-    [ "$(line Env)" = "Env        A=\$A  (cli/c; overrides fs/x)" ]
+    render '.env = [{name:"A",value:"1",raw:"1",from:"fs/x"},{name:"PATH",value:"/p",raw:"/p",from:"fs/x"},{name:"A",value:"2",raw:"$A",from:"fs/c"}]'
+    [ "$(line Env)" = "Env        A=\$A  (fs/c; overrides fs/x)" ]
     if printf '%s\n' "$output" | grep -q 'PATH=/p'; then return 1; fi
     [ "$(line Path)" = "Path       ~/.local/state/sbx/sessions/proj/bin:/usr/local/bin:/usr/bin:/bin" ]
 }
