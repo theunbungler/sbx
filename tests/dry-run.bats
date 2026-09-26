@@ -264,3 +264,19 @@ EOF
     [[ "$output" == *"Result     the launch would proceed"* ]]
     nothing_created
 }
+
+@test "--json carries the leftover cli directory warning" {
+    mkdir -p "$HOME/.config/sbx/profiles/cli"
+    echo '{}' > "$HOME/.config/sbx/profiles/cli/old.json"
+    run bash -c 'cd "$1" && shift && "$@" < /dev/null 2>/dev/null' _ "$PROJ" "$SBX" --dry-run --json --fs sandbox
+    [ "$status" -eq 0 ]
+    [[ "$(jq -r '.warnings[]' <<< "$output")" == *"none in $HOME/.config/sbx/profiles/cli are loaded"* ]]
+}
+
+@test "--cli with only a cli/ copy of the profile fails with where to move it" {
+    mkdir -p "$HOME/.config/sbx/profiles/cli"
+    echo '{}' > "$HOME/.config/sbx/profiles/cli/old.json"
+    run bash -c 'cd "$1" && shift && "$@" < /dev/null 2>&1' _ "$PROJ" "$SBX" --dry-run --cli old
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"move it to $HOME/.config/sbx/profiles/fs/old.json"* ]]
+}

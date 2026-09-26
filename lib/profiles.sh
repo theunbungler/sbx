@@ -21,6 +21,12 @@ sbx_profile_resolve() {   # <type> <name> <config_dir> <global_dir>
         name="${name#"$type"/}"
     fi
 
+    # "cli/<name>" from habit: cli profiles are fs profiles now.
+    if [[ "$name" == cli/* ]] && sbx_profile_valid_name "${name#cli/}"; then
+        echo "Error: cli profiles are now fs profiles; name it '${name#cli/}'." >&2
+        return 1
+    fi
+
     if [[ "$name" == *.json ]] || ! sbx_profile_valid_name "$name"; then
         clean=$(LC_ALL=C tr -cd '\11\40-\176' <<< "$arg")
         if [[ ${#clean} -gt 500 ]]; then
@@ -39,8 +45,39 @@ sbx_profile_resolve() {   # <type> <name> <config_dir> <global_dir>
         fi
     done
 
+    if [[ "$type" == fs ]]; then
+        for p in "./.sbx/profiles/cli/$name.json" \
+                 "$config_dir/profiles/cli/$name.json" \
+                 "$global_dir/cli/$name.json"; do
+            if [[ -f "$p" ]]; then
+                echo "Error: Profile '$name' not found. $p is a cli profile, and cli profiles are now fs profiles: move it to ${p%/cli/*}/fs/$name.json" >&2
+                return 1
+            fi
+        done
+    fi
     echo "Error: Profile '$name' of type '$type' not found." >&2
     return 1
+}
+
+# cli profiles were folded into fs profiles; nothing loads from a cli/
+# directory any more. These name the ones still holding profiles, so a
+# launch, --list-profiles and sbx-profile check can say so rather than
+# ignore them silently.
+sbx_profile_legacy_cli_dirs() {   # <config_dir> <global_dir>
+    local d f
+    for d in "./.sbx/profiles/cli" "$1/profiles/cli" "$2/cli"; do
+        for f in "$d"/*.json; do
+            if [[ -f "$f" ]]; then
+                printf '%s\n' "$d"
+                break
+            fi
+        done
+    done
+    return 0
+}
+
+sbx_profile_legacy_cli_warning() {   # <dir>
+    printf 'cli profiles are now fs profiles, so none in %s are loaded; move them to %s/fs\n' "$1" "${1%/cli}"
 }
 
 # Where a resolved profile came from. "project" is what matters for trust:
@@ -100,7 +137,7 @@ sbx_profile_list() {   # <config_dir> <global_dir>
     )
 
     echo "Available Profiles:"
-    for type in cli fs net; do
+    for type in fs net; do
         echo ""
         echo "${type^^} Profiles:"
         found=0
@@ -128,10 +165,16 @@ sbx_profile_list() {   # <config_dir> <global_dir>
             echo "  (none)"
         fi
     done
+
+    local legacy
+    while IFS= read -r legacy; do
+        echo ""
+        echo "Warning: $(sbx_profile_legacy_cli_warning "$legacy" | LC_ALL=C tr -d '\000-\037\177')"
+    done < <(sbx_profile_legacy_cli_dirs "$config_dir" "$global_dir")
 }
 
 sbx_profile_valid_type() {   # <type>
-    [[ "$1" == "cli" || "$1" == "fs" || "$1" == "net" ]]
+    [[ "$1" == "fs" || "$1" == "net" ]]
 }
 
 # A profile name is one path component, so creating one can never write
@@ -147,8 +190,7 @@ sbx_profile_valid_name() {   # <name>
 # a template left unedited can never open access by accident.
 sbx_profile_template() {   # <type> <description>
     case "$1" in
-        cli) jq -n --indent 4 --arg d "$2" '{description: $d, env: {}, passthrough: [], mounts: []}' ;;
-        fs)  jq -n --indent 4 --arg d "$2" '{description: $d, mounts: []}' ;;
+        fs)  jq -n --indent 4 --arg d "$2" '{description: $d, env: {}, passthrough: [], mounts: []}' ;;
         net) jq -n --indent 4 --arg d "$2" '{description: $d, dns: "1.1.1.1", allow: [], ports: [443]}' ;;
         *)   return 1 ;;
     esac

@@ -261,3 +261,12 @@ r() { jq -r "$1" <<< "$PLAN"; }
     [ "$(r .path)" = "$HOME/c1:/b1:/a1:/a2:/envp:/usr/local/bin:/usr/bin:/bin" ]
     [ "$(r .path_raw)" = '$HOME/c1:/b1:/a1:/a2:/envp:/usr/local/bin:/usr/bin:/bin' ]
 }
+
+@test "a leftover cli directory warns, even when an fs profile of the same name loads" {
+    mkdir -p "$CFG/profiles/cli"
+    echo '{"env":{"MINE":"1"}}' > "$CFG/profiles/cli/claude.json"
+    echo '{}' > "$GLOBAL/fs/claude.json"
+    resolve --fs "$GLOBAL/fs/claude.json"
+    [[ "$(r '.warnings[]')" == *"cli profiles are now fs profiles, so none in $CFG/profiles/cli are loaded; move them to $CFG/profiles/fs"* ]]
+    [ "$(q .errors)" = '[]' ]
+}

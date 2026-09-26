@@ -12,7 +12,7 @@ check() {   # <type> <origin> <json>
 }
 
 @test "a minimal valid profile of each type is clean" {
-    check cli user '{"description":"d","env":{"A":"b","N":1},"path":["/x"],"passthrough":["TOKEN"],"mounts":[{"source":"/a","dest":"/b","perm":"ro"}]}'
+    check fs user '{"description":"d","env":{"A":"b","N":1},"path":["/x"],"passthrough":["TOKEN"],"mounts":[{"source":"/a","dest":"/b","perm":"ro"}]}'
     [ -z "$output" ]
     check fs user '{"mounts":[{"source":"/a","dest":"/b","perm":"forked"}],"caps":"keep","userns":"full","docker_api":true}'
     [ -z "$output" ]

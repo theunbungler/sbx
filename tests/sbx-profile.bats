@@ -64,7 +64,7 @@ teardown() {
     echo '{}' > "$ROOT/elsewhere/x.json"
     run "$SBXP" check "$ROOT/elsewhere/x.json"
     [ "$status" -eq 2 ]
-    [[ "$output" == *"must be cli, fs or net"* ]]
+    [[ "$output" == *"must be fs or net"* ]]
 }
 
 @test "check treats a symlinked project profile as project even by absolute path" {
@@ -272,7 +272,7 @@ teardown() {
 
 @test "every created profile validates" {
     local type
-    for type in cli fs net; do
+    for type in fs net; do
         "$SBXP" new "$type" "t$type" --user > /dev/null
         run "$SBXP" check "$type/t$type"
         [ "$status" -eq 0 ]
@@ -317,4 +317,31 @@ teardown() {
     [[ "$output" == *"[2Kbad"* ]]
     [[ "$output" == *"is not a profile name"* ]]
     if [[ -e "$HOME/.config/sbx/profiles/fs/y.json" ]]; then return 1; fi
+}
+
+@test "new cli is refused with a pointer to fs" {
+    run "$SBXP" new cli x --user
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"cli profiles are now fs profiles"*"sbx-profile new fs x"* ]]
+    if [[ -e "$HOME/.config/sbx/profiles/cli/x.json" ]]; then return 1; fi
+}
+
+@test "check refuses a cli profile by name or path, with the move hint" {
+    mkdir -p "$HOME/.config/sbx/profiles/cli"
+    echo '{}' > "$HOME/.config/sbx/profiles/cli/old.json"
+    run "$SBXP" check cli/old
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"cli profiles are now fs profiles"* ]]
+    run "$SBXP" check "$HOME/.config/sbx/profiles/cli/old.json"
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"move it to $HOME/.config/sbx/profiles/fs/old.json"* ]]
+}
+
+@test "check with no argument warns about a leftover cli directory and still passes" {
+    mkdir -p "$HOME/.config/sbx/profiles/cli"
+    echo '{}' > "$HOME/.config/sbx/profiles/cli/old.json"
+    run "$SBXP" check
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"warning: cli profiles are now fs profiles, so none in $HOME/.config/sbx/profiles/cli are loaded"* ]]
+    if [[ "$output" == *"cli/old ("* ]]; then return 1; fi
 }

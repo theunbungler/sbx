@@ -119,6 +119,13 @@ sbx_resolve() {
         fi
     done
 
+    # A cli/ directory is never read; say so rather than let a profile
+    # there be ignored silently (see sbx_profile_legacy_cli_dirs).
+    local legacy
+    while IFS= read -r legacy; do
+        warnings+=("$(sbx_profile_legacy_cli_warning "$legacy")")
+    done < <(sbx_profile_legacy_cli_dirs "$config_dir" "$global_dir")
+
     local caps_keep=false caps_profile="" userns_full=false userns_profile="" docker_api=false
     local f_userns f_caps f_docker
     # profiles, mounts and env hold flat field lists (sbx_resolve_records),

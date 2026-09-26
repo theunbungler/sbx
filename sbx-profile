@@ -33,7 +33,7 @@ Commands:
                               as an absent mount source or whether a
                               project profile will prompt.
   new <type> <name> [--user|--local] [--from <profile>]
-                              Create a profile: cli, fs or net. --user writes
+                              Create a profile: fs or net. --user writes
                               ~/.config/sbx/profiles, --local writes
                               ./.sbx/profiles. Never overwrites.
   help                        Show this help
@@ -108,7 +108,7 @@ cmd_check() {
     fi
 
     if [[ $# -eq 0 ]]; then
-        for type in cli fs net; do
+        for type in fs net; do
             for entry in "project:./.sbx/profiles/$type" \
                          "user:$CONFIG_DIR/profiles/$type" \
                          "global:$GLOBAL_DIR/$type"; do
@@ -141,6 +141,10 @@ cmd_check() {
                 done
             done
         done
+        local legacy
+        while IFS= read -r legacy; do
+            echo "warning: $(sbx_sanitize_message "$(sbx_profile_legacy_cli_warning "$legacy")")"
+        done < <(sbx_profile_legacy_cli_dirs "$CONFIG_DIR" "$GLOBAL_DIR")
         if [[ $found -eq 0 ]]; then
             echo "No profiles found."
         fi
@@ -149,8 +153,12 @@ cmd_check() {
 
     if [[ -f "$1" ]]; then
         type=$(basename "$(dirname "$1")")
+        if [[ "$type" == cli ]]; then
+            echo "Error: cli profiles are now fs profiles: move it to $(sbx_sanitize_message "$(dirname "$(dirname "$1")")/fs/$(basename "$1")")" >&2
+            return 2
+        fi
         if ! sbx_profile_valid_type "$type"; then
-            echo "Error: cannot tell the type of '$(sbx_sanitize_message "$1")': its directory must be cli, fs or net. Use <type>/<name> instead." >&2
+            echo "Error: cannot tell the type of '$(sbx_sanitize_message "$1")': its directory must be fs or net. Use <type>/<name> instead." >&2
             return 2
         fi
         check_one "$type" "$1" || rc=1
@@ -168,6 +176,10 @@ cmd_check() {
     fi
     type="${1%%/*}"
     name="${1#*/}"
+    if [[ "$type" == cli ]]; then
+        echo "Error: cli profiles are now fs profiles; check fs/$(sbx_sanitize_message "$name") instead." >&2
+        return 2
+    fi
     if ! sbx_profile_valid_type "$type"; then
         echo "Error: no profile file at '$(sbx_sanitize_message "$1")'." >&2
         return 2
@@ -179,15 +191,11 @@ cmd_check() {
 
 field_guide() {   # <type>
     case "$1" in
-        cli)
-            echo '  env          variables to set, e.g. {"EDITOR": "vim"}'
-            echo '  passthrough  host variables to forward by name, e.g. ["ANTHROPIC_API_KEY"]'
-            echo '  path         directories to put first on PATH'
-            echo '  mounts       [{"source": "...", "dest": "...", "perm": "ro|rw|dev|forked|record"}]'
-            ;;
         fs)
             echo '  mounts       [{"source": "...", "dest": "...", "perm": "ro|rw|dev|forked|record"}]'
             echo '  env          variables to set, e.g. {"EDITOR": "vim"}'
+            echo '  passthrough  host variables to forward by name, e.g. ["ANTHROPIC_API_KEY"]'
+            echo '  path         directories to put first on PATH'
             ;;
         net)
             echo '  allow        hostnames, *.domains or CIDRs, e.g. ["github.com", "*.example.com"]'
@@ -232,8 +240,12 @@ cmd_new() {
     fi
     type="${pos[0]}"
     name="${pos[1]}"
+    if [[ "$type" == cli ]]; then
+        echo "Error: cli profiles are now fs profiles; use: sbx-profile new fs $(sbx_sanitize_message "$name")" >&2
+        return 2
+    fi
     if ! sbx_profile_valid_type "$type"; then
-        echo "Error: the type must be cli, fs or net, got '$(sbx_sanitize_message "$type")'." >&2
+        echo "Error: the type must be fs or net, got '$(sbx_sanitize_message "$type")'." >&2
         return 2
     fi
     if ! sbx_profile_valid_name "$name"; then

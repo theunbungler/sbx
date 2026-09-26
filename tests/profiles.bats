@@ -4,14 +4,13 @@ setup() {
     source "$BATS_TEST_DIRNAME/../lib/profiles.sh"
     W="$BATS_TEST_TMPDIR/w"
     PROJ="$W/proj"; CFG="$W/cfg"; GLOBAL="$W/global"
-    mkdir -p "$PROJ/.sbx/profiles/fs" "$CFG/profiles/fs" "$CFG/profiles/net" "$GLOBAL/fs" "$GLOBAL/cli"
+    mkdir -p "$PROJ/.sbx/profiles/fs" "$CFG/profiles/fs" "$CFG/profiles/net" "$GLOBAL/fs"
     echo '{}' > "$PROJ/.sbx/profiles/fs/shared.json"
     echo '{}' > "$CFG/profiles/fs/shared.json"
     echo '{}' > "$CFG/profiles/fs/mine.json"
     echo '{}' > "$CFG/profiles/net/web.json"
     echo '{}' > "$GLOBAL/fs/shared.json"
     echo '{}' > "$GLOBAL/fs/base.json"
-    echo '{}' > "$GLOBAL/cli/dev.json"
     cd "$PROJ"
 }
 
@@ -26,8 +25,42 @@ setup() {
 }
 
 @test "resolve strips a type prefix" {
-    run sbx_profile_resolve cli cli/dev "$CFG" "$GLOBAL"
-    [ "$output" = "$GLOBAL/cli/dev.json" ]
+    run sbx_profile_resolve fs fs/base "$CFG" "$GLOBAL"
+    [ "$output" = "$GLOBAL/fs/base.json" ]
+}
+
+@test "a cli/ prefix is refused with a hint to drop it" {
+    run sbx_profile_resolve fs cli/base "$CFG" "$GLOBAL"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"cli profiles are now fs profiles"*"'base'"* ]]
+}
+
+@test "a name found only under a cli/ directory fails with where to move it" {
+    mkdir -p "$CFG/profiles/cli"
+    echo '{}' > "$CFG/profiles/cli/old.json"
+    run sbx_profile_resolve fs old "$CFG" "$GLOBAL"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"$CFG/profiles/cli/old.json"*"move it to $CFG/profiles/fs/old.json"* ]]
+}
+
+@test "legacy cli dirs: only directories holding a profile are reported" {
+    run sbx_profile_legacy_cli_dirs "$CFG" "$GLOBAL"
+    [ -z "$output" ]
+    mkdir -p "$CFG/profiles/cli" "$GLOBAL/cli" .sbx/profiles/cli
+    echo '{}' > "$GLOBAL/cli/x.json"
+    echo '{}' > .sbx/profiles/cli/y.json
+    run sbx_profile_legacy_cli_dirs "$CFG" "$GLOBAL"
+    [ "$output" = "./.sbx/profiles/cli
+$GLOBAL/cli" ]
+    [ "$(sbx_profile_legacy_cli_warning "$GLOBAL/cli")" = "cli profiles are now fs profiles, so none in $GLOBAL/cli are loaded; move them to $GLOBAL/fs" ]
+}
+
+@test "the list has no CLI section and warns about a leftover cli directory" {
+    mkdir -p "$CFG/profiles/cli"
+    echo '{}' > "$CFG/profiles/cli/old.json"
+    run sbx_profile_list "$CFG" "$GLOBAL"
+    if [[ "$output" == *"CLI Profiles"* ]]; then return 1; fi
+    [[ "$output" == *"Warning: cli profiles are now fs profiles, so none in $CFG/profiles/cli are loaded"* ]]
 }
 
 @test "resolve rejects anything that isn't a bare name" {
@@ -125,7 +158,7 @@ setup() {
 }
 
 @test "valid types and names" {
-    sbx_profile_valid_type cli
+    if sbx_profile_valid_type cli; then return 1; fi
     sbx_profile_valid_type fs
     sbx_profile_valid_type net
     if sbx_profile_valid_type ssh; then return 1; fi
@@ -139,13 +172,12 @@ setup() {
 @test "templates are valid and grant nothing" {
     source "$BATS_TEST_DIRNAME/../lib/profile-check.sh"
     local type out
-    for type in cli fs net; do
+    for type in fs net; do
         sbx_profile_template "$type" "a $type profile" > "$W/t.json"
         out=$(sbx_profile_check "$type" "$W/t.json" project)
         if [[ -n "$out" ]]; then echo "$type template: $out" >&2; return 1; fi
     done
-    [ "$(sbx_profile_template cli d | jq -c .)" = '{"description":"d","env":{},"passthrough":[],"mounts":[]}' ]
-    [ "$(sbx_profile_template fs d | jq -c .)" = '{"description":"d","mounts":[]}' ]
+    [ "$(sbx_profile_template fs d | jq -c .)" = '{"description":"d","env":{},"passthrough":[],"mounts":[]}' ]
     [ "$(sbx_profile_template net d | jq -c .)" = '{"description":"d","dns":"1.1.1.1","allow":[],"ports":[443]}' ]
     run sbx_profile_template ssh d
     [ "$status" -eq 1 ]
