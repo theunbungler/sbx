@@ -18,7 +18,7 @@ SBX_PROFILE_RESTRICTED='["caps","userns","docker_api","host_ports"]'
 SBX_PROFILE_CHECK_JQ='
 def known:
   { cli: ["description","env","path","mounts","passthrough","caps","userns","docker_api"],
-    fs:  ["description","mounts","env","passthrough","caps","userns","docker_api"],
+    fs:  ["description","env","path","mounts","passthrough","caps","userns","docker_api"],
     net: ["description","dns","allow","ports","host_ports"] };
 def err($p; $m): {level: "error", path: $p, message: $m};
 def warn($p; $m): {level: "warning", path: $p, message: $m};

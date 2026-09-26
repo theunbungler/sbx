@@ -251,3 +251,13 @@ r() { jq -r "$1" <<< "$PLAN"; }
     resolve --net "$net"
     [[ "$(r '.warnings[0]')" == *".dns: not a bare IPv4 address, so 1.1.1.1 is used instead"* ]]
 }
+
+@test "path entries stack across profiles, later profile first, before env PATH" {
+    local a b c
+    a=$(user fs pa '{"path":["/a1","/a2"],"env":{"PATH":"/envp"}}')
+    b=$(user fs pb '{"path":["/b1"]}')
+    c=$(user fs pc '{"path":["$HOME/c1"]}')
+    resolve --fs "$a" --fs "$b" --fs "$c"
+    [ "$(r .path)" = "$HOME/c1:/b1:/a1:/a2:/envp:/usr/local/bin:/usr/bin:/bin" ]
+    [ "$(r .path_raw)" = '$HOME/c1:/b1:/a1:/a2:/envp:/usr/local/bin:/usr/bin:/bin' ]
+}

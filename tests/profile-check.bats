@@ -121,3 +121,12 @@ check() {   # <type> <origin> <json>
         fi
     done
 }
+
+@test "an fs profile may set path, and path is validated" {
+    check fs user '{"path":["/x","$HOME/bin"]}'
+    [ -z "$output" ]
+    check fs user '{"path":"/x"}'
+    [[ "$output" == *".path"*"expected an array of strings"* ]]
+    check fs user '{"path":["/x",3]}'
+    [[ "$output" == *".path[1]"*"expected a string"* ]]
+}

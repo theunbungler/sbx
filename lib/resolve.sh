@@ -27,7 +27,8 @@ sbx_resolve_records() {   # <n> <field>...
         --args -- "$@"
 }
 
-# PATH inside the sandbox: <cli path entries> in front of <env PATH>, then
+# PATH inside the sandbox: <every profile's path entries, later profile
+# first> in front of <env PATH>, then
 # the default. With no entries, an env PATH stands alone.
 sbx_resolve_path() {   # <entries, colon-joined> <env PATH>
     local default="/usr/local/bin:/usr/bin:/bin"
@@ -174,7 +175,8 @@ sbx_resolve() {
     fi
 
     if [[ ${#errors[@]} -eq 0 ]]; then
-        local kind f1 f2 f3 source dest perm present from value cli_path=""
+        local kind f1 f2 f3 source dest perm present from value
+        local -a path_entries=() profile_path=()
         for i in "${!paths[@]}"; do
             if [[ "${types[$i]}" == "net" ]]; then
                 continue
@@ -182,6 +184,7 @@ sbx_resolve() {
             p="${paths[$i]}"
             name=$(basename "$p" .json)
             from="${types[$i]}/$name"
+            profile_path=()
 
             # One jq pass per profile: every mount, passthrough name and env
             # entry, NUL-separated so a value may hold any character.
@@ -205,6 +208,9 @@ sbx_resolve() {
                             warnings+=("$from: mount source not present on this host, skipped: $perm $source")
                         fi
                         ;;
+                    path)
+                        profile_path+=("$f1")
+                        ;;
                     pass)
                         if [[ -n "$f1" ]]; then
                             passthrough+=("$f1")
@@ -224,16 +230,20 @@ sbx_resolve() {
             done < <(jq -j 'def nul: [0] | implode;
                 (.mounts[]? | "mount", nul, .source, nul, .dest, nul, .perm, nul),
                 (.passthrough[]? | "pass", nul, ., nul, "", nul, "", nul),
+                (.path[]? | "path", nul, ., nul, "", nul, "", nul),
                 (.env // {} | to_entries[] | "env", nul, .key, nul, (.value | tostring), nul, "", nul)' "$p")
+            # A later profile's entries go in front, as its env wins.
+            path_entries=("${profile_path[@]}" "${path_entries[@]}")
         done
 
-        # A cli profile's path entries go in front of any PATH an env block
+        # Every profile's path entries go in front of any PATH an env block
         # set, and the default closes the list (see sbx_resolve_path).
-        if [[ -n "$cli" ]]; then
-            cli_path=$(jq -r '.path[]?' "$cli")
+        local path_joined=""
+        if [[ ${#path_entries[@]} -gt 0 ]]; then
+            path_joined=$(printf '%s\n' "${path_entries[@]}" | paste -sd: -)
         fi
-        sandbox_path=$(sbx_resolve_path "$(envsubst <<< "$cli_path" | paste -sd: -)" "$sandbox_path")
-        sandbox_path_raw=$(sbx_resolve_path "$(paste -sd: - <<< "$cli_path")" "$sandbox_path_raw")
+        sandbox_path=$(sbx_resolve_path "$(envsubst <<< "$path_joined")" "$sandbox_path")
+        sandbox_path_raw=$(sbx_resolve_path "$path_joined" "$sandbox_path_raw")
 
         # --- Host-service access ---
         # Ports named here are forwarded by pasta from the host's loopback into the
