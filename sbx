@@ -597,7 +597,7 @@ read_plan_settings() {
     eval "$(jq -r '@sh "USERNS_FULL=\(.security.userns_full) USERNS_PROFILE=\(.security.userns_profile)
         CAPS_KEEP=\(.security.caps_keep) CAPS_PROFILE=\(.security.caps_profile)
         DOCKER_API=\(.security.docker_api) SBX_NETNS=\(.netns) NET_ENABLED=\(.net.enabled)
-        TEST_DOMAIN=\(.net.test_domain // "") SANDBOX_PATH=\(.path)
+        TEST_DOMAIN=\(.net.test_domain // "") SANDBOX_PATH=\(.path) GUI=\(.gui)
         NEED_SUBIDS=\(.checks | index("subids") != null)"' <<< "$PLAN")"
     mapfile -t HOST_PORTS_TCP < <(plan_get '.host_ports.tcp[]')
     mapfile -t HOST_PORTS_UDP < <(plan_get '.host_ports.udp[]')
@@ -1105,7 +1105,8 @@ write_session_records() {
 # An xpra virtual display, bound into the sandbox with its own cookie.
 setup_gui() {
     local display_num=100 xpra_log x11_sock ready=false host_xauth sbx_xauth
-    if [[ "$GUI_FLAG" != "true" ]]; then
+    # --gui or any profile's "gui": true; one display however many asked.
+    if [[ "$GUI" != "true" ]]; then
         return 0
     fi
     while [[ -S "/tmp/.X11-unix/X$display_num" ]]; do
@@ -1119,6 +1120,7 @@ setup_gui() {
         --daemon=yes \
         --log-file="$xpra_log" \
         --mdns=no \
+        --clipboard=no \
         --notifications=no \
         --bell=no \
         --speaker=disabled \

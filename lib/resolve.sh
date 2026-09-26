@@ -123,7 +123,7 @@ sbx_resolve() {
     done
 
     local caps_keep=false caps_profile="" userns_full=false userns_profile="" docker_api=false
-    local f_userns f_caps f_docker
+    local f_userns f_caps f_docker f_gui
     # profiles, mounts and env hold flat field lists (sbx_resolve_records),
     # turned into objects by one jq call each at the end.
     local -a mounts=() passthrough=() env=() tcp=() udp=()
@@ -143,6 +143,8 @@ sbx_resolve() {
         #                          mounts and the firewall ruleset belong to the
         #                          control namespace A and stay out of B's reach.
         #   "docker_api": true  -> start a podman docker-API socket for the session.
+        #   "gui": true         -> an xpra display, as --gui. One per session
+        #                          however many profiles ask for it.
         #
         # None of these are honored from a project-supplied profile: a repository
         # must never be able to talk its way back to the pre-hardening boundary,
@@ -152,8 +154,8 @@ sbx_resolve() {
                 continue
             fi
             p="${paths[$i]}"
-            IFS=$'\t' read -r f_userns f_caps f_docker < <(
-                jq -r '[.userns // "-", .caps // "-", (.docker_api // false | tostring)] | @tsv' "$p")
+            IFS=$'\t' read -r f_userns f_caps f_docker f_gui < <(
+                jq -r '[.userns // "-", .caps // "-", (.docker_api // false | tostring), (.gui // false | tostring)] | @tsv' "$p")
             if [[ "$f_userns" == "full" ]]; then
                 userns_full=true
                 userns_profile="$p"
@@ -166,6 +168,9 @@ sbx_resolve() {
             fi
             if [[ "$f_docker" == "true" ]]; then
                 docker_api=true
+            fi
+            if [[ "$f_gui" == "true" ]]; then
+                gui=true
             fi
         done
         if [[ "$userns_full" == "true" && ${#net[@]} -eq 0 ]]; then

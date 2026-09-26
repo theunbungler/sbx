@@ -1,12 +1,10 @@
 {
-    "description": "Project-specific sources",
+    "description": "A display for browsers and other GUI apps (xpra; attach with xpra attach :<N>)",
+    "gui": true,
     "mounts": [
     ],
     "env": {
         "USER": "user",
-        "DISPLAY": ":0",
-        "XDG_RUNTIME_DIR": "/run/user/1000",
-        "WAYLAND_DISPLAY": "wayland-0"
+        "XDG_RUNTIME_DIR": "/run/user/1000"
     }
-
 }

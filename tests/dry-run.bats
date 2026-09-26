@@ -248,3 +248,12 @@ EOF
     [[ "$output" == *"Result     the launch would proceed"* ]]
     nothing_created
 }
+
+@test "several gui profiles list one display socket among the host writes" {
+    echo '{"gui":true}' > "$HOME/.config/sbx/profiles/fs/g1.json"
+    echo '{"gui":true}' > "$HOME/.config/sbx/profiles/fs/g2.json"
+    run bash -c 'cd "$1" && shift && "$@" < /dev/null 2>/dev/null' _ "$PROJ" "$SBX" --dry-run --json --fs g1 --fs g2 --gui
+    [ "$(jq '[.writes[] | select(.path == "/tmp/.X11-unix/X<N>")] | length' <<< "$output")" -eq 1 ]
+    [ "$(jq -r .gui <<< "$output")" = "true" ]
+    nothing_created
+}

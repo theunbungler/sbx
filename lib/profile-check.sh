@@ -11,14 +11,15 @@
 # comment convention.
 
 # Fields a project profile may not set: each one widens the boundary
-# (capabilities, a user namespace, the podman API, host services).
-SBX_PROFILE_RESTRICTED='["caps","userns","docker_api","host_ports"]'
+# (capabilities, a user namespace, the podman API, host services, and an
+# X display served by an unsandboxed host process).
+SBX_PROFILE_RESTRICTED='["caps","userns","docker_api","host_ports","gui"]'
 
 # shellcheck disable=SC2016  # jq program: $vars are jq's, not the shell's
 SBX_PROFILE_CHECK_JQ='
 def known:
-  { cli: ["description","env","path","mounts","passthrough","caps","userns","docker_api"],
-    fs:  ["description","mounts","env","passthrough","caps","userns","docker_api"],
+  { cli: ["description","env","path","mounts","passthrough","caps","userns","docker_api","gui"],
+    fs:  ["description","mounts","env","passthrough","caps","userns","docker_api","gui"],
     net: ["description","dns","allow","ports","host_ports"] };
 def err($p; $m): {level: "error", path: $p, message: $m};
 def warn($p; $m): {level: "warning", path: $p, message: $m};
@@ -92,6 +93,7 @@ else
       ( if has("caps") and .caps != "keep" then err(".caps"; "expected \"keep\", got \(.caps | tojson)") else empty end ),
       ( if has("userns") and .userns != "full" then err(".userns"; "expected \"full\", got \(.userns | tojson)") else empty end ),
       ( if has("docker_api") and (.docker_api | type) != "boolean" then err(".docker_api"; "expected true or false, got \(.docker_api | tojson)") else empty end ),
+      ( if has("gui") and (.gui | type) != "boolean" then err(".gui"; "expected true or false, got \(.gui | tojson)") else empty end ),
 
       ( if has("dns") then
           if (.dns | type) != "string" then err(".dns"; "expected a string, got \(.dns | tojson)")
