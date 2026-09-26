@@ -14,7 +14,7 @@ check() {   # <type> <origin> <json>
 @test "a minimal valid profile of each type is clean" {
     check fs user '{"description":"d","env":{"A":"b","N":1},"path":["/x"],"passthrough":["TOKEN"],"mounts":[{"source":"/a","dest":"/b","perm":"ro"}]}'
     [ -z "$output" ]
-    check fs user '{"mounts":[{"source":"/a","dest":"/b","perm":"forked"}],"caps":"keep","userns":"full","docker_api":true}'
+    check fs user '{"mounts":[{"source":"/a","dest":"/b","perm":"forked"}],"caps":"keep","userns":"full","docker_api":true,"gui":true}'
     [ -z "$output" ]
     check net user '{"dns":"9.9.9.9","allow":["github.com","*","10.0.0.0/8","127.0.0.1"],"ports":[80,"*"],"host_ports":[5432,"53/udp","8080/tcp"]}'
     [ -z "$output" ]
@@ -129,4 +129,13 @@ check() {   # <type> <origin> <json>
     [[ "$output" == *".path"*"expected an array of strings"* ]]
     check fs user '{"path":["/x",3]}'
     [[ "$output" == *".path[1]"*"expected a string"* ]]
+}
+
+@test "gui must be a boolean, and a project profile may not set it" {
+    check fs user '{"gui":false}'
+    [ -z "$output" ]
+    check fs user '{"gui":"yes"}'
+    [[ "$output" == *'.gui: expected true or false, got "yes"'* ]]
+    check fs project '{"gui":true}'
+    [[ "$output" == *".gui: project profiles may not set gui"* ]]
 }

@@ -154,3 +154,29 @@ EOF
     [[ "$output" == *"usermod --add-subuids"* ]]
     no_session_built
 }
+
+@test "missing xpra with a gui profile stops before a display is built" {
+    mkdir -p "$HOME/.config/sbx/profiles/fs"
+    echo '{"gui":true}' > "$HOME/.config/sbx/profiles/fs/g.json"
+    rm "$ROOT/bin/xpra"
+    run_sbx arch --fs g -- /bin/true
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"sudo pacman -S xpra"* ]]
+    no_session_built
+}
+
+# The stub records every xpra call and never makes a display, so the launch
+# stops at "failed to start" having shown exactly how xpra was started.
+@test "several gui profiles and --gui start one xpra, with the clipboard off" {
+    mkdir -p "$HOME/.config/sbx/profiles/fs"
+    echo '{"gui":true}' > "$HOME/.config/sbx/profiles/fs/g1.json"
+    echo '{"gui":true}' > "$HOME/.config/sbx/profiles/fs/g2.json"
+    rm "$ROOT/bin/xpra"
+    printf '#!/bin/sh\necho "$*" >> "%s/xpra.calls"\n' "$ROOT" > "$ROOT/bin/xpra"
+    chmod +x "$ROOT/bin/xpra"
+    run_sbx arch --fs g1 --fs g2 --gui -- /bin/true
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"failed to start"* ]]
+    [ "$(grep -c '^start ' "$ROOT/xpra.calls")" -eq 1 ]
+    grep '^start ' "$ROOT/xpra.calls" | grep -q -- '--clipboard=no'
+}

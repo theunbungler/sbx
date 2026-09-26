@@ -278,3 +278,27 @@ r() { jq -r "$1" <<< "$PLAN"; }
     resolve --fs "$GLOBAL/fs/claude.json"
     [[ "$(r '.warnings[]')" == *"fs/claude: loaded $GLOBAL/fs/claude.json; $CFG/profiles/cli/claude.json is a cli profile and was not used"* ]]
 }
+
+@test "a profile's gui turns the display on, and several collapse to one" {
+    local a b
+    a=$(user fs ga '{"gui":true}')
+    b=$(user fs gb '{"gui":true}')
+    resolve --fs "$a" --fs "$b" --gui
+    [ "$(r .gui)" = "true" ]
+    [ "$(q '[.deps[] | select(. == "gui")] | length')" = "1" ]
+}
+
+@test "gui false leaves the display off" {
+    local fs
+    fs=$(user fs gf '{"gui":false}')
+    resolve --fs "$fs"
+    [ "$(r .gui)" = "false" ]
+    if [[ "$(q .deps)" == *gui* ]]; then return 1; fi
+}
+
+@test "a project profile asking for gui is an error and the display stays off" {
+    printf '%s\n' '{"gui":true}' > .sbx/profiles/fs/evilgui.json
+    resolve --fs ./.sbx/profiles/fs/evilgui.json
+    [[ "$(r '.errors[0]')" == *"may not set gui"* ]]
+    [ "$(r .gui)" = "false" ]
+}

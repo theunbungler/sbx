@@ -62,7 +62,7 @@ Every file under `lib/` is side-effect-free at source time and has no dependency
 
 Two categories, each a JSON file resolved by name (never a path) with project → user → global precedence:
 
-- `profiles/fs/*.json` — mounts, `env`, `path`, `passthrough`, and `caps`/`userns`/`docker_api` (e.g. `claude`, `gemini`, `pi`, `dev`, `sandbox`, `podman`). Stack as many as you like; later profiles win on env and put their `path` entries first. `--cli <name>` is a compatibility alias that applies an fs profile after every `--fs` one. A leftover `cli/` directory is never read; sbx warns about it.
+- `profiles/fs/*.json` — mounts, `env`, `path`, `passthrough`, `gui`, and `caps`/`userns`/`docker_api` (e.g. `claude`, `gemini`, `pi`, `dev`, `sandbox`, `podman`). Stack as many as you like; later profiles win on env and put their `path` entries first. `--cli <name>` is a compatibility alias that applies an fs profile after every `--fs` one. A leftover `cli/` directory is never read; sbx warns about it.
 - `profiles/net/*.json` — egress allow-lists (`web`, `anthropic`, `gemini`), each a set of domains/IPs and ports.
 
 Mount `perm` is one of `ro`, `rw`, `dev`, `forked`, `record` (`lib/profile-check.sh`). `forked` (persistent, sandbox-owned, keyed by profile name + launch dir) and `record` (ephemeral, host-owned, diffed at teardown) are the two isolating perms; see "Forked and Record Mounts" in the README.

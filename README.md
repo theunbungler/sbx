@@ -46,7 +46,7 @@ In every session, this means:
   profile under `./.sbx/profiles` that the repository tracks is shown and
   must be approved before use (or trusted with `SBX_TRUST_PROJECT_PROFILES=1`).
   No project profile, tracked or not, may request `caps`, `userns`,
-  `docker_api` or `host_ports`.
+  `docker_api`, `host_ports` or `gui`.
 
 ### Caveats and Explicit Non-goals
 
@@ -179,6 +179,7 @@ FS profiles define the sandbox's filesystem layout and environment — which dir
 | `path` | array of strings | No | Directories to put first on the sandbox `PATH`. A later profile's entries go in front of an earlier one's, and all go before any `env.PATH`. |
 | `userns` | string | No | `"full"` runs the entire session inside an outer user namespace carrying your full subordinate-UID range (multi-UID podman). Requires `--net`; the session identity becomes namespace-root. See [Multi-UID containers](#multi-uid-containers-podman-full). |
 | `docker_api` | boolean | No | `true` starts a podman docker-API socket for the session (see [Docker compatibility](#docker-compatibility)). |
+| `gui` | boolean | No | `true` gives the session an xpra display, as `--gui` does (see [GUI Attachment](#gui-attachment)). Rejected in project-supplied profiles. |
 | `passthrough` | array | No | Host environment variables to forward into the sandbox by name. The environment is otherwise cleared. |
 | `caps` | string | No | `"keep"` retains capabilities inside the sandbox. Required for nested user namespaces (podman); capabilities stay inside the payload's namespace; `ro` mounts and the firewall still hold. Ignored — and rejected — in project-supplied profiles. |
 
@@ -436,7 +437,19 @@ Both permissions use `rsync --compare-dest` for the diff when available, falling
 
 ## GUI Attachment
 
-When using the `--gui` flag, you can attach to the Xpra session using:
+A session gets an xpra display when you pass `--gui` or when any profile it
+loads sets `"gui": true` (`fs/chrome` does). However many ask, there is one
+display per session. Without either, the session has no display and no
+`DISPLAY` variable, so programs that would open a window or a graphical
+prompt fall back to the terminal or fail, rather than wait on a display
+nobody is watching.
+
+The display is served by xpra running on the host, outside the sandbox, so
+it is the one host process a GUI session can talk to directly; that is why a
+project profile may not turn it on. Clipboard sharing is off: an attached
+viewer never exposes your host clipboard to the session.
+
+Attach a viewer with:
 
 ```bash
 xpra attach :<N>
