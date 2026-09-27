@@ -47,6 +47,8 @@ FS_PROFILES=()
 NET_PROFILES=()
 LAST_PROFILES=()   # --cli: fs profiles applied after every --fs (compatibility)
 WORKDIR=""
+WORKSPACE=""      # the --workspace file, expanded into the flags as parsed
+WS_WORKDIR=""     # its wd; a --wd on the command line wins wherever it is
 HOST_PORT_SPECS=()   # as typed; lib/resolve.sh validates and buckets them
 COMMAND=()
 GUI_FLAG=false
@@ -115,6 +117,8 @@ Options:
   --fs <profile>         Apply a filesystem profile (multiple allowed)
   --net <profile>        Apply a network profile (multiple allowed)
   --cli <profile>        Apply an fs profile after every --fs one (compatibility)
+  --workspace <name>     Apply a saved selection: ./.sbx/<name>.json, else
+                         ~/.config/sbx/<name>.json ({fs, net, wd, gui})
   --host-port <spec>     Reach a host service on 127.0.0.1:<port> from inside.
                          <spec> is <port>[/tcp|/udp]; bare means tcp.
                          (repeatable; implies a network namespace)
@@ -138,6 +142,39 @@ EOF
 
 resolve_profile() {   # <type> <name>
     sbx_profile_resolve "$1" "$2" "$CONFIG_DIR" "$SCRIPT_DIR/profiles"
+}
+
+# A workspace is flags written down: its profiles are applied where
+# --workspace appears among the flags, its gui is OR'd with --gui, and its
+# wd is used only when no --wd is given. Validated first, so a malformed
+# file never half-applies.
+expand_workspace() {   # <path>
+    local level msg origin=user errors=0 name
+    local -a names=()
+    if [[ "$1" == ./.sbx/* ]]; then
+        origin=project
+    fi
+    while IFS=$'\t' read -r level msg; do
+        if [[ "$level" == error ]]; then
+            echo "Error: $(sbx_sanitize_message "$msg")" >&2
+            errors=1
+        fi
+    done < <(sbx_profile_check workspace "$1" "$origin")
+    if [[ $errors -ne 0 ]]; then
+        exit 1
+    fi
+    mapfile -t names < <(jq -r '.fs[]?' "$1")
+    for name in "${names[@]}"; do
+        FS_PROFILES+=("$(resolve_profile fs "$name")")
+    done
+    mapfile -t names < <(jq -r '.net[]?' "$1")
+    for name in "${names[@]}"; do
+        NET_PROFILES+=("$(resolve_profile net "$name")")
+    done
+    if [[ "$(jq -r '.gui // false' "$1")" == "true" ]]; then
+        GUI_FLAG=true
+    fi
+    WS_WORKDIR="$(jq -r '.wd // ""' "$1" | envsubst)"
 }
 
 # ---------------------------------------------------------------------------
@@ -376,6 +413,15 @@ parse_args() {
                 LAST_PROFILES+=("$(resolve_profile fs "$2")")
                 shift 2
                 ;;
+            --workspace)
+                if [[ -n "$WORKSPACE" ]]; then
+                    echo "Error: only one --workspace per launch." >&2
+                    exit 2
+                fi
+                WORKSPACE="$(sbx_workspace_resolve "$2" "$CONFIG_DIR")"
+                expand_workspace "$WORKSPACE"
+                shift 2
+                ;;
             --host-port)
                 HOST_PORT_SPECS+=("$2")
                 shift 2
@@ -463,6 +509,9 @@ resolve_plan() {
     if [[ "$GUI_FLAG" == "true" ]]; then
         args+=(--gui)
     fi
+    if [[ -n "$WORKSPACE" ]]; then
+        args+=(--workspace "$WORKSPACE")
+    fi
     PLAN=$(sbx_resolve "${args[@]}")
 
     # The name this launch would claim and the widest socket path it could
@@ -524,8 +573,8 @@ dry_run_report() {
 # git-tracked, trust not granted). It only prompts; the trust decision is
 # the plan's. A cloned repository can ship profiles that mount anything, so
 # using one is a decision made outside the repository.
-prompt_project_profile() {   # <profile path>
-    local profile="$1" remote="" rname="" answer=""
+prompt_project_profile() {   # <path> [<kind: profile|workspace>] [<user workspace it shadows>]
+    local profile="$1" kind="${2:-profile}" shadows="${3:-}" remote="" rname="" answer=""
     rname=$(git -C "$PWD" remote 2>/dev/null | head -n1)
     if [[ -n "$rname" ]]; then
         remote=$(git -C "$PWD" remote get-url "$rname" 2>/dev/null || true)
@@ -533,11 +582,14 @@ prompt_project_profile() {   # <profile path>
 
     {
         echo ""
-        echo "This launch would use a profile tracked by the project's git repository:"
+        echo "This launch would use a $kind tracked by the project's git repository:"
         echo "  $profile"
+        if [[ -n "$shadows" ]]; then
+            echo "  It shadows your workspace $shadows"
+        fi
         if [[ -n "$remote" ]]; then
             echo ""
-            echo "  The repo has remote $remote — this profile was authored by"
+            echo "  The repo has remote $remote — this $kind was authored by"
             echo "  whoever wrote that repository, not by you."
         fi
         echo ""
@@ -546,12 +598,12 @@ prompt_project_profile() {   # <profile path>
     } >&2
 
     if [[ ! -t 0 ]]; then
-        echo "Error: refusing to use a project profile non-interactively." >&2
+        echo "Error: refusing to use a project $kind non-interactively." >&2
         echo "  Set SBX_TRUST_PROJECT_PROFILES=1 to allow it." >&2
         exit 1
     fi
 
-    printf "Use this project profile? [y/N] " >&2
+    printf "Use this project %s? [y/N] " "$kind" >&2
     read -r answer < /dev/tty
     if [[ "$answer" != "y" && "$answer" != "Y" ]]; then
         echo "Aborted." >&2
@@ -563,7 +615,7 @@ prompt_project_profile() {   # <profile path>
 # prompts, then warnings: profile-authored warning text must not get the
 # chance to repaint or crowd out the prompt.
 check_plan() {
-    local msg profile
+    local msg profile ws_path
     local -a confirm
     if [[ "$(plan_get '.errors | length')" != "0" ]]; then
         while IFS= read -r msg; do
@@ -575,8 +627,11 @@ check_plan() {
     # mapfile, then a plain for: a `while read` loop would point fd 0 at
     # the process substitution, and the prompt tests fd 0 for a terminal.
     mapfile -t confirm < <(plan_get '.confirm[]')
+    ws_path=$(plan_get '.workspace.path // ""')
     for profile in "${confirm[@]}"; do
-        if [[ -n "$profile" ]]; then
+        if [[ -n "$profile" && "$profile" == "$ws_path" ]]; then
+            prompt_project_profile "$profile" workspace "$(plan_get '.workspace.shadows')"
+        elif [[ -n "$profile" ]]; then
             prompt_project_profile "$profile"
         fi
     done
@@ -1366,6 +1421,9 @@ run_session() {
 
 main() {
     parse_args "$@"
+    if [[ -z "$WORKDIR" ]]; then
+        WORKDIR="$WS_WORKDIR"
+    fi
 
     if [[ "$RESEED" == "true" && "$DRY_RUN" == "true" ]]; then
         echo "Error: --dry-run applies only to a launch; it cannot be combined with --reseed." >&2

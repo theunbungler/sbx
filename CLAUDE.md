@@ -65,6 +65,8 @@ Two categories, each a JSON file resolved by name (never a path) with project �
 - `profiles/fs/*.json` — mounts, `env`, `path`, `passthrough`, `gui`, and `caps`/`userns`/`docker_api` (e.g. `claude`, `gemini`, `pi`, `dev`, `sandbox`, `podman`). Stack as many as you like; later profiles win on env and put their `path` entries first. `--cli <name>` is a compatibility alias that applies an fs profile after every `--fs` one. A leftover `cli/` directory is never read; sbx warns about it.
 - `profiles/net/*.json` — egress allow-lists (`web`, `anthropic`, `gemini`), each a set of domains/IPs and ports.
 
+A **workspace** (`./.sbx/<name>.json`, else `~/.config/sbx/<name>.json`; most local wins) is only `{fs, net, wd, gui}`: flags written down, expanded by `expand_workspace` in `sbx` where `--workspace` appears. It grants nothing itself; a git-tracked project workspace is confirmed like a tracked project profile.
+
 Mount `perm` is one of `ro`, `rw`, `dev`, `forked`, `record` (`lib/profile-check.sh`). `forked` (persistent, sandbox-owned, keyed by profile name + launch dir) and `record` (ephemeral, host-owned, diffed at teardown) are the two isolating perms; see "Forked and Record Mounts" in the README.
 
 Multiple profiles of the same category stack (e.g. two `--fs` profiles); see README "Stacking Network Profiles" for the port-pairing rule that keeps stacked grants minimal rather than unioned.

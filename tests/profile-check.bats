@@ -139,3 +139,17 @@ check() {   # <type> <origin> <json>
     check fs project '{"gui":true}'
     [[ "$output" == *".gui: project profiles may not set gui"* ]]
 }
+
+@test "a workspace holds only fs, net, wd and gui" {
+    check workspace user '{"fs":["a","b"],"net":["web"],"wd":"/w","gui":true}'
+    [ -z "$output" ]
+    # a tracked project workspace is confirmed at launch instead
+    check workspace project '{"gui":true}'
+    [ -z "$output" ]
+    check workspace user '{"fs":"a","net":[1],"wd":3,"gui":"y","mounts":[]}'
+    [[ "$output" == *".fs: expected an array of profile names"* ]]
+    [[ "$output" == *".net[0]: expected a profile name"* ]]
+    [[ "$output" == *".wd: expected a string"* ]]
+    [[ "$output" == *'.gui: expected true or false, got "y"'* ]]
+    [[ "$output" == *".mounts: unknown field for a workspace"* ]]
+}

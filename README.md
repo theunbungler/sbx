@@ -129,11 +129,12 @@ To see all available commands and options, run:
 |---------|-------------|
 | `--doctor [--json]` | Check that required tools are installed and that unprivileged user namespaces work. Prints the install command for your distro. Exits non-zero only if something every session needs is missing. |
 | `--dry-run [--json]` | Show everything this launch would do — profiles, mounts, environment, network grants, every host location it would write, missing dependencies, confirmations, warnings and errors — without creating, prompting or launching anything. Exits 1 if the real launch would stop. |
-| `--list-profiles` | Show all available FS and NET profiles. |
+| `--list-profiles` | Show all available FS and NET profiles, and workspaces. |
 | `--list-sessions` | List all currently active sandbox sessions. |
 | `--join <session>` | Open a new shell inside a running sandbox session, with its own terminal. Append `-- <cmd>` to run a command instead. |
 | `--attach <session>` | Reattach to a running session's original terminal (the one `sbx` started it on). |
 | `--wd <path>` | Start the session in this directory inside the sandbox. |
+| `--workspace <name>` | Apply a saved selection of profiles, working directory and display (see [Workspaces](#workspaces)). |
 | `--host-port <spec>` | Reach a service running on the host's `127.0.0.1:<port>` from inside the sandbox. `<spec>` is `<port>[/tcp\|/udp]`; a bare number means TCP. Repeatable. |
 | `--gui` | Start a session with isolated GUI support via `xpra`. |
 | `--changes [<id>]` | Show what the most recent (or a named) `record`-mount session changed, for the current directory. |
@@ -323,6 +324,35 @@ The starting directory is deliberately not a profile field: it would resolve las
 ```bash
 ./sbx --fs sandbox --wd /workspace
 ```
+
+### Workspaces
+
+A workspace is a set of flags written down: which fs and net profiles to
+load, the working directory, and whether to start a display. It holds
+nothing else — everything a session is granted still comes from profiles.
+
+```json
+{ "fs": ["sandbox", "claude"], "net": ["anthropic"], "wd": "/workspace", "gui": false }
+```
+
+Every field is optional. Save it as `./.sbx/<name>.json` for one project, or
+`~/.config/sbx/<name>.json` for use from any directory, and launch with
+`./sbx --workspace <name>`. When both exist, the project's wins.
+
+- Its profiles are applied where `--workspace` appears among the flags, so
+  `--fs a --workspace dev --fs b` loads `a`, then the workspace's, then `b`.
+- A `--wd` on the command line wins over the workspace's `wd`.
+- `gui: true` starts a display, as `--gui` does; either way there is one.
+- One `--workspace` per launch.
+
+A project workspace that git tracks arrived with the repository and chose
+which of *your* profiles to load, so it is shown and must be approved, like a
+tracked project profile (or trusted with `SBX_TRUST_PROJECT_PROFILES=1`). The
+prompt says which of your own workspaces it shadows. Untracked project
+workspaces and those in `~/.config/sbx` are yours and need no approval. A
+session can write neither location: `.sbx` and `~/.config/sbx` are masked
+inside every sandbox. `--dry-run` shows the workspace and where it came from,
+and `--list-profiles` lists workspaces with what each shadows.
 
 Without `--wd`, bwrap picks the start directory itself: the directory you launched from if that path also exists inside the sandbox, otherwise `$HOME`, otherwise `/`. Since most profiles do not mount the launch directory at its host path, this usually lands in `$HOME` — pass `--wd` whenever the session should begin somewhere specific.
 

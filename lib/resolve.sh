@@ -40,7 +40,7 @@ sbx_resolve_path() {   # <entries, colon-joined> <env PATH>
 }
 
 sbx_resolve() {
-    local launch_dir="" config_dir="" global_dir="" wd="" gui=false
+    local launch_dir="" config_dir="" global_dir="" wd="" gui=false ws=""
     local -a fs=() net=() flag_ports=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -52,6 +52,7 @@ sbx_resolve() {
             --host-port)  flag_ports+=("$2"); shift 2 ;;
             --wd)         wd="$2"; shift 2 ;;
             --gui)        gui=true; shift ;;
+            --workspace)  ws="$2"; shift 2 ;;
             *)
                 echo "sbx_resolve: unknown argument '$1'" >&2
                 return 2
@@ -66,6 +67,25 @@ sbx_resolve() {
     for p in "${net[@]}"; do types+=(net); paths+=("$p"); done
 
     local -a profiles=() errors=() warnings=() confirm=()
+
+    # The workspace was expanded into the flags above by sbx; it is recorded
+    # for --dry-run, and a tracked project one is confirmed like a tracked
+    # project profile: it arrived with the repository and chose these
+    # profiles. Named first, so its prompt comes before theirs.
+    local ws_json=null ws_origin="" ws_shadow=""
+    if [[ -n "$ws" ]]; then
+        ws_origin=user
+        if [[ "$ws" == ./.sbx/* ]]; then
+            ws_origin=project
+            ws_shadow=$(sbx_workspace_shadowed "$(basename "$ws" .json)" "$config_dir")
+            if [[ "${SBX_TRUST_PROJECT_PROFILES:-}" != "1" ]] &&
+               git -C "$launch_dir" ls-files --error-unmatch "$ws" >/dev/null 2>&1; then
+                confirm+=("$ws")
+            fi
+        fi
+        ws_json=$(jq -cn --arg n "$(basename "$ws" .json)" --arg p "$ws" --arg o "$ws_origin" --arg s "$ws_shadow" \
+            '{name: $n, path: $p, origin: $o, shadows: $s}')
+    fi
 
     # --host-port flags arrive exactly as typed; this is their only
     # validation. An out-of-range/non-numeric port or an unknown protocol
@@ -356,12 +376,12 @@ sbx_resolve() {
         --arg path "$sandbox_path" --arg path_raw "$sandbox_path_raw" --arg wd "$wd" --argjson gui "$gui" \
         --argjson tcp "$(sbx_resolve_strings "${tcp[@]}" | jq -c 'map(tonumber)')" \
         --argjson udp "$(sbx_resolve_strings "${udp[@]}" | jq -c 'map(tonumber)')" \
-        --argjson netns "$netns" --argjson net "$net_json" \
+        --argjson netns "$netns" --argjson net "$net_json" --argjson workspace "$ws_json" \
         '{profiles: $profiles, errors: $errors, warnings: $warnings, confirm: $confirm, deps: $deps, checks: $checks,
           security: {caps_keep: $caps_keep, caps_profile: $caps_profile,
                      userns_full: $userns_full, userns_profile: $userns_profile,
                      docker_api: $docker_api},
           mounts: $mounts, passthrough: $passthrough, env: $env, path: $path, path_raw: $path_raw,
-          wd: $wd, gui: $gui, host_ports: {tcp: $tcp, udp: $udp},
+          workspace: $workspace, wd: $wd, gui: $gui, host_ports: {tcp: $tcp, udp: $udp},
           netns: $netns, net: $net}'
 }

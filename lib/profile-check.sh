@@ -19,7 +19,8 @@ SBX_PROFILE_RESTRICTED='["caps","userns","docker_api","host_ports","gui"]'
 SBX_PROFILE_CHECK_JQ='
 def known:
   { fs:  ["description","env","path","mounts","passthrough","caps","userns","docker_api","gui"],
-    net: ["description","dns","allow","ports","host_ports"] };
+    net: ["description","dns","allow","ports","host_ports"],
+    workspace: ["fs","net","wd","gui"] };
 def err($p; $m): {level: "error", path: $p, message: $m};
 def warn($p; $m): {level: "warning", path: $p, message: $m};
 def is_port: type == "number" and . == floor and . >= 1 and . <= 65535;
@@ -38,7 +39,7 @@ if type != "object" then [err("."; "expected a JSON object at the top level")]
 else
   . as $p
   | [ ( keys[] | . as $k | select(known[$type] | any(. == $k) | not)
-        | err(".\($k)"; "unknown field for a \($type) profile") ),
+        | err(".\($k)"; "unknown field for a \($type)" + (if $type == "workspace" then "" else " profile" end)) ),
 
       ( if has("description") and (.description | type) != "string"
         then err(".description"; "expected a string, got \(.description | tojson)") else empty end ),
@@ -92,6 +93,18 @@ else
       ( if has("caps") and .caps != "keep" then err(".caps"; "expected \"keep\", got \(.caps | tojson)") else empty end ),
       ( if has("userns") and .userns != "full" then err(".userns"; "expected \"full\", got \(.userns | tojson)") else empty end ),
       ( if has("docker_api") and (.docker_api | type) != "boolean" then err(".docker_api"; "expected true or false, got \(.docker_api | tojson)") else empty end ),
+      ( if $type == "workspace" then
+          ( ("fs", "net") as $f
+            | if has($f) | not then empty
+              elif (.[$f] | type) != "array" then err(".\($f)"; "expected an array of profile names, got \(.[$f] | tojson)")
+              else .[$f] | to_entries[] | select(.value | type != "string")
+                   | err(".\($f)[\(.key)]"; "expected a profile name, got \(.value | tojson)")
+              end ),
+          ( if has("wd") and (.wd | type) != "string" then err(".wd"; "expected a string, got \(.wd | tojson)")
+            elif has("wd") and (.wd | has_ctrl) then err(".wd"; "expected no control characters")
+            else empty end )
+        else empty end ),
+
       ( if has("gui") and (.gui | type) != "boolean" then err(".gui"; "expected true or false, got \(.gui | tojson)") else empty end ),
 
       ( if has("dns") then
@@ -132,7 +145,8 @@ else
           end
         else empty end ),
 
-      ( if $origin == "project" then
+      # A project workspace only selects; a tracked one is confirmed at launch.
+      ( if $origin == "project" and $type != "workspace" then
           $restricted[] as $f
           | select(($p | has($f)) and (known[$type] | any(. == $f)))
           | err(".\($f)"; "project profiles may not set \($f); move the profile to ~/.config/sbx/profiles/ to grant it")

@@ -289,3 +289,59 @@ EOF
     [ "$(jq -r .gui <<< "$output")" = "true" ]
     nothing_created
 }
+
+ws_profiles() {
+    local p
+    for p in "$@"; do echo '{}' > "$HOME/.config/sbx/profiles/fs/$p.json"; done
+}
+
+dryj() {
+    run bash -c 'cd "$1" && shift && "$@" < /dev/null 2>/dev/null' _ "$PROJ" "$SBX" --dry-run --json "$@"
+}
+
+@test "a workspace expands to its profiles, wd and gui, in place among the flags" {
+    ws_profiles first wa wb last
+    echo '{"fs":["wa","wb"],"net":["web"],"wd":"/ws","gui":true}' > "$HOME/.config/sbx/dev.json"
+    dryj --fs first --workspace dev --fs last
+    [ "$status" -eq 0 ]
+    [ "$(jq -c '[.profiles[] | .type + "/" + .name]' <<< "$output")" = '["fs/first","fs/wa","fs/wb","fs/last","net/web"]' ]
+    [ "$(jq -r .wd <<< "$output")" = "/ws" ]
+    [ "$(jq -r .gui <<< "$output")" = "true" ]
+    [ "$(jq -r .workspace.origin <<< "$output")" = "user" ]
+    nothing_created
+}
+
+@test "--wd on the command line wins over a workspace's wd, wherever it appears" {
+    echo '{"wd":"/ws"}' > "$HOME/.config/sbx/dev.json"
+    dryj --workspace dev --wd /cli
+    [ "$(jq -r .wd <<< "$output")" = "/cli" ]
+    dryj --wd /cli --workspace dev
+    [ "$(jq -r .wd <<< "$output")" = "/cli" ]
+}
+
+@test "a project workspace shadows the user's, and the dry run says so" {
+    ws_profiles pa ua
+    mkdir -p "$PROJ/.sbx"
+    echo '{"fs":["pa"]}' > "$PROJ/.sbx/dev.json"
+    echo '{"fs":["ua"]}' > "$HOME/.config/sbx/dev.json"
+    dryj --workspace dev
+    [ "$(jq -c '[.profiles[].name]' <<< "$output")" = '["pa"]' ]
+    dry --workspace dev
+    [[ "$output" == *"Workspace  dev (project, ./.sbx/dev.json; shadows ~/.config/sbx/dev.json)"* ]]
+}
+
+@test "a second --workspace is refused" {
+    echo '{}' > "$HOME/.config/sbx/a.json"
+    echo '{}' > "$HOME/.config/sbx/b.json"
+    run bash -c 'cd "$1" && shift && "$@" < /dev/null 2>&1' _ "$PROJ" "$SBX" --dry-run --workspace a --workspace b
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"only one --workspace"* ]]
+}
+
+@test "an invalid workspace stops the launch, naming each problem" {
+    echo '{"fs":"a","bogus":1}' > "$HOME/.config/sbx/bad.json"
+    run bash -c 'cd "$1" && shift && "$@" < /dev/null 2>&1' _ "$PROJ" "$SBX" --dry-run --workspace bad
+    [ "$status" -ne 0 ]
+    [[ "$output" == *".fs: expected an array of profile names"* ]]
+    [[ "$output" == *".bogus: unknown field for a workspace"* ]]
+}

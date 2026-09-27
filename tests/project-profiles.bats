@@ -102,3 +102,23 @@ EOF
     [ -n "$warn_line" ]
     [ "$warn_line" -gt "$prompt_line" ]
 }
+
+@test "a tracked project workspace is refused non-interactively, naming what it shadows" {
+    mkdir -p "$HOME/.config/sbx"
+    echo '{"wd":"/"}' > "$PROJ/.sbx/dev.json"
+    echo '{}' > "$HOME/.config/sbx/dev.json"
+    git -C "$PROJ" init -q
+    git -C "$PROJ" add -f .sbx/dev.json
+    run bash -c "cd '$PROJ' && $SBX --workspace dev -- /bin/true < /dev/null 2>&1"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"workspace tracked by the project's git repository"* ]]
+    [[ "$output" == *"It shadows your workspace $HOME/.config/sbx/dev.json"* ]]
+    [[ "$output" == *"SBX_TRUST_PROJECT_PROFILES=1"* ]]
+}
+
+@test "a user workspace launches with its profiles and wd, without a prompt" {
+    mkdir -p "$HOME/.config/sbx"
+    echo '{"fs":["tst"],"wd":"/out"}' > "$HOME/.config/sbx/w.json"
+    run bash -c "cd '$PROJ' && script -qec \"$SBX --workspace w -- /bin/sh -c 'pwd > /out/wd.txt'\" /dev/null >/dev/null 2>&1 < /dev/null"
+    [ "$(cat "$HOSTDIR/wd.txt")" = "/out" ]
+}

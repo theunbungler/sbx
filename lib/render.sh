@@ -48,7 +48,10 @@ def section($title; $lines):
 def mark($ok): if $ok then "✓" else "✗" end;
 
 . as $d
-| ( section("Profiles"; [ [ $d.profiles[] | "\(.type)/\(.name) (\(.origin))" ] | join("  ") | select(length > 0) ]),
+| ( section("Workspace"; [ $d.workspace | select(. != null)
+        | "\(.name) (\(.origin), \(.path | tilde)"
+          + (if .shadows != "" then "; shadows " + (.shadows | tilde) else "" end) + ")" ]),
+    section("Profiles"; [ [ $d.profiles[] | "\(.type)/\(.name) (\(.origin))" ] | join("  ") | select(length > 0) ]),
 
     ( if ($d.errors | length) == 0 then
         section("Security"; [ [ (if $d.security.caps_keep then "capabilities KEPT in the payload namespace (\($d.security.caps_profile | tilde))" else "capabilities dropped; mounts and the firewall are enforced from outside the payload namespace" end),

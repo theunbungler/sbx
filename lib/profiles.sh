@@ -86,6 +86,33 @@ sbx_profile_cli_twins() {   # <name> <config_dir> <global_dir>
     return 0
 }
 
+# Workspaces: a saved selection of profiles, a working directory and the
+# display, as ./.sbx/<name>.json or <config_dir>/<name>.json. The most local
+# one wins. Like a profile argument, the name is a NAME, never a path.
+sbx_workspace_resolve() {   # <name> <config_dir>
+    local name="$1" p
+    if ! sbx_profile_valid_name "$name"; then
+        echo "Error: '$(LC_ALL=C tr -cd '\11\40-\176' <<< "$name" | cut -c1-200)' is not a workspace name." >&2
+        return 1
+    fi
+    for p in "./.sbx/$name.json" "$2/$name.json"; do
+        if [[ -f "$p" ]]; then
+            printf '%s\n' "$p"
+            return 0
+        fi
+    done
+    echo "Error: workspace '$name' not found (looked for ./.sbx/$name.json and $2/$name.json)." >&2
+    return 1
+}
+
+# The user's workspace a project workspace of the same name hides, if any.
+sbx_workspace_shadowed() {   # <name> <config_dir>
+    if [[ -f "./.sbx/$1.json" && -f "$2/$1.json" ]]; then
+        printf '%s\n' "$2/$1.json"
+    fi
+    return 0
+}
+
 sbx_profile_legacy_cli_warning() {   # <dir>
     printf 'cli profiles are now fs profiles, so none in %s are loaded; move them to %s/fs\n' "$1" "${1%/cli}"
 }
@@ -175,6 +202,28 @@ sbx_profile_list() {   # <config_dir> <global_dir>
             echo "  (none)"
         fi
     done
+
+    local ws shown project_ws=""
+    echo ""
+    echo "Workspaces:"
+    found=0
+    for src in "Project:./.sbx" "User:$config_dir"; do
+        label="${src%%:*}"
+        path="${src#*:}"
+        while IFS= read -r ws; do
+            [[ -n "$ws" ]] || continue
+            shown=$(LC_ALL=C tr -d '\000-\037\177' <<< "$ws")
+            if [[ "$label" == User && -f "./.sbx/$ws.json" ]]; then
+                echo "  $shown ($label, shadowed by Project)"
+            else
+                echo "  $shown ($label)"
+            fi
+            found=1
+        done < <(find "$path" -maxdepth 1 -type f -name '*.json' -printf '%f\n' 2>/dev/null | sed 's/\.json$//' | sort)
+    done
+    if [[ $found -eq 0 ]]; then
+        echo "  (none)"
+    fi
 
     local legacy
     while IFS= read -r legacy; do

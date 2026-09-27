@@ -302,3 +302,22 @@ r() { jq -r "$1" <<< "$PLAN"; }
     [[ "$(r '.errors[0]')" == *"may not set gui"* ]]
     [ "$(r .gui)" = "false" ]
 }
+
+@test "a workspace is recorded with its origin, and a tracked project one is confirmed" {
+    resolve
+    [ "$(q .workspace)" = 'null' ]
+    printf '{}\n' > .sbx/dev.json
+    printf '{}\n' > "$CFG/dev.json"
+    resolve --workspace ./.sbx/dev.json
+    [ "$(q .workspace)" = "{\"name\":\"dev\",\"path\":\"./.sbx/dev.json\",\"origin\":\"project\",\"shadows\":\"$CFG/dev.json\"}" ]
+    [ "$(q .confirm)" = '[]' ]
+    git init -q .
+    git add -f .sbx/dev.json
+    resolve --workspace ./.sbx/dev.json
+    [ "$(q .confirm)" = '["./.sbx/dev.json"]' ]
+    SBX_TRUST_PROJECT_PROFILES=1 resolve --workspace ./.sbx/dev.json
+    [ "$(q .confirm)" = '[]' ]
+    resolve --workspace "$CFG/dev.json"
+    [ "$(r .workspace.origin)" = "user" ]
+    [ "$(r .workspace.shadows)" = "" ]
+}

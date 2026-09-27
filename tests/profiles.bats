@@ -210,3 +210,40 @@ $GLOBAL/cli" ]
     [[ "$output" == *"  shared (Global, shadowed by Project)"* ]]
     [[ "$output" == *"  mine (User)"* ]]
 }
+
+@test "a workspace resolves from the project before the user config" {
+    echo '{}' > .sbx/dev.json
+    echo '{}' > "$CFG/dev.json"
+    echo '{}' > "$CFG/mine.json"
+    run sbx_workspace_resolve dev "$CFG"
+    [ "$status" -eq 0 ]
+    [ "$output" = "./.sbx/dev.json" ]
+    run sbx_workspace_resolve mine "$CFG"
+    [ "$output" = "$CFG/mine.json" ]
+    run sbx_workspace_shadowed dev "$CFG"
+    [ "$output" = "$CFG/dev.json" ]
+    run sbx_workspace_shadowed mine "$CFG"
+    [ -z "$output" ]
+}
+
+@test "a workspace name is a bare name, and a missing one says where it looked" {
+    run sbx_workspace_resolve ../evil "$CFG"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"not a workspace name"* ]]
+    run sbx_workspace_resolve nope "$CFG"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"./.sbx/nope.json"*"$CFG/nope.json"* ]]
+}
+
+@test "the list shows workspaces with their origin and shadowing" {
+    echo '{}' > .sbx/dev.json
+    echo '{}' > "$CFG/dev.json"
+    echo '{}' > "$CFG/mine.json"
+    run sbx_profile_list "$CFG" "$GLOBAL"
+    [[ "$output" == *"Workspaces:"* ]]
+    [[ "$output" == *"  dev (Project)"* ]]
+    [[ "$output" == *"  dev (User, shadowed by Project)"* ]]
+    [[ "$output" == *"  mine (User)"* ]]
+    # profiles/ beside them is not a workspace
+    if [[ "$output" == *"  shared (User)"*"Workspaces:"*"shared"* ]]; then return 1; fi
+}
