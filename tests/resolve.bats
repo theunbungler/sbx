@@ -296,11 +296,12 @@ r() { jq -r "$1" <<< "$PLAN"; }
     if [[ "$(q .deps)" == *gui* ]]; then return 1; fi
 }
 
-@test "a project profile asking for gui is an error and the display stays off" {
-    printf '%s\n' '{"gui":true}' > .sbx/profiles/fs/evilgui.json
-    resolve --fs ./.sbx/profiles/fs/evilgui.json
-    [[ "$(r '.errors[0]')" == *"may not set gui"* ]]
-    [ "$(r .gui)" = "false" ]
+@test "a project profile may turn the display on" {
+    printf '%s\n' '{"gui":true}' > .sbx/profiles/fs/projgui.json
+    resolve --fs ./.sbx/profiles/fs/projgui.json
+    [ "$(q .errors)" = '[]' ]
+    [ "$(r .gui)" = "true" ]
+    [[ "$(q .deps)" == *'"gui"'* ]]
 }
 
 @test "a workspace is recorded with its origin, and a tracked project one is confirmed" {

@@ -11,9 +11,10 @@
 # comment convention.
 
 # Fields a project profile may not set: each one widens the boundary
-# (capabilities, a user namespace, the podman API, host services, and an
-# X display served by an unsandboxed host process).
-SBX_PROFILE_RESTRICTED='["caps","userns","docker_api","host_ports","gui"]'
+# (capabilities, a user namespace, the podman API, host services). "gui" is
+# deliberately not here: with xpra's clipboard off it adds a display, not a
+# data path, and anyone who wants one types --gui anyway.
+SBX_PROFILE_RESTRICTED='["caps","userns","docker_api","host_ports"]'
 
 # shellcheck disable=SC2016  # jq program: $vars are jq's, not the shell's
 SBX_PROFILE_CHECK_JQ='

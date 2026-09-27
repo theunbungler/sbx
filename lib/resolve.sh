@@ -182,12 +182,19 @@ sbx_resolve() {
         # must never be able to talk its way back to the pre-hardening boundary,
         # with or without the interactive confirmation added elsewhere.
         for i in "${!paths[@]}"; do
-            if [[ "${types[$i]}" == "net" || "${origins[$i]}" == "project" ]]; then
+            if [[ "${types[$i]}" == "net" ]]; then
                 continue
             fi
             p="${paths[$i]}"
             IFS=$'\t' read -r f_userns f_caps f_docker f_gui < <(
                 jq -r '[.userns // "-", .caps // "-", (.docker_api // false | tostring), (.gui // false | tostring)] | @tsv' "$p")
+            # gui is honored from any profile; the rest never from a project one.
+            if [[ "$f_gui" == "true" ]]; then
+                gui=true
+            fi
+            if [[ "${origins[$i]}" == "project" ]]; then
+                continue
+            fi
             if [[ "$f_userns" == "full" ]]; then
                 userns_full=true
                 userns_profile="$p"
@@ -200,9 +207,6 @@ sbx_resolve() {
             fi
             if [[ "$f_docker" == "true" ]]; then
                 docker_api=true
-            fi
-            if [[ "$f_gui" == "true" ]]; then
-                gui=true
             fi
         done
         if [[ "$userns_full" == "true" && ${#net[@]} -eq 0 ]]; then

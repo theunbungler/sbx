@@ -131,13 +131,13 @@ check() {   # <type> <origin> <json>
     [[ "$output" == *".path[1]"*"expected a string"* ]]
 }
 
-@test "gui must be a boolean, and a project profile may not set it" {
+@test "gui must be a boolean, and a project profile may set it" {
     check fs user '{"gui":false}'
     [ -z "$output" ]
     check fs user '{"gui":"yes"}'
     [[ "$output" == *'.gui: expected true or false, got "yes"'* ]]
     check fs project '{"gui":true}'
-    [[ "$output" == *".gui: project profiles may not set gui"* ]]
+    [ -z "$output" ]
 }
 
 @test "a workspace holds only fs, net, wd and gui" {
