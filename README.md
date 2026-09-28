@@ -501,6 +501,30 @@ check a real filter needs, so a 32-bit system call cannot slip past it.
 - A `caps: keep` session (podman) needs namespace creation and mounting;
   a filter that forbids them breaks it.
 
+**A starting policy.** `contrib/seccomp/agents.easyseccomp` is an
+[easyseccomp](https://github.com/giuseppe/easyseccomp) policy for sessions
+running Claude Code or pi and the tools they drive (bash, git, coreutils,
+ripgrep, ssh, tmux). It allows those by category and logs everything else,
+so you can see what a real session uses before enforcing anything. Namespace
+and mount work, ptrace, `bpf`, io_uring, keyrings, module loading and
+unusual socket families are deliberately left out. Compile it with
+`-d ENFORCE` to refuse the rest instead, and with `-d PODMAN` for container
+sessions; the file's header has the commands. It is x86-64 only.
+
+**Reading the log.** A logged call becomes a kernel audit record,
+`type=1326`, which never contains the word "seccomp":
+`journalctl -k -g 'type=1326'`. Without an audit daemon the kernel
+rate-limits these records to a few every few seconds and drops the rest
+(`kauditd_printk_skb: N callbacks suppressed`), so a busy session, or another
+program flooding the audit log, hides most of them. To capture everything,
+let journald receive audit records directly and read them by type:
+
+```bash
+sudo systemctl enable --now systemd-journald-audit.socket
+sudo auditctl -b 8192        # a larger kernel queue for bursts
+journalctl _AUDIT_TYPE_NAME=SECCOMP --since "10 min ago"
+```
+
 ## GUI Attachment
 
 A session gets an xpra display when you pass `--gui` or when any profile it

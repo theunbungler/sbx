@@ -1,0 +1,141 @@
+// Seccomp policy for an sbx session running Claude Code and/or pi, with the
+// tools they drive: bash, git, coreutils, ripgrep, ssh (git push), tmux.
+// x86-64 only. Compile with easyseccomp (https://github.com/giuseppe/easyseccomp):
+//
+//   easyseccomp < agents.easyseccomp > agents-audit.bpf            # log the rest
+//   easyseccomp -d ENFORCE < agents.easyseccomp > agents.bpf       # refuse the rest
+//   easyseccomp -d PODMAN ...                                      # + container sessions
+//
+//   sbx --fs claude --net anthropic --seccomp agents-audit.bpf
+//
+// Rules run top to bottom; the first match decides. Everything listed below
+// is allowed silently. Anything else is LOGGED and allowed (the default), or
+// refused with EPERM when compiled with ENFORCE. Start in log mode, look at
+// what shows up (journalctl _AUDIT_TYPE_NAME=SECCOMP with the journald audit
+// socket on, or journalctl -k -g type=1326 without it), and either add it
+// here or leave it out on purpose.
+//
+// Left out on purpose, so they are logged (or refused): namespace and mount
+// work (unshare, setns, mount, pivot_root, clone with namespace flags),
+// ptrace and cross-process memory access, bpf, perf_event_open,
+// userfaultfd, io_uring, kernel keyrings, module loading, kexec, reboot,
+// clock setting, swap, raw/packet/unusual sockets, setuid-family calls,
+// personality, chroot, mknod, open_by_handle_at, SysV/POSIX message queues
+// and shared memory. None of these is needed to edit code, run tools or talk
+// to an API; most are where kernel exploits live.
+
+// --- Architecture ----------------------------------------------------------
+// A filter keyed on x86-64 numbers means nothing to 32-bit or x32 calls, so
+// those are never allowed by the rules below.
+#ifdef ENFORCE
+$arch != @x86_64 => KILL_PROCESS();
+$syscall >= 1073741824 => KILL_PROCESS();   // 0x40000000, the x32 bit
+#endif
+#ifndef ENFORCE
+$arch != @x86_64 => LOG();
+$syscall >= 1073741824 => LOG();
+#endif
+
+// --- Memory ----------------------------------------------------------------
+$syscall in (@brk, @mmap, @munmap, @mremap, @mprotect, @madvise, @mincore,
+             @msync, @mlock, @mlock2, @munlock, @mlockall, @munlockall,
+             @membarrier, @memfd_create, @pkey_alloc, @pkey_free,
+             @pkey_mprotect, @get_mempolicy, @set_mempolicy, @mbind)
+    => ALLOW();
+
+// --- Processes and threads -------------------------------------------------
+// clone is allowed only without namespace flags (NEWNS|NEWCGROUP|NEWUTS|
+// NEWIPC|NEWUSER|NEWPID|NEWNET = 0x7e020000 = 2114060288; easyseccomp takes
+// decimal only). clone3 passes its flags in a
+// struct the filter cannot read, so it has to be allowed whole: glibc uses it
+// for threads and posix_spawn.
+$syscall == @clone && $arg0 & 2114060288 == 0 => ALLOW();
+$syscall in (@clone3, @fork, @vfork, @execve, @execveat, @exit, @exit_group,
+             @wait4, @waitid, @kill, @tgkill, @tkill,
+             @getpid, @getppid, @gettid, @getpgid, @getpgrp, @setpgid,
+             @getsid, @setsid, @set_tid_address, @set_robust_list,
+             @get_robust_list, @futex, @futex_waitv, @rseq, @arch_prctl,
+             @prctl, @sched_yield, @sched_getaffinity, @sched_setaffinity,
+             @sched_getparam, @sched_getscheduler, @sched_get_priority_max,
+             @sched_get_priority_min, @sched_getattr, @getpriority,
+             @setpriority, @getrlimit, @setrlimit, @prlimit64, @getrusage,
+             @times, @capget, @capset, @pidfd_open, @pidfd_send_signal,
+             @getuid, @geteuid, @getgid, @getegid, @getresuid, @getresgid,
+             @getgroups, @uname, @sysinfo, @getcpu, @getrandom, @umask)
+    => ALLOW();
+// setfsuid/setfsgid(-1) is how tmux asks for its filesystem ids. They can
+// only switch among ids the process already has, so they grant nothing.
+$syscall in (@setfsuid, @setfsgid) => ALLOW();
+
+// --- Signals and time ------------------------------------------------------
+$syscall in (@rt_sigaction, @rt_sigprocmask, @rt_sigreturn, @rt_sigsuspend,
+             @rt_sigpending, @rt_sigtimedwait, @rt_sigqueueinfo,
+             @rt_tgsigqueueinfo, @sigaltstack, @alarm, @pause,
+             @restart_syscall, @signalfd, @signalfd4,
+             @clock_gettime, @clock_getres, @clock_nanosleep, @nanosleep,
+             @gettimeofday, @time, @getitimer, @setitimer, @timer_create,
+             @timer_settime, @timer_gettime, @timer_getoverrun, @timer_delete,
+             @timerfd_create, @timerfd_settime, @timerfd_gettime)
+    => ALLOW();
+
+// --- Files -----------------------------------------------------------------
+$syscall in (@read, @write, @readv, @writev, @pread64, @pwrite64, @preadv,
+             @pwritev, @preadv2, @pwritev2, @open, @openat, @openat2, @creat,
+             @close, @close_range, @lseek, @dup, @dup2, @dup3, @fcntl, @flock,
+             @fsync, @fdatasync, @sync, @syncfs, @sync_file_range, @fallocate,
+             @ftruncate, @truncate, @fadvise64, @readahead, @sendfile,
+             @copy_file_range, @splice, @tee,
+             @stat, @fstat, @lstat, @newfstatat, @statx, @statfs, @fstatfs,
+             @access, @faccessat, @faccessat2, @getdents, @getdents64,
+             @getcwd, @chdir, @fchdir, @mkdir, @mkdirat, @rmdir, @rename,
+             @renameat, @renameat2, @link, @linkat, @unlink, @unlinkat,
+             @symlink, @symlinkat, @readlink, @readlinkat,
+             @chmod, @fchmod, @fchmodat, @fchmodat2, @chown, @fchown, @lchown,
+             @fchownat, @utime, @utimes, @utimensat, @futimesat,
+             @getxattr, @lgetxattr, @fgetxattr, @setxattr, @lsetxattr,
+             @fsetxattr, @listxattr, @llistxattr, @flistxattr, @removexattr,
+             @lremovexattr, @fremovexattr)
+    => ALLOW();
+
+// --- Waiting on things -----------------------------------------------------
+// ioctl is allowed whole: terminals (tmux, bash, the agents' TUIs) use many
+// of its requests, and narrowing it well needs per-device knowledge.
+$syscall in (@poll, @ppoll, @select, @pselect6, @epoll_create,
+             @epoll_create1, @epoll_ctl, @epoll_wait, @epoll_pwait,
+             @epoll_pwait2, @eventfd, @eventfd2, @inotify_init,
+             @inotify_init1, @inotify_add_watch, @inotify_rm_watch, @pipe,
+             @pipe2, @ioctl)
+    => ALLOW();
+
+// --- Network ---------------------------------------------------------------
+// Sockets of the ordinary families only: AF_UNIX (1), AF_INET (2),
+// AF_INET6 (10), and AF_NETLINK (16), which Node uses to list interfaces.
+// Packet, raw-hardware, crypto (AF_ALG), vsock and the rest are logged.
+$syscall == @socket && $arg0 == 1 => ALLOW();
+$syscall == @socket && $arg0 == 2 => ALLOW();
+$syscall == @socket && $arg0 == 10 => ALLOW();
+$syscall == @socket && $arg0 == 16 => ALLOW();
+$syscall in (@socketpair, @connect, @bind, @listen, @accept, @accept4,
+             @getsockname, @getpeername, @getsockopt, @setsockopt, @sendto,
+             @recvfrom, @sendmsg, @recvmsg, @sendmmsg, @recvmmsg, @shutdown)
+    => ALLOW();
+
+// --- Containers (compile with -d PODMAN for fs/podman, fs/podman-full) -----
+#ifdef PODMAN
+$syscall == @clone => ALLOW();
+$syscall in (@unshare, @setns, @mount, @umount2, @pivot_root, @mount_setattr,
+             @open_tree, @move_mount, @fsopen, @fsconfig, @fsmount, @fspick,
+             @setuid, @setgid, @setresuid, @setresgid, @setgroups,
+             @setfsuid, @setfsgid, @sethostname, @setdomainname, @chroot,
+             @mknod, @mknodat, @keyctl, @add_key, @request_key, @seccomp,
+             @personality, @pidfd_getfd, @shmget, @shmat, @shmdt, @shmctl)
+    => ALLOW();
+#endif
+
+// --- Everything else -------------------------------------------------------
+#ifdef ENFORCE
+=> ERRNO(EPERM);
+#endif
+#ifndef ENFORCE
+=> LOG();
+#endif
