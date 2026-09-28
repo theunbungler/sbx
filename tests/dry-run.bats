@@ -345,3 +345,19 @@ dryj() {
     [[ "$output" == *".fs: expected an array of profile names"* ]]
     [[ "$output" == *".bogus: unknown field for a workspace"* ]]
 }
+
+@test "the dry run shows the seccomp filter and where its copy goes" {
+    head -c 32 /dev/zero > "$ROOT/f.bpf"
+    dry --seccomp "$ROOT/f.bpf"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Seccomp    $ROOT/f.bpf  (4 instructions; loaded for the payload, joins and containers)"* ]]
+    [[ "$output" == *".seccomp"*"the --seccomp filter as loaded; removed at teardown"* ]]
+    nothing_created
+}
+
+@test "a second --seccomp is refused" {
+    head -c 8 /dev/zero > "$ROOT/a.bpf"
+    dry --seccomp "$ROOT/a.bpf" --seccomp "$ROOT/a.bpf"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"only one --seccomp"* ]]
+}

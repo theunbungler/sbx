@@ -40,7 +40,7 @@ sbx_resolve_path() {   # <entries, colon-joined> <env PATH>
 }
 
 sbx_resolve() {
-    local launch_dir="" config_dir="" global_dir="" wd="" gui=false ws=""
+    local launch_dir="" config_dir="" global_dir="" wd="" gui=false ws="" seccomp=""
     local -a fs=() net=() flag_ports=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -53,6 +53,7 @@ sbx_resolve() {
             --wd)         wd="$2"; shift 2 ;;
             --gui)        gui=true; shift ;;
             --workspace)  ws="$2"; shift 2 ;;
+            --seccomp)    seccomp="$2"; shift 2 ;;
             *)
                 echo "sbx_resolve: unknown argument '$1'" >&2
                 return 2
@@ -72,6 +73,26 @@ sbx_resolve() {
     # for --dry-run, and a tracked project one is confirmed like a tracked
     # project profile: it arrived with the repository and chose these
     # profiles. Named first, so its prompt comes before theirs.
+    # --seccomp: one compiled filter, raw BPF as bwrap reads it (an array of
+    # 8-byte struct sock_filter). Only its shape is checked here; what it
+    # allows is the user's business, and a filter that breaks the session's
+    # own start-up fails closed (see lib/session.sh).
+    local seccomp_json=null seccomp_size
+    if [[ -n "$seccomp" ]]; then
+        if [[ ! -f "$seccomp" || ! -r "$seccomp" ]]; then
+            errors+=("--seccomp: $seccomp is not a readable file")
+        else
+            seccomp_size=$(stat -c %s -- "$seccomp")
+            if [[ "$seccomp_size" -eq 0 ]]; then
+                errors+=("--seccomp: $seccomp is empty")
+            elif (( seccomp_size % 8 != 0 )); then
+                errors+=("--seccomp: $seccomp is not a whole number of 8-byte BPF instructions ($seccomp_size bytes)")
+            else
+                seccomp_json=$(jq -cn --arg p "$seccomp" --argjson n $((seccomp_size / 8)) '{path: $p, instructions: $n}')
+            fi
+        fi
+    fi
+
     local ws_json=null ws_origin="" ws_shadow=""
     if [[ -n "$ws" ]]; then
         ws_origin=user
@@ -381,11 +402,12 @@ sbx_resolve() {
         --argjson tcp "$(sbx_resolve_strings "${tcp[@]}" | jq -c 'map(tonumber)')" \
         --argjson udp "$(sbx_resolve_strings "${udp[@]}" | jq -c 'map(tonumber)')" \
         --argjson netns "$netns" --argjson net "$net_json" --argjson workspace "$ws_json" \
+        --argjson seccomp "$seccomp_json" \
         '{profiles: $profiles, errors: $errors, warnings: $warnings, confirm: $confirm, deps: $deps, checks: $checks,
           security: {caps_keep: $caps_keep, caps_profile: $caps_profile,
                      userns_full: $userns_full, userns_profile: $userns_profile,
                      docker_api: $docker_api},
           mounts: $mounts, passthrough: $passthrough, env: $env, path: $path, path_raw: $path_raw,
-          workspace: $workspace, wd: $wd, gui: $gui, host_ports: {tcp: $tcp, udp: $udp},
+          workspace: $workspace, seccomp: $seccomp, wd: $wd, gui: $gui, host_ports: {tcp: $tcp, udp: $udp},
           netns: $netns, net: $net}'
 }

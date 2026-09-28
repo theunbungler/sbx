@@ -49,6 +49,8 @@ LAST_PROFILES=()   # --cli: fs profiles applied after every --fs (compatibility)
 WORKDIR=""
 WORKSPACE=""      # the --workspace file, expanded into the flags as parsed
 WS_WORKDIR=""     # its wd; a --wd on the command line wins wherever it is
+SECCOMP_FILE=""   # --seccomp, as given (absolute)
+SECCOMP_COPY=""   # the copy launch.sh loads, in the masked join/ area
 HOST_PORT_SPECS=()   # as typed; lib/resolve.sh validates and buckets them
 COMMAND=()
 GUI_FLAG=false
@@ -117,6 +119,8 @@ Options:
   --fs <profile>         Apply a filesystem profile (multiple allowed)
   --net <profile>        Apply a network profile (multiple allowed)
   --cli <profile>        Apply an fs profile after every --fs one (compatibility)
+  --seccomp <file>       Load this compiled seccomp filter (raw BPF) for the
+                         payload, its joins and containers (one per launch)
   --workspace <name>     Apply a saved selection: ./.sbx/<name>.json, else
                          ~/.config/sbx/<name>.json ({fs, net, wd, gui})
   --host-port <spec>     Reach a host service on 127.0.0.1:<port> from inside.
@@ -422,6 +426,14 @@ parse_args() {
                 expand_workspace "$WORKSPACE"
                 shift 2
                 ;;
+            --seccomp)
+                if [[ -n "$SECCOMP_FILE" ]]; then
+                    echo "Error: only one --seccomp per launch." >&2
+                    exit 2
+                fi
+                SECCOMP_FILE="$(realpath -m -- "$2")"
+                shift 2
+                ;;
             --host-port)
                 HOST_PORT_SPECS+=("$2")
                 shift 2
@@ -511,6 +523,9 @@ resolve_plan() {
     fi
     if [[ -n "$WORKSPACE" ]]; then
         args+=(--workspace "$WORKSPACE")
+    fi
+    if [[ -n "$SECCOMP_FILE" ]]; then
+        args+=(--seccomp "$SECCOMP_FILE")
     fi
     PLAN=$(sbx_resolve "${args[@]}")
 
@@ -1139,6 +1154,12 @@ setup_network() {
 #                 derivable later: the key includes the launch directory,
 #                 whose only other record is the forgeable session.json.
 write_session_records() {
+    # The filter checked is the filter loaded: a private copy, outside
+    # anything the sandbox can see (join/ is masked), taken before it starts.
+    if [[ -n "$SECCOMP_FILE" ]]; then
+        SECCOMP_COPY="$STATE_DIR/join/$SESSION_ID.seccomp"
+        install -m 0400 -- "$SECCOMP_FILE" "$SECCOMP_COPY"
+    fi
     jq -n --indent 4 --arg id "$SESSION_ID" --arg cwd "$PWD" --argjson pid "$$" \
         --argjson fs "$(sbx_resolve_strings "${FS_PROFILES[@]}" "${LAST_PROFILES[@]}")" \
         --argjson net "$(sbx_resolve_strings "${NET_PROFILES[@]}")" \
@@ -1352,7 +1373,7 @@ EOF
         fi
     fi
     declare -p NET_MODE CAPS_KEEP NEST_TCP NEST_UDP SBX_DNS_ADDR DNSMASQ_BIN DNSMASQ_ARGS \
-        TEST_DOMAIN RESOLV_DEST > "$SESSION_DIR/launch.env"
+        TEST_DOMAIN RESOLV_DEST SECCOMP_COPY > "$SESSION_DIR/launch.env"
 }
 
 port_list() {   # <port>...: comma-joined, or "none"

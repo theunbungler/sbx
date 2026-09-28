@@ -75,6 +75,7 @@ Multiple profiles of the same category stack (e.g. two `--fs` profiles); see REA
 
 - `./.sbx` (the directory that configures the *next* launch from this directory) is never visible inside any session — masked with an empty tmpfs over every writable mount that would expose it, so a payload can never plant a profile for a future launch to trust.
 - `ro` mounts are enforced by the A/B namespace nesting itself (see above), not by a flag a payload could later disable.
+- A `--seccomp` filter is loaded by bwrap *before* the capability drop (`setpriv` is bwrap's command), so a filter can fake that drop's success. `lib/session.sh` therefore refuses to start a capless session unless `CapBnd` in `/proc/self/status` is all zeros. Don't remove that check as redundant; `tests/seccomp.bats` proves the payload runs without it.
 - Untracked project profiles under `./.sbx/profiles` are trusted without a prompt (treated as the user's own scratch config); git-tracked ones require confirmation (or `SBX_TRUST_PROJECT_PROFILES=1`). This is a deliberate, documented trust boundary — don't "fix" it without checking the README threat model first.
 - Sessions with `"caps": "keep"` (`fs/podman`, `fs/podman-full`) hold capabilities *inside B's own namespace* — enough to create further namespaces and over-mount paths on themselves, but never enough to write a `ro` mount or touch A's firewall.
 

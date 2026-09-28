@@ -722,3 +722,12 @@ EOF
     fi
 }
 
+
+@test "removing a session also removes its seccomp copy" {
+    source "$BATS_TEST_DIRNAME/../lib/sessions.sh"
+    local st="$ROOT/st"
+    mkdir -p "$st/sessions/x" "$st/join"
+    touch "$st/join/x.json" "$st/join/x.lock" "$st/join/x.pid" "$st/join/x.seccomp"
+    sbx_session_remove "$st" x
+    if compgen -G "$st/join/x.*" >/dev/null; then return 1; fi
+}

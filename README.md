@@ -55,8 +55,10 @@ In every session, this means:
   They can create further namespaces and hide paths from themselves with
   over-mounts; they cannot write `ro` mounts or change the firewall. Such
   sessions print a note at launch.
-- **Kernel exploits.** There is no seccomp filter: `bwrap --seccomp` needs a
+- **Kernel exploits.** sbx ships no seccomp filter: `bwrap --seccomp` needs a
   compiled BPF blob, which is the kind of custom code this project avoids.
+  You can load one you built yourself with `--seccomp` (see
+  [Seccomp Filters](#seccomp-filters)).
 - **Wildcard `allow` entries.** `*.anthropic.com` admits any IP an attacker
   can publish under that suffix.
 - **DNS as an exfiltration channel.** Query labels for allowed domains are
@@ -134,6 +136,7 @@ To see all available commands and options, run:
 | `--join <session>` | Open a new shell inside a running sandbox session, with its own terminal. Append `-- <cmd>` to run a command instead. |
 | `--attach <session>` | Reattach to a running session's original terminal (the one `sbx` started it on). |
 | `--wd <path>` | Start the session in this directory inside the sandbox. |
+| `--seccomp <file>` | Load your own compiled seccomp filter for the payload, its joins and containers (see [Seccomp Filters](#seccomp-filters)). |
 | `--workspace <name>` | Apply a saved selection of profiles, working directory and display (see [Workspaces](#workspaces)). |
 | `--host-port <spec>` | Reach a service running on the host's `127.0.0.1:<port>` from inside the sandbox. `<spec>` is `<port>[/tcp\|/udp]`; a bare number means TCP. Repeatable. |
 | `--gui` | Start a session with isolated GUI support via `xpra`. |
@@ -464,6 +467,39 @@ Both permissions use `rsync --compare-dest` for the diff when available, falling
       -home-user-projB/             # independent store for the same profile in ~/projB
         _home_user_.claude/
 ```
+
+## Seccomp Filters
+
+sbx ships no seccomp filter, but will load one you provide:
+
+```bash
+./sbx --fs sandbox --seccomp ~/filters/agent.bpf
+```
+
+The file is a compiled filter in the raw form bwrap reads: an array of
+8-byte `struct sock_filter` instructions, with no header. Build it with
+libseccomp (`seccomp_export_bpf`, or `export_bpf` from its Python bindings),
+minijail's `compile_seccomp_policy`, or ceccomp; these add the architecture
+check a real filter needs, so a 32-bit system call cannot slip past it.
+
+- **One filter per launch.** sbx checks only its shape (non-empty, a whole
+  number of instructions); what it allows is up to you. `--dry-run` shows
+  which filter a launch would load.
+- **What it covers:** the sandbox's PID 1 and everything under it — the
+  payload, every `--join` shell, and podman containers. The control
+  namespace outside the sandbox (DNS, the firewall, host-port relays) is
+  not filtered.
+- **sbx keeps its own copy** for the session's lifetime, outside anything
+  the sandbox can see, so the filter loaded is the filter that was checked.
+- **It also covers sbx's own start-up inside the sandbox:** the capability
+  drop, bash, tmux. A filter that blocks what those need stops the launch.
+  A filter that makes a call *report* success without running it could
+  skip the capability drop silently, so a capless session refuses to start
+  unless its capability bounding set really is empty. (A filter that fakes
+  every `prctl` call makes the drop loop forever instead; the launch hangs
+  rather than running unhardened.)
+- A `caps: keep` session (podman) needs namespace creation and mounting;
+  a filter that forbids them breaks it.
 
 ## GUI Attachment
 

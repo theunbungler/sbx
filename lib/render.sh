@@ -51,6 +51,8 @@ def mark($ok): if $ok then "✓" else "✗" end;
 | ( section("Workspace"; [ $d.workspace | select(. != null)
         | "\(.name) (\(.origin), \(.path | tilde)"
           + (if .shadows != "" then "; shadows " + (.shadows | tilde) else "" end) + ")" ]),
+    section("Seccomp"; [ $d.seccomp | select(. != null)
+        | (.path | tilde) + "  (\(.instructions) instructions; loaded for the payload, joins and containers)" ]),
     section("Profiles"; [ [ $d.profiles[] | "\(.type)/\(.name) (\(.origin))" ] | join("  ") | select(length > 0) ]),
 
     ( if ($d.errors | length) == 0 then

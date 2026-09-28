@@ -155,6 +155,10 @@ sbx_state_writes() {   # <plan json> <state_dir> <launch_dir> [<xauthority file>
             "xpra display socket; removed when the display stops" "" "" "")")
     fi
 
+    if [[ "$(jq -r '.seccomp != null' <<< "$plan")" == "true" ]]; then
+        rows+=("$(sbx_state_write_row temporary "$state/join/$base.seccomp" \
+            "the --seccomp filter as loaded; removed at teardown" "" "" "")")
+    fi
     rows+=("$(sbx_state_write_row temporary "$state/join/$base.{pid,json,lock}" \
         "session bookkeeping (pid, join sidecar, lock); removed at teardown" "" "" "")")
 

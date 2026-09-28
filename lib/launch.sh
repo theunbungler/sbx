@@ -128,5 +128,15 @@ else
     enter=(setpriv --bounding-set=-all --inh-caps=-all --ambient-caps=-all --)
 fi
 mapfile -d '' -t bwrap_args < "$session_dir/bwrap.args"
+
+# --seccomp: bwrap loads the filter just before it execs its command, so
+# it covers the capability drop above session.sh too. A filter that makes
+# that drop fail stops the launch; one that fakes its success is caught by
+# session.sh, which refuses to start with a non-empty bounding set.
+seccomp=()
+if [[ -n "${SECCOMP_COPY:-}" ]]; then
+    exec {SBX_SFD}<"$SECCOMP_COPY" || fail "could not open the seccomp filter $SECCOMP_COPY."
+    seccomp=(--seccomp "$SBX_SFD")
+fi
 nsenter --net=/proc/"$SBX_B_PID"/ns/net -- \
-    bwrap "${bwrap_args[@]}" --userns2 "$SBX_BFD" "${enter[@]}" "$session_dir/session.sh"
+    bwrap "${bwrap_args[@]}" "${seccomp[@]}" --userns2 "$SBX_BFD" "${enter[@]}" "$session_dir/session.sh"

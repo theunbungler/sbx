@@ -322,3 +322,20 @@ r() { jq -r "$1" <<< "$PLAN"; }
     [ "$(r .workspace.origin)" = "user" ]
     [ "$(r .workspace.shadows)" = "" ]
 }
+
+@test "a seccomp filter is checked and recorded" {
+    resolve
+    [ "$(q .seccomp)" = 'null' ]
+    resolve --seccomp "$SRC/none.bpf"
+    [[ "$(r '.errors[]')" == *"--seccomp: $SRC/none.bpf is not a readable file"* ]]
+    : > "$SRC/empty.bpf"
+    resolve --seccomp "$SRC/empty.bpf"
+    [[ "$(r '.errors[]')" == *"--seccomp: $SRC/empty.bpf is empty"* ]]
+    printf 'abc' > "$SRC/odd.bpf"
+    resolve --seccomp "$SRC/odd.bpf"
+    [[ "$(r '.errors[]')" == *"--seccomp: $SRC/odd.bpf is not a whole number of 8-byte BPF instructions"* ]]
+    head -c 16 /dev/zero > "$SRC/ok.bpf"
+    resolve --seccomp "$SRC/ok.bpf"
+    [ "$(q .errors)" = '[]' ]
+    [ "$(q .seccomp)" = "{\"path\":\"$SRC/ok.bpf\",\"instructions\":2}" ]
+}
