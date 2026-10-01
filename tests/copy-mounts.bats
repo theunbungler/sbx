@@ -257,5 +257,16 @@ setup() {
     script -qec "bash -c \"source '$BATS_TEST_DIRNAME/../lib/copy-mounts.sh'; \
                  SBX_PROGRESS_DELAY=0 sbx_copy_seed_progress '$SRC' '$TMP' bigseed\"" \
         "$typescript" >/dev/null 2>&1
-    grep -aq "bigseed" "$typescript"
+    grep -aq "bigseed: " "$typescript"
+}
+
+@test "seed_progress draws on SBX_PROGRESS_FD, leaving stderr alone" {
+    for i in $(seq 1 20000); do echo "data $i" > "$SRC/f$i.txt"; done
+    local typescript="$WORK/typescript"
+    script -qec "bash -c \"source '$BATS_TEST_DIRNAME/../lib/copy-mounts.sh'; \
+                 exec 7>&2 2>'$WORK/stderr'; \
+                 SBX_PROGRESS_FD=7 SBX_PROGRESS_DELAY=0 sbx_copy_seed_progress '$SRC' '$TMP' bigseed\"" \
+        "$typescript" >/dev/null 2>&1
+    grep -aq "bigseed: " "$typescript"
+    if grep -q "bigseed: " "$WORK/stderr"; then echo "progress reached stderr" >&2; return 1; fi
 }

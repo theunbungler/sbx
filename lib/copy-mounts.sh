@@ -177,7 +177,11 @@ sbx_manifest_deleted() {
 # --reflink=auto makes the copy metadata-only on btrfs/xfs when source and
 # destination share a filesystem, and falls back to a full copy otherwise.
 #
-# Gated on BOTH a time threshold and stderr being a TTY, because the fast
+# Drawn on SBX_PROGRESS_FD (default stderr): sbx points it at the terminal
+# while it keeps a copy of stderr for the session's pane, so the redraws
+# stay out of that copy.
+#
+# Gated on BOTH a time threshold and that fd being a TTY, because the fast
 # path needs no instrumentation at all: a 300MB same-filesystem btrfs seed
 # is a reflink and completes in ~4ms, versus ~144ms with --reflink=never.
 # Progress is only ever wanted where reflink is unavailable, which is
@@ -192,7 +196,7 @@ sbx_manifest_deleted() {
 # percentage is capped at 99 until the copy actually exits.
 sbx_copy_seed_progress() {
     local src="$1" tmp="$2" label="$3"
-    local delay="${SBX_PROGRESS_DELAY:-1}"
+    local delay="${SBX_PROGRESS_DELAY:-1}" fd="${SBX_PROGRESS_FD:-2}"
 
     # Existence check first: creating $tmp for a source that does not exist
     # leaves an empty directory that a caller then treats as a seeded store.
@@ -220,7 +224,7 @@ sbx_copy_seed_progress() {
 
     while kill -0 "$cp_pid" 2>/dev/null; do
         sleep 0.2
-        [[ -t 2 ]] || continue
+        [[ -t "$fd" ]] || continue
         (( SECONDS - start < delay )) && continue
 
         if [[ -z "$total" ]] && ! kill -0 "$du_pid" 2>/dev/null; then
@@ -234,14 +238,14 @@ sbx_copy_seed_progress() {
         if [[ -n "$total" && "$total" != unknown && -n "$done_b" && "$total" -gt 0 ]]; then
             local pct=$(( done_b * 100 / total ))
             (( pct > 99 )) && pct=99
-            printf '\r\033[K  %s: %d%% (%ds)' "$label" "$pct" "$(( SECONDS - start ))" >&2
+            printf '\r\033[K  %s: %d%% (%ds)' "$label" "$pct" "$(( SECONDS - start ))" >&"$fd"
         elif [[ -n "$done_b" ]]; then
             printf '\r\033[K  %s: %s copied (%ds)' \
                 "$label" "$(numfmt --to=iec "$done_b" 2>/dev/null || echo "$done_b B")" \
-                "$(( SECONDS - start ))" >&2
+                "$(( SECONDS - start ))" >&"$fd"
         else
             # /proc/<pid>/io unreadable — hardened procfs, or not Linux.
-            printf '\r\033[K  %s: working (%ds)' "$label" "$(( SECONDS - start ))" >&2
+            printf '\r\033[K  %s: working (%ds)' "$label" "$(( SECONDS - start ))" >&"$fd"
         fi
     done
 
@@ -249,6 +253,6 @@ sbx_copy_seed_progress() {
     kill "$du_pid" 2>/dev/null || true
     wait "$du_pid" 2>/dev/null || true
     rm -f "$du_out"
-    (( shown )) && printf '\r\033[K' >&2
+    (( shown )) && printf '\r\033[K' >&"$fd"
     return $rc
 }

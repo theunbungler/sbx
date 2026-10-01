@@ -12,6 +12,12 @@ dir="${BASH_SOURCE[0]%/*}"
 source "$dir/wrapper.env"
 mapfile -d '' -t cmd < "$dir/command"
 
+# What sbx printed before the tmux client covered it (start_transcript in
+# sbx). Only here, so only the payload's pane shows it, never a join's.
+if [[ -s "$dir/launch.log" ]]; then
+    cat "$dir/launch.log"
+fi
+
 if [[ "$CAPS_KEEP" != "true" ]]; then
     exec "${cmd[@]}"
 fi

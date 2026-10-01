@@ -1317,6 +1317,8 @@ teardown() {
     # reach it.
     local exit_status=$?
     local join_lock arch_dir rm_ r_src r_dest r_id r_work r_base r_cur rel
+    # A launch that failed before run_session still has the transcript up.
+    end_transcript
 
     # A seed interrupted mid-progress leaves a partial line on the terminal.
     if [[ -t 2 ]]; then
@@ -1429,6 +1431,48 @@ EOF
         TEST_DOMAIN RESOLV_DEST SECCOMP_COPY > "$SESSION_DIR/launch.env"
 }
 
+# What sbx prints from here until the sandbox starts is also written to a
+# transcript, which wrapper.sh replays at the top of the payload's pane:
+# the tmux client is about to cover the terminal it was printed on. The
+# terminal itself is kept on two spare fds; seed progress draws there, so
+# its redraws stay out of the transcript, and end_transcript hands it back
+# before anything that needs a tty (tmux, bwrap) runs.
+TRANSCRIPT=""
+start_transcript() {
+    TRANSCRIPT=$(mktemp) || { TRANSCRIPT=""; return 0; }
+    exec {TTY_OUT}>&1 {TTY_ERR}>&2
+    exec > >(tee -a "$TRANSCRIPT")
+    TEE_OUT_PID=$!
+    exec 2> >(tee -a "$TRANSCRIPT" >&"$TTY_ERR")
+    TEE_ERR_PID=$!
+    export SBX_PROGRESS_FD="$TTY_ERR"
+    # Until teardown's trap replaces this: an early exit still flushes
+    # its error to the terminal before the shell prompt returns.
+    trap end_transcript EXIT
+}
+
+# Idempotent. Restores the terminal, waits (bounded) for both tees to
+# drain, and moves the transcript into the session directory if there is
+# one by now; otherwise it is discarded.
+end_transcript() {
+    local pid
+    [[ -n "$TRANSCRIPT" ]] || return 0
+    exec 1>&"$TTY_OUT" 2>&"$TTY_ERR" {TTY_OUT}>&- {TTY_ERR}>&-
+    unset SBX_PROGRESS_FD
+    for pid in "$TEE_OUT_PID" "$TEE_ERR_PID"; do
+        for _ in {1..20}; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.05
+        done
+    done
+    if [[ -n "${SESSION_DIR:-}" && -d "$SESSION_DIR" ]]; then
+        mv -f "$TRANSCRIPT" "$SESSION_DIR/launch.log" 2>/dev/null || rm -f "$TRANSCRIPT"
+    else
+        rm -f "$TRANSCRIPT"
+    fi
+    TRANSCRIPT=""
+}
+
 port_list() {   # <port>...: comma-joined, or "none"
     local joined
     if [[ $# -eq 0 ]]; then
@@ -1457,6 +1501,7 @@ run_session() {
     # session by sbx's pid.
     if [[ "$SBX_NETNS" != "true" ]]; then
         echo "Starting session $SESSION_ID..."
+        end_transcript
         # A: this user as 0 in a new user namespace, with an empty network.
         setpriv --pdeathsig KILL -- unshare --user --map-root-user --net -- "${launch[@]}"
         return
@@ -1472,6 +1517,7 @@ run_session() {
            -a "$HOST_IP" -g "$HOST_GW" -n "$HOST_MASK")
     if [[ "$USERNS_FULL" == "true" ]]; then
         echo "Starting session $SESSION_ID with networking (full userns)..."
+        end_transcript
         # unshare claims the subordinate range through the setuid newuidmap;
         # pasta must not make a user namespace of its own (--netns-only).
         setpriv --pdeathsig KILL -- unshare --map-auto --map-root-user -- \
@@ -1490,6 +1536,7 @@ run_session() {
         fi
         echo "Starting session $SESSION_ID with host ports $desc (no internet)..."
     fi
+    end_transcript
     setpriv --pdeathsig KILL -- "${pasta[@]}" -- "${launch[@]}"
 }
 
@@ -1515,6 +1562,7 @@ main() {
     if [[ "$DRY_RUN" == "true" ]]; then
         dry_run_report
     fi
+    start_transcript
     check_plan
     if [[ "$RESEED" == "true" ]]; then
         reseed

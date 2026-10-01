@@ -12,6 +12,12 @@ On `main` since the nested-sessions milestone; not yet part of a numbered
 release.
 
 ### Added
+- **Launch output in the payload's pane** (2026-09-30). What sbx prints
+  before the session starts (warnings, seeding, the "Starting session"
+  line) is replayed at the top of the payload's tmux pane, since the tmux
+  client covers the terminal it was printed on. `--join` panes don't
+  repeat it. Seed progress still draws on the terminal and stays out of the
+  replay.
 - **Workspaces** (2026-09-27): `--workspace <name>` applies a saved
   `{fs, net, wd, gui}` from `./.sbx/<name>.json` or
   `~/.config/sbx/<name>.json`; the most local wins. A git-tracked project

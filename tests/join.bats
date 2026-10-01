@@ -328,3 +328,19 @@ EOF
     ( cd "$PROJ" && timeout 5 script -qec "$SBX --attach $BG_SESSION" /dev/null > "$HOSTDIR/attach.out" 2>&1 ) || true
     grep -q PAYLOAD_MARKER "$HOSTDIR/attach.out"
 }
+
+@test "the payload's pane opens with sbx's launch output" {
+    # tmux covers the terminal sbx printed on; wrapper.sh replays it.
+    start_bg_sbx "--fs caps" "$PARK"
+    sleep 1
+    tmux -S "$BG_SDIR/tmux.sock" capture-pane -p -t main > "$HOSTDIR/pane.txt"
+    grep -q "Starting session $BG_SESSION" "$HOSTDIR/pane.txt"
+}
+
+@test "a join's pane does not replay the launch output" {
+    start_bg_sbx "--fs caps" "$PARK"
+    sleep 1
+    ( cd "$PROJ" && script -qec "$SBX --join $BG_SESSION -- /bin/sh -c 'echo JOINED; sleep 2'" /dev/null > "$HOSTDIR/join.out" 2>&1 )
+    grep -q JOINED "$HOSTDIR/join.out"
+    if grep -q "Starting session" "$HOSTDIR/join.out"; then echo "replayed in join" >&2; return 1; fi
+}
