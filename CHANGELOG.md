@@ -12,6 +12,10 @@ On `main` since the nested-sessions milestone; not yet part of a numbered
 release.
 
 ### Added
+- **An in-sandbox `sudo`** (2026-09-30) for sessions that run as you: it
+  runs the command as namespace root (`unshare --map-root-user`), for
+  programs that check for uid 0. It grants no privilege; the real `sudo`
+  cannot work in a sandbox.
 - **Launch output in the payload's pane** (2026-09-30). What sbx prints
   before the session starts (warnings, seeding, the "Starting session"
   line) is replayed at the top of the payload's tmux pane, since the tmux
@@ -32,6 +36,13 @@ release.
   working on sbx.
 
 ### Changed
+- **Networked sessions run as you, not root** (2026-09-30). The payload of
+  a session with `--net` or `--host-port` now has your uid, as a session
+  without networking always did, so Claude Code's
+  `--dangerously-skip-permissions` and chromium work there. Root it never
+  had real use for: every capability is dropped. Networked sessions that
+  keep caps (`fs/podman`, `fs/podman-full`) stay namespace-root. The plan
+  carries `security.identity`, and `--dry-run` shows it.
 - **Breaking: cli profiles are now fs profiles** (2026-09-26). The `cli`
   type is gone and the bundled `claude`, `dev`, `gemini` and `pi` profiles
   moved to `profiles/fs/`. `--cli <name>` still works, as an alias that

@@ -297,12 +297,31 @@ EOF
     [ "$(cat "$HOSTDIR/id.txt")" = "$(id -u)" ]
 }
 
-@test "capless with networking: the payload sees uid 0, as before" {
+@test "capless with networking: the payload sees the host uid" {
     requires_net
     payload "--fs drop --net nothing" <<'EOF'
 id -u > /out/id.txt
 EOF
+    [ "$(cat "$HOSTDIR/id.txt")" = "$(id -u)" ]
+}
+
+@test "capless with networking: sudo is namespace root and still cannot write ro" {
+    requires_net
+    payload "--fs drop --net nothing" <<'EOF'
+sudo id -u > /out/id.txt
+sudo sh -c 'echo pwned > /ro/f.txt' 2>/dev/null
+true
+EOF
     [ "$(cat "$HOSTDIR/id.txt")" = "0" ]
+    [ "$(cat "$RODIR/f.txt")" = "readonly" ]
+}
+
+@test "caps keep with networking: no sudo shim, the payload is already root" {
+    requires_net
+    payload "--fs keep --net nothing" <<'EOF'
+command -v sudo > /out/sudo.txt || true
+EOF
+    if grep -q "/sessions/" "$HOSTDIR/sudo.txt"; then echo "shim present" >&2; return 1; fi
 }
 
 @test "capless without networking: the payload is in its own user namespace, nested" {

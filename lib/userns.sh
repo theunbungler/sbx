@@ -41,8 +41,9 @@ sbx_userns_write_map() {   # <map file> <map text>
 }
 
 # B mirrors the caller's ranges as an identity map: every id A can represent
-# means the same id in B. Networked and userns: full sessions, whose payload
-# has always run as A's 0.
+# means the same id in B. For a payload that runs as root (identity "root":
+# networked sessions that keep caps, userns: full among them), whose podman
+# expects A's 0.
 sbx_userns_map_identity() {   # <pid>
     local kind map inside outside count
     for kind in uid gid; do
@@ -54,9 +55,9 @@ sbx_userns_map_identity() {   # <pid>
     done
 }
 
-# B maps the host id that A's 0 stands for onto A's 0, so the payload sees
-# the identity a bwrap-created namespace gave it before B existed: sessions
-# without networking, where A comes from `unshare --map-root-user`.
+# B maps the host id that A's 0 stands for onto A's 0, so the payload is the
+# user, under the user's own uid (identity "user"). A's map comes from
+# `unshare --map-root-user` or from pasta; either way its 0 is the user.
 sbx_userns_map_outer_ids() {   # <pid>
     local kind inside outside count
     for kind in uid gid; do

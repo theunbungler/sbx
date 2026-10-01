@@ -122,6 +122,20 @@ r() { jq -r "$1" <<< "$PLAN"; }
     [ "$(q .deps)" = '["core","podman"]' ]
 }
 
+@test "the payload runs as the user unless it keeps caps with networking" {
+    local keep net
+    keep=$(user fs k '{"caps":"keep"}')
+    net=$(user net n '{"allow":["github.com"]}')
+    resolve
+    [ "$(r .security.identity)" = "user" ]
+    resolve --net "$net"
+    [ "$(r .security.identity)" = "user" ]
+    resolve --fs "$keep"
+    [ "$(r .security.identity)" = "user" ]
+    resolve --fs "$keep" --net "$net"
+    [ "$(r .security.identity)" = "root" ]
+}
+
 @test "userns full without a net profile is an error" {
     local fs
     fs=$(user fs u '{"userns":"full"}')

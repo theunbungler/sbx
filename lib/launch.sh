@@ -32,11 +32,16 @@ trap 'sbx_nestnet_release; sbx_userns_release "${SBX_B_PID:-}"; [[ -n "${DNSMASQ
 
 # --- The payload namespace B (lib/userns.sh, lib/nestnet.sh) ---
 sbx_userns_hold || fail "could not create the payload user namespace."
-if [[ "$NET_MODE" == "none" ]]; then
+# IDENTITY (the plan's security.identity): "user" maps the host uid onto
+# A's 0, so the payload is the user; "root" mirrors A's map, so it is A's 0.
+if [[ "$IDENTITY" == "root" ]]; then
+    sbx_userns_map_identity "$SBX_B_PID" || fail "could not map the payload user namespace."
+else
     sbx_userns_map_outer_ids "$SBX_B_PID" || fail "could not map the payload user namespace."
+fi
+if [[ "$NET_MODE" == "none" ]]; then
     sbx_nestnet_lo_up "$SBX_B_PID" || fail "could not bring up the payload loopback."
 else
-    sbx_userns_map_identity "$SBX_B_PID" || fail "could not map the payload user namespace."
     nest_dns=""
     if [[ "$NET_MODE" == "dns" ]]; then
         nest_dns="$SBX_DNS_ADDR"

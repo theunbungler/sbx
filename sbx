@@ -668,7 +668,7 @@ read_plan_settings() {
     # profile path contains.
     eval "$(jq -r '@sh "USERNS_FULL=\(.security.userns_full) USERNS_PROFILE=\(.security.userns_profile)
         CAPS_KEEP=\(.security.caps_keep) CAPS_PROFILE=\(.security.caps_profile)
-        DOCKER_API=\(.security.docker_api) SBX_NETNS=\(.netns) NET_ENABLED=\(.net.enabled)
+        DOCKER_API=\(.security.docker_api) IDENTITY=\(.security.identity) SBX_NETNS=\(.netns) NET_ENABLED=\(.net.enabled)
         TEST_DOMAIN=\(.net.test_domain // "") SANDBOX_PATH=\(.path) GUI=\(.gui)
         NEED_SUBIDS=\(.checks | index("subids") != null)"' <<< "$PLAN")"
     mapfile -t HOST_PORTS_TCP < <(plan_get '.host_ports.tcp[]')
@@ -879,6 +879,16 @@ exec podman "$@"
 SHIMEOF
     chmod +x "$SESSION_DIR/bin/docker"
     BWRAP_ARGS+=(--setenv DOCKER_HOST "unix://$PODMAN_SOCK")
+}
+
+# A payload that runs as the user gets lib/sudo.sh as its sudo: namespace
+# root for programs that check for uid 0, never real privilege. One that
+# runs as root needs none.
+add_sudo_shim() {
+    if [[ "$IDENTITY" == "user" ]]; then
+        mkdir -p "$SESSION_DIR/bin"
+        install -m 0755 "$SCRIPT_DIR/lib/sudo.sh" "$SESSION_DIR/bin/sudo"
+    fi
 }
 
 # Profile mounts. ro/rw/dev bind directly; forked and record are collected
@@ -1427,7 +1437,7 @@ EOF
             mapfile -t DNSMASQ_ARGS < <(sbx_egress_dnsmasq_args "$(plan_get '.net')")
         fi
     fi
-    declare -p NET_MODE CAPS_KEEP NEST_TCP NEST_UDP SBX_DNS_ADDR DNSMASQ_BIN DNSMASQ_ARGS \
+    declare -p NET_MODE CAPS_KEEP IDENTITY NEST_TCP NEST_UDP SBX_DNS_ADDR DNSMASQ_BIN DNSMASQ_ARGS \
         TEST_DOMAIN RESOLV_DEST SECCOMP_COPY > "$SESSION_DIR/launch.env"
 }
 
@@ -1573,6 +1583,7 @@ main() {
     claim_session
     build_base_args
     setup_virt
+    add_sudo_shim
     add_profile_mounts
     seed_forked_mounts
     seed_record_mounts

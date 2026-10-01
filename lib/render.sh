@@ -58,7 +58,8 @@ def mark($ok): if $ok then "✓" else "✗" end;
     ( if ($d.errors | length) == 0 then
         section("Security"; [ [ (if $d.security.caps_keep then "capabilities KEPT in the payload namespace (\($d.security.caps_profile | tilde))" else "capabilities dropped; mounts and the firewall are enforced from outside the payload namespace" end),
                                 (if $d.security.userns_full then "userns full" else "no userns" end),
-                                (if $d.security.docker_api then "docker API" else "no docker API" end) ] | join(" · ") ])
+                                (if $d.security.docker_api then "docker API" else "no docker API" end),
+                                (if $d.security.identity == "root" then "runs as namespace root" else "runs as you (sudo: namespace root)" end) ] | join(" · ") ])
       else empty end ),
 
     section("Mounts"; [ $d.mounts[] as $m

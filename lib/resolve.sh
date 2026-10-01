@@ -180,7 +180,7 @@ sbx_resolve() {
     # profiles, mounts and env hold flat field lists (sbx_resolve_records),
     # turned into objects by one jq call each at the end.
     local -a mounts=() passthrough=() env=() tcp=() udp=()
-    local sandbox_path="" sandbox_path_raw="" netns=false net_json='{"enabled":false}'
+    local identity sandbox_path="" sandbox_path_raw="" netns=false net_json='{"enabled":false}'
     local -a deps=(core) checks=()
 
     if [[ ${#errors[@]} -eq 0 ]]; then
@@ -377,6 +377,16 @@ sbx_resolve() {
         fi
     fi
 
+    # Who the payload is in its own namespace. Root only where it needs to
+    # be: a networked session that keeps caps, whose podman runs rootful
+    # over the identity map (userns: full implies caps: keep). Everywhere
+    # else root bought nothing, with every capability dropped, and made
+    # root-averse programs refuse to run.
+    identity=user
+    if [[ "$netns" == "true" && "$caps_keep" == "true" ]]; then
+        identity=root
+    fi
+
     if [[ ${#errors[@]} -gt 0 ]]; then
         sandbox_path=""
         sandbox_path_raw=""
@@ -392,7 +402,7 @@ sbx_resolve() {
         --argjson checks "$(sbx_resolve_strings "${checks[@]}")" \
         --argjson caps_keep "$caps_keep" --arg caps_profile "$caps_profile" \
         --argjson userns_full "$userns_full" --arg userns_profile "$userns_profile" \
-        --argjson docker_api "$docker_api" \
+        --argjson docker_api "$docker_api" --arg identity "$identity" \
         --argjson mounts "$(sbx_resolve_records 6 "${mounts[@]}" |
             jq -c 'map({profile: .[0], from: .[1], source: .[2], dest: .[3], perm: .[4], present: (.[5] == "true")})')" \
         --argjson passthrough "$(sbx_resolve_strings "${passthrough[@]}")" \
@@ -406,7 +416,7 @@ sbx_resolve() {
         '{profiles: $profiles, errors: $errors, warnings: $warnings, confirm: $confirm, deps: $deps, checks: $checks,
           security: {caps_keep: $caps_keep, caps_profile: $caps_profile,
                      userns_full: $userns_full, userns_profile: $userns_profile,
-                     docker_api: $docker_api},
+                     docker_api: $docker_api, identity: $identity},
           mounts: $mounts, passthrough: $passthrough, env: $env, path: $path, path_raw: $path_raw,
           workspace: $workspace, seccomp: $seccomp, wd: $wd, gui: $gui, host_ports: {tcp: $tcp, udp: $udp},
           netns: $netns, net: $net}'

@@ -548,6 +548,27 @@ xpra attach :<N>
 ```
 *(Where `<N>` is the display number provided by `sbx`)*
 
+## User Identity and sudo
+
+The payload runs as **you**: your uid, so `id`, `whoami`, `$USER` and
+`$HOME` agree, and your files are owned by you inside as well as out. The
+exception is a session that keeps capabilities *and* has networking
+(`--fs podman` or `--fs podman-full` with `--net` or `--host-port`): its
+podman runs rootful inside the payload namespace, so the payload is
+namespace-root there. `--dry-run` shows which on its Security line.
+
+The real `sudo` cannot work in any session — bwrap's `no_new_privs` makes
+the kernel ignore its setuid bit, and host root is unmapped. Sessions
+that run as you get a `sudo` of sbx's own instead, which runs the command
+as **namespace root**: uid 0 in a nested user namespace
+(`unshare --map-root-user`). That satisfies programs and scripts that
+check for root or call `sudo cmd`, and it grants nothing: read-only
+mounts stay read-only, the firewall is out of reach, and files it writes
+are yours on the host. Something that needs real privilege (installing
+into `/usr`, say) still fails, just past the root check. It accepts the
+common options (`-E`, `-H`, `-n`, `-S`, `-k`, `-p`, `-i`, `-s`, `-u root`)
+and refuses any other user.
+
 ## Virt: Podman Containers and QEMU VMs
 
 Every session gets rootless-podman-friendly plumbing for free: a
@@ -561,7 +582,8 @@ Three `fs` profiles add device access and persistent storage:
 
 - `--fs podman` — single-UID rootless podman: `/dev/net/tun` plus a
   persistent container store at `~/.local/state/sbx/virt/containers`.
-  Composes with everything (real-user identity), works offline with
+  Composes with everything (real-user identity without networking;
+  namespace-root with it, see [User Identity](#user-identity-and-sudo)), works offline with
   cached images. Images that switch UIDs (`USER` directives, service
   images like postgres/nginx that drop privileges) will fail — use
   `podman-full` for those.
@@ -573,7 +595,7 @@ Three `fs` profiles add device access and persistent storage:
   directory at `~/.local/state/sbx/virt/images`.
 
 ```bash
-# Root-only containers, composes with anything (real-user identity)
+# Root-only containers, composes with anything (namespace-root, as it is networked)
 ./sbx --fs sandbox --fs podman --fs claude --net web
 
 # Full image fidelity (postgres/USER images), ns-root session
