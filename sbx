@@ -33,6 +33,8 @@ source "$SCRIPT_DIR/lib/resolve.sh"
 source "$SCRIPT_DIR/lib/sessions.sh"
 # shellcheck source=lib/nestnet.sh
 source "$SCRIPT_DIR/lib/nestnet.sh"
+# shellcheck source=lib/x11.sh
+source "$SCRIPT_DIR/lib/x11.sh"
 # shellcheck source=lib/egress.sh
 source "$SCRIPT_DIR/lib/egress.sh"
 
@@ -61,6 +63,7 @@ ASSUME_YES=false
 
 # Set by the GUI phase; read by teardown.
 XPRA_DISPLAY=""
+X11_RELAY_PID=""
 
 # Every path runs this before touching state — except --dry-run, which
 # must create nothing.
@@ -220,6 +223,8 @@ cmd_gc() {
         scname="${scname%.pid}"
         scname="${scname%.json}"
         scname="${scname%.lock}"
+        scname="${scname%.seccomp}"
+        scname="${scname%.x11}"
         [[ -d "$STATE_DIR/sessions/$scname" ]] && continue
         rm -f "${sc:?}"
     done
@@ -1173,14 +1178,44 @@ write_session_records() {
         > "$STATE_DIR/join/$SESSION_ID.json"
 }
 
+# A file socket for a display that has only its abstract one (see
+# lib/x11.sh). It lives under join/, which the sandbox never sees except
+# through the bind setup_gui makes. --pdeathsig and setsid as for the net
+# relays in lib/nestnet.sh; stop_x11_relay kills the whole group.
+start_x11_relay() {   # <display number> <socket path>
+    rm -f "$2"
+    setpriv --pdeathsig KILL -- setsid socat \
+        "UNIX-LISTEN:$2,fork,mode=600" \
+        "ABSTRACT-CONNECT:/tmp/.X11-unix/X$1" </dev/null >/dev/null 2>&1 &
+    X11_RELAY_PID=$!
+    for _ in {1..100}; do
+        kill -0 "$X11_RELAY_PID" 2>/dev/null || break
+        if [[ -S "$2" ]]; then
+            return 0
+        fi
+        sleep 0.05
+    done
+    stop_x11_relay
+    return 1
+}
+
+stop_x11_relay() {
+    if [[ -n "$X11_RELAY_PID" ]]; then
+        # wait reaps it here, quietly, before bash reports it "Killed".
+        kill -9 -- "-$X11_RELAY_PID" 2>/dev/null || true
+        wait "$X11_RELAY_PID" 2>/dev/null || true
+        X11_RELAY_PID=""
+    fi
+}
+
 # An xpra virtual display, bound into the sandbox with its own cookie.
 setup_gui() {
-    local display_num=100 xpra_log x11_sock ready=false host_xauth sbx_xauth
+    local display_num=100 xpra_log x11_sock ready="" host_xauth sbx_xauth
     # --gui or any profile's "gui": true; one display however many asked.
     if [[ "$GUI" != "true" ]]; then
         return 0
     fi
-    while [[ -S "/tmp/.X11-unix/X$display_num" ]]; do
+    while sbx_x11_display_taken "$display_num"; do
         display_num=$((display_num + 1))
     done
     XPRA_DISPLAY=":$display_num"
@@ -1202,17 +1237,34 @@ setup_gui() {
     echo -n "Waiting for display"
     for _ in {1..40}; do
         if [[ -S "$x11_sock" ]]; then
-            ready=true
+            ready=file
+            break
+        fi
+        # The file socket can lag the abstract one by a moment; only a
+        # read-only /tmp/.X11-unix (WSLg) settles on the abstract alone.
+        if [[ ! -w /tmp/.X11-unix ]] && sbx_x11_abstract_listening "$display_num"; then
+            ready=abstract
             break
         fi
         sleep 0.25
         echo -n "."
     done
     echo
-    if [[ "$ready" != "true" ]]; then
+    if [[ -z "$ready" ]]; then
         echo "Error: xpra display $XPRA_DISPLAY failed to start. Check $xpra_log" >&2
         xpra stop "$XPRA_DISPLAY" >/dev/null 2>&1 || true
         exit 1
+    fi
+    if [[ "$ready" == "abstract" ]]; then
+        x11_sock="$STATE_DIR/join/$SESSION_ID.x11"
+        if ! start_x11_relay "$display_num" "$x11_sock"; then
+            echo "Error: /tmp/.X11-unix is read-only, and the socat relay to display $XPRA_DISPLAY did not start." >&2
+            if ! command -v socat >/dev/null 2>&1; then
+                echo "  socat is needed here: $(sbx_deps_install_hint "$(sbx_deps_family)" socat)" >&2
+            fi
+            xpra stop "$XPRA_DISPLAY" >/dev/null 2>&1 || true
+            exit 1
+        fi
     fi
 
     # xpra keys its cookie to the host's hostname, which the sandbox does
@@ -1244,7 +1296,7 @@ setup_gui() {
     BWRAP_ARGS+=(--setenv LIBGL_ALWAYS_INDIRECT 1)
 
     echo "GUI display $XPRA_DISPLAY is ready."
-    echo "  Attach viewer : xpra attach $XPRA_DISPLAY"
+    echo "  Attach viewer : $(sbx_x11_attach_cmd "$XPRA_DISPLAY" "$(sbx_deps_kernel_release)")"
     echo "  Stop display  : xpra stop $XPRA_DISPLAY"
 }
 
@@ -1315,6 +1367,7 @@ teardown() {
 
     if [[ -n "$XPRA_DISPLAY" ]]; then
         echo "Stopping xpra display $XPRA_DISPLAY..."
+        stop_x11_relay
         xpra stop "$XPRA_DISPLAY" >/dev/null 2>&1 || true
     fi
 

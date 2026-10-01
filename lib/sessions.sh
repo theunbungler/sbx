@@ -36,7 +36,7 @@ sbx_session_alive() {   # <state_dir> <name>
 # the next session to claim the name.
 sbx_session_remove() {   # <state_dir> <name>
     rm -rf "${1:?}/sessions/${2:?}"
-    rm -f "$1/join/$2.json" "$1/join/$2.lock" "$1/join/$2.pid" "$1/join/$2.seccomp"
+    rm -f "$1/join/$2.json" "$1/join/$2.lock" "$1/join/$2.pid" "$1/join/$2.seccomp" "$1/join/$2.x11"
 }
 
 # A session name is typed by hand at --join and --attach and interpolated

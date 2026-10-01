@@ -349,6 +349,8 @@ EOF
     echo $$ > "$HOME/.local/state/sbx/join/alive.pid"
     echo '{}' > "$HOME/.local/state/sbx/join/alive.json"
     : > "$HOME/.local/state/sbx/join/alive.lock"
+    : > "$HOME/.local/state/sbx/join/alive.seccomp"
+    : > "$HOME/.local/state/sbx/join/alive.x11"
     # No sessions/ghost directory at all: pure orphan sidecars.
     echo 999999 > "$HOME/.local/state/sbx/join/ghost.pid"
     echo '{}' > "$HOME/.local/state/sbx/join/ghost.json"
@@ -358,6 +360,8 @@ EOF
     [ -f "$HOME/.local/state/sbx/join/alive.pid" ]
     [ -f "$HOME/.local/state/sbx/join/alive.json" ]
     [ -f "$HOME/.local/state/sbx/join/alive.lock" ]
+    [ -e "$HOME/.local/state/sbx/join/alive.seccomp" ]
+    [ -e "$HOME/.local/state/sbx/join/alive.x11" ]
     [ ! -f "$HOME/.local/state/sbx/join/ghost.pid" ]
     [ ! -f "$HOME/.local/state/sbx/join/ghost.json" ]
     [ ! -f "$HOME/.local/state/sbx/join/ghost.lock" ]
@@ -723,11 +727,11 @@ EOF
 }
 
 
-@test "removing a session also removes its seccomp copy" {
+@test "removing a session also removes its seccomp copy and X11 relay socket" {
     source "$BATS_TEST_DIRNAME/../lib/sessions.sh"
     local st="$ROOT/st"
     mkdir -p "$st/sessions/x" "$st/join"
-    touch "$st/join/x.json" "$st/join/x.lock" "$st/join/x.pid" "$st/join/x.seccomp"
+    touch "$st/join/x.json" "$st/join/x.lock" "$st/join/x.pid" "$st/join/x.seccomp" "$st/join/x.x11"
     sbx_session_remove "$st" x
     if compgen -G "$st/join/x.*" >/dev/null; then return 1; fi
 }

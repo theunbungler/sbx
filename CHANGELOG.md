@@ -47,6 +47,15 @@ release.
   two mounts can never share one (2026-09-24).
 - `--reseed` runs before a session name is claimed (2026-09-24).
 
+### Fixed
+- **`--gui` on WSL2** (2026-09-30). WSLg mounts `/tmp/.X11-unix`
+  read-only, so the display only ever had its abstract socket and sbx gave
+  up waiting. sbx now relays it to a file socket with socat, and prints a
+  WSL-specific attach command (`GDK_BACKEND=x11 xpra attach :N
+  --opengl=no`). `--doctor` reports when xpra's viewer lacks PyGObject's
+  cairo bindings, which leaves attached windows black.
+- `--gc` no longer deletes a live session's `--seccomp` copy (2026-09-30).
+
 ### Security
 - A session never sees the launch directory's `.sbx`, which configures the
   next launch. An empty tmpfs covers it wherever a writable mount would

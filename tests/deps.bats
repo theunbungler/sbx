@@ -449,6 +449,25 @@ doctor_bin() {   # <tool to omit>...: a PATH holding every table tool except tho
     [[ "$output" == *"sudo dnf install passt"* ]]
 }
 
+@test "doctor: missing cairo bindings for the xpra viewer are reported but exit 0" {
+    doctor_bin bwrap
+    veth_loaded
+    fake_bwrap 0
+    os_release "$FIX/os" ubuntu debian
+    PATH="$FIX/bin" SBX_OS_RELEASE="$FIX/os" SBX_DEPS_PYTHON=/bin/false run sbx_deps_doctor
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"✗ xpra viewer cannot draw"* ]]
+    [[ "$output" == *"sudo apt install python3-gi-cairo"* ]]
+}
+
+@test "doctor: present cairo bindings are a check mark under gui" {
+    doctor_bin bwrap
+    veth_loaded
+    fake_bwrap 0
+    PATH="$FIX/bin" SBX_DEPS_PYTHON=/bin/true run sbx_deps_doctor
+    [[ "$output" == *"✓ xpra viewer can draw"* ]]
+}
+
 @test "doctor: a missing core tool exits 1" {
     doctor_bin bwrap jq
     fake_bwrap 0

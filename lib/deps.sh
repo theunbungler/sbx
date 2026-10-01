@@ -380,6 +380,23 @@ sbx_deps_veth_remedy() {
     echo "After a kernel upgrade, reboot so the running kernel matches its modules."
 }
 
+# xpra's GTK3 viewer paints through PyGObject's cairo bindings. They are a
+# separate package on Debian and Ubuntu, which xpra does not depend on;
+# without them `xpra attach` opens windows that stay black. Reported by the
+# doctor only: it concerns the viewer, not the launch.
+sbx_deps_gicairo_ok() {
+    "${SBX_DEPS_PYTHON:-python3}" -c 'import gi; gi.require_foreign("cairo")' >/dev/null 2>&1
+}
+
+sbx_deps_gicairo_package() {   # <family>
+    case "$1" in
+        arch)   echo "sudo pacman -S python-gobject" ;;
+        debian) echo "sudo apt install python3-gi-cairo" ;;
+        fedora) echo "sudo dnf install python3-gobject" ;;
+        *)      echo "install PyGObject's cairo bindings (python3-gi-cairo on Debian/Ubuntu)" ;;
+    esac
+}
+
 
 # Runs the host checks once and leaves the results in globals, for the
 # three reports below to render:
@@ -594,6 +611,17 @@ sbx_deps_doctor() {
                 else
                     echo "         ✗ $(sbx_deps_veth_problem)"
                     echo "           $(sbx_deps_veth_remedy)"
+                fi
+                ;;
+            gui)
+                if [[ -z "${SBX_DEPS_R[missing_gui]}" ]]; then
+                    if sbx_deps_gicairo_ok; then
+                        echo "         ✓ xpra viewer can draw (PyGObject cairo bindings)"
+                    else
+                        echo "         ✗ xpra viewer cannot draw: PyGObject's cairo bindings are missing"
+                        echo "           (xpra attach shows black windows)"
+                        echo "           $(sbx_deps_gicairo_package "$(sbx_deps_family)")"
+                    fi
                 fi
                 ;;
             podman)
