@@ -12,6 +12,17 @@ On `main` since the nested-sessions milestone; not yet part of a numbered
 release.
 
 ### Added
+- **Your own shell by default** (2026-10-02): a launch or `--join` with no
+  command runs `$SHELL` instead of `bash`, when it lives under `/usr` or
+  `/opt`; otherwise still `bash`.
+- **`Ctrl+b` as the in-sandbox tmux prefix** (2026-10-01) when sbx isn't
+  run from inside another tmux. `Ctrl+\` stays a prefix everywhere, and is
+  the only one when `$TMUX` is set, so a host tmux keeps `Ctrl+b`. Each
+  launch, `--join` and `--attach` decides for its own terminal; the status
+  bar shows the prefixes.
+- **Mouse support in the in-sandbox tmux** (2026-10-01): the wheel
+  scrolls, a click or hover selects a pane. `Shift`+drag selects text in
+  the outer terminal.
 - **An in-sandbox `sudo`** (2026-09-30) for sessions that run as you: it
   runs the command as namespace root (`unshare --map-root-user`), for
   programs that check for uid 0. It grants no privilege; the real `sudo`

@@ -344,3 +344,45 @@ EOF
     grep -q JOINED "$HOSTDIR/join.out"
     if grep -q "Starting session" "$HOSTDIR/join.out"; then echo "replayed in join" >&2; return 1; fi
 }
+
+# The prefixes a session's clients see, as "<prefix> <prefix2>".
+session_prefixes() {   # <tmux target>
+    tmux -S "$BG_SDIR/tmux.sock" display -p -t "$1" '#{prefix} #{prefix2}'
+}
+
+@test "a launch outside a host tmux takes C-b and C-\\ as prefixes" {
+    TMUX='' start_bg_sbx "--fs caps" "$PARK"
+    sleep 1
+    [ "$(session_prefixes main)" = 'C-b C-\' ]
+}
+
+@test "a launch inside a host tmux leaves C-b to it" {
+    TMUX=/tmp/fake-tmux,1,0 start_bg_sbx "--fs caps" "$PARK"
+    sleep 1
+    [ "$(session_prefixes main)" = 'C-\ None' ]
+}
+
+@test "a join's prefixes follow the joiner's terminal, not the launcher's" {
+    TMUX='' start_bg_sbx "--fs caps" "$PARK"
+    sleep 1
+    ( cd "$PROJ" && TMUX=/tmp/fake-tmux,1,0 script -qec "$SBX --join $BG_SESSION -- sleep 3" /dev/null >/dev/null 2>&1 ) &
+    local jpid=$! join_session=""
+    for _ in $(seq 30); do
+        join_session=$(tmux -S "$BG_SDIR/tmux.sock" list-sessions -F '#{session_name}' | grep -vx main | head -n1)
+        [[ -n "$join_session" ]] && break
+        sleep 0.1
+    done
+    sleep 0.5
+    local got
+    got=$(session_prefixes "$join_session")
+    reap_bounded "$jpid" 5
+    [ "$got" = 'C-\ None' ]
+    [ "$(session_prefixes main)" = 'C-b C-\' ]
+}
+
+@test "an attach sets main's prefixes for its own terminal" {
+    TMUX='' start_bg_sbx "--fs caps" "$PARK"
+    sleep 1
+    ( cd "$PROJ" && TMUX=/tmp/fake-tmux,1,0 timeout 3 script -qec "$SBX --attach $BG_SESSION" /dev/null >/dev/null 2>&1 ) || true
+    [ "$(session_prefixes main)" = 'C-\ None' ]
+}

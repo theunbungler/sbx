@@ -35,6 +35,8 @@ source "$SCRIPT_DIR/lib/sessions.sh"
 source "$SCRIPT_DIR/lib/nestnet.sh"
 # shellcheck source=lib/x11.sh
 source "$SCRIPT_DIR/lib/x11.sh"
+# shellcheck source=lib/tmux.sh
+source "$SCRIPT_DIR/lib/tmux.sh"
 # shellcheck source=lib/egress.sh
 source "$SCRIPT_DIR/lib/egress.sh"
 
@@ -109,6 +111,7 @@ sbx_claim_lock() {   # <consequence>
 usage() {
     cat <<EOF
 Usage: $(basename "$0") [options] [command]
+       (no command: your \$SHELL, if the sandbox can run it, else bash)
 
 Options:
   --list-profiles        Show available profiles
@@ -300,6 +303,23 @@ cmd_changes() {   # [<id>]
     exit 0
 }
 
+# The payload when none is given: the user's own $SHELL, when the sandbox
+# can run it. Its directory must resolve under /usr or /opt, which every
+# session binds at the same paths (/bin is a symlink into /usr inside, as on
+# a merged-/usr host); a shell elsewhere, under $HOME say, falls back to
+# bash. $SHELL is kept as written, since a shell may act on its argv0.
+default_shell() {
+    local dir
+    if [[ "${SHELL-}" == /* && -x "$SHELL" && ! -d "$SHELL" ]]; then
+        dir=$(readlink -f -- "${SHELL%/*}/") || dir=""
+        if [[ "$dir" == /usr/* || "$dir" == /opt/* ]]; then
+            printf '%s\n' "$SHELL"
+            return 0
+        fi
+    fi
+    printf '%s\n' /bin/bash
+}
+
 # Checks shared by --join and --attach; sets SDIR. The name is typed by
 # hand and interpolated into paths, so it is validated first.
 open_session() {   # <name>
@@ -321,7 +341,8 @@ open_session() {   # <name>
 
 cmd_join() {   # <name> [-- <cmd>...]
     local name="$1" meta join_path join_wd lock
-    local -a cmd=(/bin/bash)
+    local -a cmd
+    cmd=("$(default_shell)")
     shift
     if [[ "${1-}" == "--" && $# -gt 1 ]]; then
         shift
@@ -353,14 +374,22 @@ cmd_join() {   # <name> [-- <cmd>...]
     # launch.sh). env PATH by absolute path: tmux hands a pane the client's
     # PATH regardless of update-environment. -c: start where the payload
     # did; a directory missing inside makes tmux fall back to $HOME.
+    # The prefixes follow the joiner's terminal, not the launcher's; the
+    # session is the join's own, so no other client sees the change.
+    local -a prefix_args
+    mapfile -d '' -t prefix_args < <(sbx_tmux_prefix_args "${TMUX-}")
     exec tmux -S "$SDIR/tmux.sock" new-session -c "$join_wd" -- \
-        /usr/bin/env "PATH=$join_path" "${cmd[@]}"
+        /usr/bin/env "PATH=$join_path" "${cmd[@]}" "${prefix_args[@]}"
 }
 
 # Mirroring, deliberately: the way back to a payload you detached from.
 cmd_attach() {   # <name>
     open_session "$1"
-    exec tmux -S "$SDIR/tmux.sock" attach -t main
+    # main is shared, so this sets the prefixes for every client attached
+    # to it: the most recent attach wins. C-\ works whatever it chose.
+    local -a prefix_args
+    mapfile -d '' -t prefix_args < <(sbx_tmux_prefix_args "${TMUX-}" main)
+    exec tmux -S "$SDIR/tmux.sock" attach -t main "${prefix_args[@]}"
 }
 
 parse_args() {
@@ -1402,19 +1431,33 @@ write_session_files() {
     #                  is why --join re-imposes it.)
     #   exit-empty     the server exits with its last session, which is what
     #                  lets session.sh stop waiting.
-    #   prefix C-\     a host tmux keeps C-b.
+    #   prefix         C-\ always; C-b too unless sbx was launched inside
+    #                  a host tmux, which keeps C-b (lib/tmux.sh). A doubled
+    #                  prefix types the key itself, whichever slot it is in.
+    #   status-right   the prefixes, which differ from tmux's default.
     #   window-size    per-client, so one join cannot resize another.
+    #   mouse          wheel scrolling (copy mode, or the program if it took
+    #                  the mouse) and click-to-select; Shift+drag still
+    #                  selects in the outer terminal.
+    #   focus-follows-mouse  hovering selects a pane. -q: an older tmux
+    #                  lacks the option, and must not report a config error.
+    local prefix prefix2
+    read -r prefix prefix2 <<< "$(sbx_tmux_prefixes "${TMUX-}")"
     cat > "$SESSION_DIR/tmux.conf" <<EOF
 set -g update-environment ''
 set -g exit-empty on
 set -g escape-time 0
 set -g window-size latest
-unbind C-b
-set -g prefix C-\\\\
-bind C-\\\\ send-prefix
+set -g mouse on
+set -gq focus-follows-mouse on
+set -g prefix ${prefix//\\/\\\\}
+set -g prefix2 ${prefix2//\\/\\\\}
+bind C-b send-keys C-b
+bind C-\\\\ send-keys C-\\\\
 set -g status on
 set -g status-left ' sbx:$SESSION_ID '
 set -g status-left-length 40
+set -g status-right ' prefix #{prefix}#{?#{!=:#{prefix2},None}, or #{prefix2},} '
 EOF
 
     install -m 0755 "$SCRIPT_DIR/lib/session.sh" "$SESSION_DIR/session.sh"
@@ -1564,7 +1607,7 @@ main() {
         sbx_state_init
     fi
     if [[ ${#COMMAND[@]} -eq 0 ]]; then
-        COMMAND=(/bin/bash)
+        COMMAND=("$(default_shell)")
     fi
 
     preflight_core

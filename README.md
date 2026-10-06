@@ -10,13 +10,22 @@ The motivating intent behind sbx is to be a sandboxed environment for an AI codi
 
 ## Features
 
-- **Modular Profiles**: Tailor your sandbox with specific configurations:
+- **Modular Profiles**: Compose your sandbox from stackable configurations.  Bring as many as you like:
   - **Filesystem (FS) Profiles**: Mounts, environment variables, PATH entries and capabilities (e.g., `claude`, `sandbox`, `podman`).
-  - **Network (NET) Profiles**: Control network access and connectivity (e.g., `web`, `test_net`).
-- **Composable FS and NET profiles**: Each is designed to enable a minimal environment for something.  Bring as many as you like into the sandbox. 
+  - **Network (NET) Profiles**: CIDR and DNS endpoints and ports (e.g., `web`, `test_net`).
 - **Flexible Session Management**: List active sessions, and open additional shells inside a running one.
 - **GUI Support**: Enable isolated graphical interfaces using `xpra`.
 - **Flexible Configuration**: Profiles can be stored locally, in your home directory, or in system-wide paths.
+
+## Quickstart
+
+1. Clone sbx
+2. Add the `sbx` script to your path
+3. Run `sbx --doctor` and install dependencies
+    - Note: if you're running a modern Ubuntu, this may ask you to install an apparmor profile
+4. Run `sbx-profile ls` to see the profiles that ship with sbx
+5. Start writing your own profiles.  Read the existing ones, and then use `sbx-profile` to create new ones
+6. Launch your sandbox.  Run `sbx --fs <> --fs <> --net <> --net <>` with your profiles to launch
 
 ## Threat model
 
@@ -144,6 +153,20 @@ To see all available commands and options, run:
 | `--reseed` | Discard this directory's `forked` stores for the selected profiles, so the next launch seeds them from the host again. Asks first; refuses while a session holding one of those stores is still running. |
 | `--gc` | Remove crash residue — session directories and working copies left by a session that never got to shut down — and trim old change archives. Never removes a `forked` store; it reports them instead. |
 | `--yes` | Answer the confirmation prompts (`--reseed`, project-local profiles) with yes. |
+
+With no command, a session (and a `--join`) runs your own `$SHELL`, as long
+as it lives under `/usr` or `/opt`, which every session sees; a shell
+installed anywhere else falls back to `bash`. The sandbox's home directory
+starts empty, so the shell comes up without your rc files unless a profile
+mounts them (zsh offers its new-user setup in that case; `q` dismisses it).
+
+Every session runs in its own tmux, whose prefix key is `Ctrl+\` (detach
+with `Ctrl+\ d`). `Ctrl+b` works too, unless the terminal you launch, join
+or attach from is already inside tmux: that tmux keeps `Ctrl+b`. Since
+`--attach` shares the session's original terminal, the most recent attach
+decides for every client on it. The status bar shows the current prefixes. The mouse wheel scrolls, and
+hovering over a pane selects it; hold `Shift` to select text in your own
+terminal instead of tmux.
 
 ### Applying Profiles
 

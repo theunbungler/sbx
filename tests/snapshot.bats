@@ -209,10 +209,18 @@ normalize() {   # <capture dir>
     fi
 }
 
+# CASE_SHELL sets $SHELL; CASE_NO_COMMAND=1 launches without a command.
 run_case() {   # <case name> <sbx args...>
     local name="$1"; shift
     local cmd
-    cmd="$(printf '%q ' "$SBX" "$@")-- /bin/true"
+    cmd="$(printf '%q ' "$SBX" "$@")"
+    # Only sbx sees it: script runs the command line with $SHELL.
+    if [[ -n "${CASE_SHELL+set}" ]]; then
+        cmd="SHELL=$(printf '%q' "$CASE_SHELL") $cmd"
+    fi
+    if [[ "${CASE_NO_COMMAND:-}" != "1" ]]; then
+        cmd+="-- /bin/true"
+    fi
     ( cd "$PROJ" && env -i \
         PATH="$STUB:/usr/local/bin:/usr/bin:/bin" \
         HOME="$HOME_DIR" USER=snapuser LOGNAME=snapuser SHELL=/bin/bash \
@@ -289,4 +297,39 @@ check_snapshot() {   # <case name>
         return 1
     fi
     diff -ru "$CAP/again-a" "$CAP/again-b"
+}
+
+# Not goldens: what the payload defaults to with no command given.
+default_command() {   # <case name> <shell>
+    CASE_NO_COMMAND=1 CASE_SHELL="$2" run_case "$1" --fs sandbox
+    if [[ ! -f "$CAP/$1/command" ]]; then
+        cat "$ROOT/$1.out" >&2
+        return 1
+    fi
+    cat "$CAP/$1/command"
+}
+
+@test "default command: the user's \$SHELL when it lives under /usr" {
+    [[ -x /usr/bin/sh ]] || skip "no /usr/bin/sh"
+    run default_command shell-usr /usr/bin/sh
+    [ "$status" -eq 0 ]
+    [ "$output" = "/usr/bin/sh" ]
+}
+
+@test "default command: bash when \$SHELL is outside what the sandbox binds" {
+    mkdir -p "$HOME_DIR/bin"
+    printf '#!/bin/sh\n' > "$HOME_DIR/bin/myshell"
+    chmod +x "$HOME_DIR/bin/myshell"
+    run default_command shell-home "$HOME_DIR/bin/myshell"
+    [ "$status" -eq 0 ]
+    [ "$output" = "/bin/bash" ]
+}
+
+@test "default command: bash when \$SHELL is unset or not executable" {
+    run default_command shell-empty ""
+    [ "$status" -eq 0 ]
+    [ "$output" = "/bin/bash" ]
+    run default_command shell-missing /usr/bin/no-such-shell
+    [ "$status" -eq 0 ]
+    [ "$output" = "/bin/bash" ]
 }
